@@ -15,7 +15,7 @@ export const defaultModelPerProvider: Record<KnownProvider, string> = {
 	"amazon-bedrock": "us.anthropic.claude-opus-4-6-v1",
 	"ant-ling": "Ring-2.6-1T",
 	anthropic: "claude-opus-4-8",
-	openai: "gpt-5.4",
+	openai: "gpt-5.5",
 	"azure-openai-responses": "gpt-5.4",
 	"openai-codex": "gpt-5.5",
 	nvidia: "nvidia/nemotron-3-super-120b-a12b",
@@ -255,9 +255,24 @@ export function parseModelPattern(
  * The algorithm tries to match the full pattern first, then progressively
  * strips colon-suffixes to find a match.
  */
-export async function resolveModelScope(patterns: string[], modelRegistry: ModelRegistry): Promise<ScopedModel[]> {
+export interface ModelScopeDiagnostic {
+	type: "warning";
+	message: string;
+	pattern: string;
+}
+
+export interface ResolveModelScopeResult {
+	scopedModels: ScopedModel[];
+	diagnostics: ModelScopeDiagnostic[];
+}
+
+export async function resolveModelScopeWithDiagnostics(
+	patterns: string[],
+	modelRegistry: ModelRegistry,
+): Promise<ResolveModelScopeResult> {
 	const availableModels = await modelRegistry.getAvailable();
 	const scopedModels: ScopedModel[] = [];
+	const diagnostics: ModelScopeDiagnostic[] = [];
 
 	for (const pattern of patterns) {
 		// Check if pattern contains glob characters
@@ -283,7 +298,7 @@ export async function resolveModelScope(patterns: string[], modelRegistry: Model
 			});
 
 			if (matchingModels.length === 0) {
-				console.warn(chalk.yellow(`Warning: No models match pattern "${pattern}"`));
+				diagnostics.push({ type: "warning", message: `No models match pattern "${pattern}"`, pattern });
 				continue;
 			}
 
@@ -298,11 +313,11 @@ export async function resolveModelScope(patterns: string[], modelRegistry: Model
 		const { model, thinkingLevel, warning } = parseModelPattern(pattern, availableModels);
 
 		if (warning) {
-			console.warn(chalk.yellow(`Warning: ${warning}`));
+			diagnostics.push({ type: "warning", message: warning, pattern });
 		}
 
 		if (!model) {
-			console.warn(chalk.yellow(`Warning: No models match pattern "${pattern}"`));
+			diagnostics.push({ type: "warning", message: `No models match pattern "${pattern}"`, pattern });
 			continue;
 		}
 
@@ -312,6 +327,14 @@ export async function resolveModelScope(patterns: string[], modelRegistry: Model
 		}
 	}
 
+	return { scopedModels, diagnostics };
+}
+
+export async function resolveModelScope(patterns: string[], modelRegistry: ModelRegistry): Promise<ScopedModel[]> {
+	const { scopedModels, diagnostics } = await resolveModelScopeWithDiagnostics(patterns, modelRegistry);
+	for (const diagnostic of diagnostics) {
+		console.warn(chalk.yellow(`Warning: ${diagnostic.message}`));
+	}
 	return scopedModels;
 }
 
@@ -340,7 +363,7 @@ export interface ResolveCliModelResult {
 export function resolveCliModel(options: {
 	cliProvider?: string;
 	cliModel?: string;
-	cliThinking?: string;
+	cliThinking?: ThinkingLevel;
 	modelRegistry: ModelRegistry;
 }): ResolveCliModelResult {
 	const { cliProvider, cliModel, cliThinking, modelRegistry } = options;
@@ -422,6 +445,27 @@ export function resolveCliModel(options: {
 	});
 
 	if (model) {
+		// If provider inference matched an unauthenticated provider/model pair, prefer
+		// one exact raw model-id match that is authenticated. This keeps
+		// "provider/model" syntax preferred when usable, but handles models whose
+		// literal id starts with a known provider name (for example
+		// commandcode model id "xiaomi/mimo-v2.5-pro").
+		if (inferredProvider) {
+			const rawExactMatches = availableModels.filter(
+				(m) => m.id.toLowerCase() === cliModel.toLowerCase() && !modelsAreEqual(m, model),
+			);
+			if (rawExactMatches.length > 0 && !modelRegistry.hasConfiguredAuth(model)) {
+				const authenticatedRawMatches = rawExactMatches.filter((m) => modelRegistry.hasConfiguredAuth(m));
+				if (authenticatedRawMatches.length === 1) {
+					return {
+						model: authenticatedRawMatches[0],
+						thinkingLevel: undefined,
+						warning: undefined,
+						error: undefined,
+					};
+				}
+			}
+		}
 		return { model, thinkingLevel, warning, error: undefined };
 	}
 
@@ -470,10 +514,13 @@ export function resolveCliModel(options: {
 
 		const fallbackModel = buildFallbackModel(provider, fallbackPattern, availableModels);
 		if (fallbackModel) {
+			const requestedThinking = cliThinking ?? fallbackThinking;
+			const model =
+				requestedThinking && requestedThinking !== "off" ? { ...fallbackModel, reasoning: true } : fallbackModel;
 			const fallbackWarning = warning
 				? `${warning} Model "${fallbackPattern}" not found for provider "${provider}". Using custom model id.`
 				: `Model "${fallbackPattern}" not found for provider "${provider}". Using custom model id.`;
-			return { model: fallbackModel, thinkingLevel: fallbackThinking, warning: fallbackWarning, error: undefined };
+			return { model, thinkingLevel: fallbackThinking, warning: fallbackWarning, error: undefined };
 		}
 	}
 
@@ -549,10 +596,10 @@ export async function findInitialModel(options: {
 		};
 	}
 
-	// 3. Try saved default from settings
+	// 3. Try saved default from settings if auth is configured.
 	if (defaultProvider && defaultModelId) {
 		const found = modelRegistry.find(defaultProvider, defaultModelId);
-		if (found) {
+		if (found && modelRegistry.hasConfiguredAuth(found)) {
 			model = found;
 			if (defaultThinkingLevel) {
 				thinkingLevel = defaultThinkingLevel;

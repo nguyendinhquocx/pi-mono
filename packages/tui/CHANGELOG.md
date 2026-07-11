@@ -2,9 +2,84 @@
 
 ## [Unreleased]
 
+## [0.80.6] - 2026-07-09
+
+## [0.80.5] - 2026-07-09
+
+## [0.80.4] - 2026-07-09
+
 ### Fixed
 
+- Fixed editor paste marker accounting when paste markers are deleted or terminal state is cleared, preventing stale paste state after marker removal ([#6397](https://github.com/earendil-works/pi/pull/6397) by [@affanali2k3](https://github.com/affanali2k3)).
+
+## [0.80.3] - 2026-06-30
+
+### Added
+
+- Added an opt-in Markdown renderer option to preserve source backslash escapes for transcript rendering ([#6105](https://github.com/earendil-works/pi/issues/6105)).
+
+## [0.80.2] - 2026-06-23
+
+## [0.80.1] - 2026-06-23
+
+## [0.80.0] - 2026-06-23
+
+### Changed
+
+- Added `Ctrl+J` as a default newline keybinding alongside `Shift+Enter`.
+
+## [0.79.10] - 2026-06-22
+
+## [0.79.9] - 2026-06-20
+
+### Fixed
+
+- Fixed Markdown streaming code fence rendering so partial closing fences no longer make code blocks shrink or flicker while content streams ([#5846](https://github.com/earendil-works/pi/pull/5846) by [@xl0](https://github.com/xl0)).
+
+## [0.79.8] - 2026-06-19
+
+## [0.79.7] - 2026-06-18
+
+### Added
+
+- Added terminal color-scheme query and notification support for light/dark appearance detection (`TUI.queryTerminalColorScheme()`, `TUI.onTerminalColorSchemeChange()`, and `TUI.setTerminalColorSchemeNotifications()`) ([#5874](https://github.com/earendil-works/pi/pull/5874)).
+- Added Warp terminal detection for Kitty graphics inline image support ([#5841](https://github.com/earendil-works/pi/pull/5841) by [@dodiego](https://github.com/dodiego)).
+- Exported `sliceByColumn` for ANSI-aware horizontal column slicing.
+
+## [0.79.6] - 2026-06-16
+
+## [0.79.5] - 2026-06-16
+
+### Changed
+
+- Updated Markdown parsing to `marked` 18.0.5.
+
+### Fixed
+
+- Fixed editor Cursor Up handling so non-empty drafts jump to the start of the line before browsing input history ([#5789](https://github.com/earendil-works/pi/pull/5789) by [@4h9fbZ](https://github.com/4h9fbZ)).
+
+## [0.79.4] - 2026-06-15
+
+### Added
+
+- Added terminal background color query support for OSC 11 replies ([#5385](https://github.com/earendil-works/pi/pull/5385) by [@vegarsti](https://github.com/vegarsti)).
+
+### Fixed
+
+- Fixed overlay compositing over CJK wide characters so borders stay aligned when an overlay starts inside a full-width cell ([#5297](https://github.com/earendil-works/pi/issues/5297)).
+- Fixed WezTerm inline Kitty image rendering during full redraw fallbacks so image padding rows are reserved before the placement is drawn without regressing tall-image placement ([#5618](https://github.com/earendil-works/pi/issues/5618), [#4415](https://github.com/earendil-works/pi/issues/4415)).
+
+## [0.79.3] - 2026-06-13
+
+## [0.79.2] - 2026-06-12
+
+### Fixed
+
+- Fixed Markdown source list marker preservation to include unordered markers, so standalone `+` user messages no longer render as `-` ([#5657](https://github.com/earendil-works/pi/issues/5657)).
+- Fixed slash-separated fuzzy queries so provider/model completions remain matchable after insertion.
 - Fixed WezTerm inline Kitty image rendering so reserved row clears do not erase all but the top strip of tool image previews ([#5618](https://github.com/earendil-works/pi/issues/5618)).
+- Fixed editor wrapping for CJK text to break at character boundaries instead of leaving large trailing gaps ([#5585](https://github.com/earendil-works/pi/pull/5585) by [@haoqixu](https://github.com/haoqixu)).
+- Fixed loose Markdown list rendering to preserve blank-line separation between list items ([#5562](https://github.com/earendil-works/pi/pull/5562) by [@Perlence](https://github.com/Perlence)).
 
 ## [0.79.1] - 2026-06-09
 
