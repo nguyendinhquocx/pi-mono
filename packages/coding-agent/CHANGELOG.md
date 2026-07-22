@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Exposed `PI_SESSION_ID`, `PI_SESSION_FILE`, `PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL` to commands run by built-in and factory-created bash tools.
+
+### Fixed
+
+- Fixed explicit self-updates when `PI_SKIP_VERSION_CHECK` is set ([#6977](https://github.com/earendil-works/pi/issues/6977)).
+
 ## [0.81.1] - 2026-07-21
 
 ### New Features
@@ -57,6 +65,7 @@
 - Fixed llama.cpp router download progress updates and removed redundant wording from model action confirmations.
 - Moved automatic model catalog network refresh out of startup initialization and into the running interactive and RPC modes.
 - Fixed persisted sessions being read and parsed twice when opened, reducing startup latency for large sessions ([#6793](https://github.com/earendil-works/pi/issues/6793)).
+- Fixed slow Ctrl+G external-editor startup when the system temporary directory contains many entries ([#6774](https://github.com/earendil-works/pi/issues/6774)).
 - Fixed prompt-template defaults for all arguments (`${@:-default}` and `${ARGUMENTS:-default}`) ([#6695](https://github.com/earendil-works/pi/issues/6695)).
 - Fixed obsolete custom UI, custom tool, and custom editor examples in the extension documentation ([#6735](https://github.com/earendil-works/pi/issues/6735)).
 - Fixed Kimi Coding sessions to show API-equivalent implied costs with the subscription indicator.
