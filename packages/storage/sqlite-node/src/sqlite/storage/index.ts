@@ -1,13 +1,7 @@
-import type {
-	LeafEntry,
-	SessionEntryCursorOptions,
-	SessionStorage,
-	SessionTreeEntry,
-} from "@earendil-works/pi-agent-core";
-import { SessionError } from "@earendil-works/pi-agent-core";
+import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
+import { SessionError, toError } from "@earendil-works/pi-agent-core";
 import { uuidv7 } from "@earendil-works/pi-ai";
 import type { SqliteDatabase, SqliteSessionMetadata } from "../types.ts";
-import { getMaterializedBranchPathOrCompaction } from "./branch-entries.ts";
 import { decodeEntry, encodeEntry, type SessionEntryRow } from "./session-entries.ts";
 import {
 	applyEntryToMaterializedState,
@@ -19,28 +13,22 @@ import {
 	type SessionMaterializedRow,
 	type SessionMaterializedState,
 	serializeSummary,
-	sessionStatsFromMaterializedState,
 } from "./session-materialized.ts";
 import { advanceSequence, getNextSequence } from "./session-sequences.ts";
 import { rowToMetadata, type SessionRow } from "./sessions.ts";
-import { generateEntryId, invalidSession, leafIdAfterEntry } from "./shared.ts";
+import { invalidEntry, invalidSession, leafIdAfterEntry } from "./shared.ts";
 
-async function decodeEntryRows(entryRows: SessionEntryRow[]): Promise<{
-	entries: SessionTreeEntry[];
-	leafId: string | null;
-}> {
+function decodeEntryRows(entryRows: SessionEntryRow[]): SessionTreeEntry[] {
 	const entries: SessionTreeEntry[] = [];
-	let leafId: string | null = null;
 	for (const entryRow of entryRows) {
 		try {
 			const entry = decodeEntry(entryRow);
 			entries.push(entry);
-			leafId = leafIdAfterEntry(entry);
-		} catch {
-			// Keep JSONL-like permissive resume behavior: skip malformed entries.
+		} catch (error) {
+			throw invalidEntry(`failed to decode entry ${entryRow.id}`, toError(error));
 		}
 	}
-	return { entries, leafId };
+	return entries;
 }
 
 async function loadEntryRowsByIds(
@@ -81,7 +69,7 @@ async function hasExistingChild(db: SqliteDatabase, sessionId: string, parentId:
 	return row !== undefined;
 }
 
-async function loadSqliteStorage(
+async function loadSqliteSession(
 	db: SqliteDatabase,
 	sessionId: string,
 ): Promise<{
@@ -113,11 +101,10 @@ async function loadSqliteStorage(
 	};
 }
 
-export class SqliteSessionStorage implements SessionStorage<SqliteSessionMetadata> {
+export class SqliteSessionConnection {
 	private readonly db: SqliteDatabase;
 	private readonly metadata: SqliteSessionMetadata;
 	private byId: Map<string, SessionTreeEntry>;
-	private labelsById: Map<string, string>;
 	private currentLeafId: string | null;
 	private activeBranchId: string | null;
 	private materializedState: SessionMaterializedState;
@@ -185,26 +172,23 @@ export class SqliteSessionStorage implements SessionStorage<SqliteSessionMetadat
 	private constructor(
 		db: SqliteDatabase,
 		metadata: SqliteSessionMetadata,
-		entries: SessionTreeEntry[] | null,
 		leafId: string | null,
 		activeBranchId: string | null,
 		materializedState: SessionMaterializedState,
 	) {
 		this.db = db;
 		this.metadata = metadata;
-		this.byId = new Map((entries ?? []).map((entry) => [entry.id, entry]));
+		this.byId = new Map<string, SessionTreeEntry>();
 		this.materializedState = materializedState;
-		this.labelsById = materializedState.labelsById;
 		this.currentLeafId = leafId;
 		this.activeBranchId = activeBranchId;
 	}
 
-	static async open(db: SqliteDatabase, metadata: SqliteSessionMetadata): Promise<SqliteSessionStorage> {
-		const loaded = await loadSqliteStorage(db, metadata.id);
-		return new SqliteSessionStorage(
+	static async open(db: SqliteDatabase, metadata: SqliteSessionMetadata): Promise<SqliteSessionConnection> {
+		const loaded = await loadSqliteSession(db, metadata.id);
+		return new SqliteSessionConnection(
 			db,
 			rowToMetadata(loaded.row, metadata.path),
-			null,
 			loaded.leafId,
 			loaded.activeBranchId,
 			loaded.materializedState,
@@ -220,7 +204,7 @@ export class SqliteSessionStorage implements SessionStorage<SqliteSessionMetadat
 			parentSessionId?: string;
 			metadata?: Record<string, unknown>;
 		},
-	): Promise<SqliteSessionStorage> {
+	): Promise<SqliteSessionConnection> {
 		const createdAt = new Date().toISOString();
 		await db
 			.prepare(
@@ -238,7 +222,7 @@ export class SqliteSessionStorage implements SessionStorage<SqliteSessionMetadat
 		await db
 			.prepare("INSERT INTO session_materialized (session_id, payload) VALUES (?, ?)")
 			.run(...materializedStateValues(options.sessionId, createEmptyMaterializedState()));
-		return new SqliteSessionStorage(
+		return new SqliteSessionConnection(
 			db,
 			{
 				id: options.sessionId,
@@ -248,7 +232,6 @@ export class SqliteSessionStorage implements SessionStorage<SqliteSessionMetadat
 				parentSessionId: options.parentSessionId,
 				metadata: options.metadata,
 			},
-			[],
 			null,
 			null,
 			createEmptyMaterializedState(),
@@ -259,36 +242,7 @@ export class SqliteSessionStorage implements SessionStorage<SqliteSessionMetadat
 		return this.metadata;
 	}
 
-	async getLeafId(): Promise<string | null> {
-		return this.currentLeafId;
-	}
-
-	async setLeafId(leafId: string | null): Promise<void> {
-		if (leafId !== null && !(await this.getEntry(leafId))) {
-			throw new SessionError("not_found", `Entry ${leafId} not found`);
-		}
-		const entry: LeafEntry = {
-			type: "leaf",
-			id: await this.createEntryId(),
-			parentId: this.currentLeafId,
-			timestamp: new Date().toISOString(),
-			targetId: leafId,
-		};
-		await this.appendEntry(entry);
-	}
-
-	async createEntryId(): Promise<string> {
-		for (let i = 0; i < 100; i++) {
-			const id = generateEntryId(this.byId);
-			const existing = await this.db
-				.prepare("SELECT 1 AS found FROM session_entries WHERE session_id = ? AND id = ? LIMIT 1")
-				.get<{ found: number }>(this.metadata.id, id);
-			if (!existing) return id;
-		}
-		return uuidv7();
-	}
-
-	async appendEntry(entry: SessionTreeEntry): Promise<void> {
+	async appendEntry(entry: SessionTreeEntry, options: { transaction?: boolean } = {}): Promise<void> {
 		const encoded = encodeEntry(entry);
 		const previousMaterializedState: SessionMaterializedState = {
 			...this.materializedState,
@@ -301,7 +255,7 @@ export class SqliteSessionStorage implements SessionStorage<SqliteSessionMetadat
 		const previousActiveBranchId = this.activeBranchId;
 		try {
 			applyEntryToMaterializedState(this.materializedState, entry);
-			await this.db.transaction(async () => {
+			const write = async () => {
 				const parentHadExistingChild = await hasExistingChild(this.db, this.metadata.id, entry.parentId);
 				const nextSeq = await getNextSequence(this.db, this.metadata.id);
 				await this.db
@@ -333,19 +287,20 @@ export class SqliteSessionStorage implements SessionStorage<SqliteSessionMetadat
 					}
 					await this.appendToActiveBranch(entry.id, entry.parentId);
 				}
-			});
+			};
+			if (options.transaction === false) await write();
+			else await this.db.transaction(write);
 		} catch (error) {
 			this.materializedState = previousMaterializedState;
-			this.labelsById = previousMaterializedState.labelsById;
 			this.byId = previousById;
 			this.currentLeafId = previousLeafId;
 			this.activeBranchId = previousActiveBranchId;
 			if (error instanceof SessionError) throw error;
-			throw new SessionError("storage", `Failed to append SQLite session entry ${entry.id}`);
+			throw new SessionError("storage", `Failed to append SQLite session entry ${entry.id}`, toError(error));
 		}
 	}
 
-	async getEntry(id: string): Promise<SessionTreeEntry | undefined> {
+	private async getEntry(id: string): Promise<SessionTreeEntry | undefined> {
 		const cached = this.byId.get(id);
 		if (cached) return cached;
 		const row = await this.db
@@ -358,92 +313,21 @@ export class SqliteSessionStorage implements SessionStorage<SqliteSessionMetadat
 			const entry = decodeEntry(row);
 			this.byId.set(entry.id, entry);
 			return entry;
-		} catch {
-			return undefined;
+		} catch (error) {
+			throw invalidEntry(`failed to decode entry ${row.id}`, toError(error));
 		}
 	}
 
-	async findEntries<TType extends SessionTreeEntry["type"]>(
-		type: TType,
-	): Promise<Array<Extract<SessionTreeEntry, { type: TType }>>> {
-		const rows = await this.db
-			.prepare(
-				"SELECT session_id, id, entry_seq, parent_id, type, timestamp, payload FROM session_entries WHERE session_id = ? AND type = ? ORDER BY entry_seq",
-			)
-			.all<SessionEntryRow>(this.metadata.id, type);
-		const entries: Array<Extract<SessionTreeEntry, { type: TType }>> = [];
-		for (const row of rows) {
-			try {
-				const entry = decodeEntry(row) as Extract<SessionTreeEntry, { type: TType }>;
-				this.byId.set(entry.id, entry);
-				entries.push(entry);
-			} catch {
-				// Keep JSONL-like permissive resume behavior: skip malformed entries.
-			}
-		}
-		return entries;
-	}
-
-	async getLabel(id: string): Promise<string | undefined> {
-		return this.labelsById.get(id);
-	}
-
-	async getSessionName(): Promise<string | undefined> {
-		return this.materializedState.name;
-	}
-
-	async getSessionStats() {
-		return sessionStatsFromMaterializedState(this.materializedState);
-	}
-
-	async getPathToRootOrCompaction(leafId: string | null): Promise<SessionTreeEntry[]> {
-		if (leafId === null) return [];
-		if (leafId === this.currentLeafId) {
-			if (!this.activeBranchId) {
-				throw invalidSession(`missing active branch for session ${this.metadata.id} leaf ${leafId}`);
-			}
-			return getMaterializedBranchPathOrCompaction(this.db, this.metadata.id, this.activeBranchId, this.byId);
-		}
-		return this.getPathToRootOrCompactionEntries(leafId);
-	}
-
-	async getEntries(options?: SessionEntryCursorOptions): Promise<SessionTreeEntry[]> {
-		const limit = options?.limit;
-		if (limit !== undefined) {
-			const beforeOrAtEntrySeq =
-				options?.afterEntrySeq ??
-				(
-					await this.db
-						.prepare("SELECT entry_seq FROM session_entries WHERE session_id = ? ORDER BY entry_seq DESC LIMIT 1")
-						.get<{ entry_seq: number }>(this.metadata.id)
-				)?.entry_seq;
-			if (beforeOrAtEntrySeq === undefined) {
-				return [];
-			}
-			const rows = await this.db
-				.prepare(
-					"SELECT session_id, id, entry_seq, parent_id, type, timestamp, payload FROM session_entries WHERE session_id = ? AND entry_seq <= ? ORDER BY entry_seq DESC LIMIT ?",
-				)
-				.all<SessionEntryRow>(this.metadata.id, beforeOrAtEntrySeq, limit);
-			const entries = (await decodeEntryRows(rows)).entries;
-			for (const entry of entries) {
-				this.byId.set(entry.id, entry);
-			}
-			return entries.reverse();
-		}
+	async getEntries(): Promise<SessionTreeEntry[]> {
 		const rows = await this.db
 			.prepare(
 				"SELECT session_id, id, entry_seq, parent_id, type, timestamp, payload FROM session_entries WHERE session_id = ? ORDER BY entry_seq",
 			)
 			.all<SessionEntryRow>(this.metadata.id);
-		const entries = (await decodeEntryRows(rows)).entries;
+		const entries = decodeEntryRows(rows);
 		for (const entry of entries) {
 			this.byId.set(entry.id, entry);
 		}
 		return entries;
-	}
-
-	async cleanup(): Promise<void> {
-		await this.db.close();
 	}
 }
