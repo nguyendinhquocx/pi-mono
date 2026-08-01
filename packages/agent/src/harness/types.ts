@@ -526,9 +526,44 @@ export interface SessionForkOptions {
 	id?: string;
 }
 
-export interface SessionSnapshot<TMetadata extends SessionMetadata = SessionMetadata> {
-	metadata: TMetadata;
-	entries: SessionTreeEntry[];
+export type SessionForkSelection =
+	/** Copy all persisted entries in append order. */
+	| { kind: "all" }
+	/** Copy the target's active path, excluding the target; the target must be a user message. */
+	| { kind: "before_user_message"; entryId: string }
+	/** Copy the target's active path, including the target. */
+	| { kind: "through_entry"; entryId: string };
+
+export interface SessionBranchQuery {
+	/** Entry where traversal starts. Session defaults this to its active leaf. */
+	start?: string | null;
+	/** Stop after the first matching entry, inclusive. */
+	stopAtType?: SessionTreeEntry["type"];
+	/** Stop after the matching entry, inclusive. */
+	stopAtId?: string;
+	/** Filter returned entries by type after determining traversal bounds. */
+	type?: SessionTreeEntry["type"];
+	/** Filter returned custom entries by custom type. */
+	customType?: string;
+	/** Traversal order. Defaults to newest first. */
+	order?: "newestFirst" | "oldestFirst";
+	/** Maximum number of filtered entries to return. */
+	limit?: number;
+}
+
+export interface SessionHead {
+	leafId: string | null;
+}
+
+/** Canonical reads for one stored session. Its lifetime is owned by the containing {@link SessionStore}. */
+export interface SessionReader<TMetadata extends SessionMetadata = SessionMetadata> {
+	readonly metadata: TMetadata;
+	/** Rejects with `invalid_session` when a non-null active leaf does not reference a stored entry. */
+	readHead(): Promise<SessionHead>;
+	readEntry(id: string): Promise<SessionTreeEntry | undefined>;
+	readEntries(options?: SessionEntryCursorOptions): Promise<readonly SessionTreeEntry[]>;
+	findEntriesOnBranch(query: SessionBranchQuery & { start: string | null }): Promise<readonly SessionTreeEntry[]>;
+	readPathToRootOrCompaction(leafId: string | null): Promise<readonly SessionTreeEntry[]>;
 }
 
 /** Owns persistence and resources shared by all sessions in a repository. */
@@ -537,16 +572,12 @@ export interface SessionStore<
 	TCreateOptions extends SessionCreateOptions = SessionCreateOptions,
 	TListOptions = void,
 > extends AsyncDisposable {
-	create(options: TCreateOptions): Promise<SessionSnapshot<TMetadata>>;
-	load(metadata: TMetadata): Promise<SessionSnapshot<TMetadata>>;
+	create(options: TCreateOptions): Promise<SessionReader<TMetadata>>;
+	load(metadata: TMetadata): Promise<SessionReader<TMetadata>>;
 	list(options?: TListOptions): Promise<TMetadata[]>;
 	appendEntry(metadata: TMetadata, entry: SessionTreeEntry): Promise<void>;
 	delete(metadata: TMetadata): Promise<void>;
-	fork(
-		source: TMetadata,
-		options: SessionForkOptions & TCreateOptions,
-		entries: readonly SessionTreeEntry[],
-	): Promise<SessionSnapshot<TMetadata>>;
+	fork(source: TMetadata, options: TCreateOptions, selection: SessionForkSelection): Promise<SessionReader<TMetadata>>;
 }
 
 export interface JsonlSessionCreateOptions extends SessionCreateOptions {
