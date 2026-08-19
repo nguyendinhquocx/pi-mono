@@ -304,15 +304,17 @@ export interface ImagesOptions extends ProviderRequestOptions<ImagesModel<Images
 
 export type ProviderImagesOptions = ImagesOptions & Record<string, unknown>;
 
-export type AnthropicRefusalFallback = "default" | readonly { model: string }[];
+export interface AnthropicAllowedFallbackModel {
+	provider: ProviderId;
+	model: string;
+	cost: ModelCost;
+}
 
 // Unified options with reasoning passed to streamSimple() and completeSimple()
 export interface SimpleStreamOptions extends StreamOptions {
 	/** Provider-neutral tool selection for simple requests. Default: "auto". */
 	toolChoice?: ToolChoice;
 	reasoning?: ThinkingLevel;
-	/** Anthropic server-side fallback for eligible refusal stop reasons. Anthropic providers only. */
-	refusalFallbacks?: AnthropicRefusalFallback;
 	/** Ask a capable provider to return a durable handle and continue the request asynchronously. */
 	deferred?: boolean | { window?: "15m" | "1h" | "24h" };
 	/** Custom token budgets for thinking levels (token-based providers only) */
@@ -430,6 +432,7 @@ export interface AssistantMessage {
 	model: string;
 	responseModel?: string; // Concrete `chunk.model` when different from the requested `model` (e.g. OpenRouter `auto` -> `anthropic/...`)
 	responseId?: string; // Provider-specific response/message identifier when the upstream API exposes one
+	reasoningDetails?: JsonValue[]; // Provider-specific structured reasoning details to replay verbatim on later same-model turns.
 	diagnostics?: AssistantMessageDiagnostic[]; // Redacted provider/runtime diagnostics for failures and recoveries.
 	usage: Usage;
 	stopReason: StopReason;
@@ -691,11 +694,12 @@ export interface AnthropicMessagesCompat {
 	/** Whether the provider supports Anthropic strict tool schemas. Default: false; generated Anthropic models enable it explicitly. */
 	supportsStrictTools?: boolean;
 	/**
-	 * Model ids Anthropic accepts in `fallbacks` for server-side refusal fallback.
-	 * When absent or empty, callers must omit `fallbacks`; Anthropic rejects the
-	 * field for models with no permitted fallback targets.
+	 * Models Anthropic accepts in `fallbacks` for server-side refusal fallback,
+	 * with local pricing metadata for returned fallback responses. When absent or
+	 * empty, callers must omit `fallbacks`; Anthropic rejects the field for models
+	 * with no permitted fallback targets.
 	 */
-	allowedFallbackModels?: string[];
+	allowedFallbackModels?: AnthropicAllowedFallbackModel[];
 	/**
 	 * Whether the provider supports deferred tools loaded by `tool_reference`
 	 * blocks in tool results. Default: true for first-party Anthropic models
