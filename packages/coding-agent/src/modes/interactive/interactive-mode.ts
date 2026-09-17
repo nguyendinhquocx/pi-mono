@@ -35,6 +35,7 @@ import {
 	Spacer,
 	setCapabilityOverrides,
 	setKeybindings,
+	type Terminal,
 	Text,
 	TruncatedText,
 	type TUI,
@@ -371,6 +372,8 @@ export interface InteractiveModeOptions {
 	tuiMode?: TuiMode;
 	/** Initial interactive theme setting for this invocation. */
 	initialThemeSetting?: string;
+	/** Terminal implementation. Defaults to the current process terminal. */
+	terminal?: Terminal;
 }
 
 export class InteractiveMode {
@@ -536,6 +539,7 @@ export class InteractiveMode {
 			tuiMode,
 			showHardwareCursor: this.settingsManager.getShowHardwareCursor(),
 			logDirectory: getAgentDir(),
+			terminal: options.terminal,
 			onRightClickPaste: this.onRightClickPaste,
 			fullscreenCopyOnSelect: this.settingsManager.getFullscreenCopyOnSelect(),
 		});
@@ -3824,20 +3828,18 @@ export class InteractiveMode {
 			const transformations = diagnostic.details?.transformations;
 			if (!Array.isArray(transformations)) continue;
 
-			const dropped = transformations.flatMap((transformation): string[] => {
-				if (typeof transformation !== "object" || transformation === null) return [];
-				const details = transformation as Record<string, unknown>;
-				if (details.type !== "thinking_dropped") return [];
-				const reason = typeof details.reason === "string" ? details.reason : "unknown reason";
-				const location = typeof details.path === "string" ? ` at ${details.path}` : "";
-				return [`${reason}${location}`];
-			});
-			if (dropped.length === 0) continue;
+			const droppedCount = transformations.filter(
+				(transformation) =>
+					typeof transformation === "object" &&
+					transformation !== null &&
+					(transformation as Record<string, unknown>).type === "thinking_dropped",
+			).length;
+			if (droppedCount === 0) continue;
 
-			const noun = dropped.length === 1 ? "thinking block" : `${dropped.length} thinking blocks`;
+			const noun = droppedCount === 1 ? "1 thinking block" : `${droppedCount} thinking blocks`;
 			this.chatContainer.addChild(new Spacer(1));
 			this.chatContainer.addChild(
-				new Text(theme.fg("warning", `Anthropic dropped ${noun}: ${dropped.join("; ")}`), 1, 0),
+				new Text(theme.fg("warning", `Anthropic dropped ${noun} (details in session)`), 1, 0),
 			);
 		}
 	}
