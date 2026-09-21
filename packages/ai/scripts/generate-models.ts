@@ -640,7 +640,7 @@ const OPENAI_COMPLETIONS_DEFAULT_COMPAT = {
 	chatTemplateKwargs: {},
 	chatTemplateArgs: {},
 	zaiToolStream: false,
-	supportsStrictMode: true,
+	supportsStrictMode: false,
 	supportsOpenAIGrammarTools: false,
 	supportsMidConvoSystemMessages: false,
 	supportsMidConvoToolAdditions: false,
@@ -744,6 +744,7 @@ function detectOpenAICompletionsCompat(model: Model<"openai-completions">): Open
 		chatTemplateKwargs: {},
 		chatTemplateArgs: {},
 		zaiToolStream: false,
+		// Preserve built-in behavior as explicit metadata against the conservative runtime default.
 		supportsStrictMode: !isMoonshot && !isTogether && !isCloudflareAiGateway && !isNvidia && !isCerebras,
 		supportsOpenAIGrammarTools: false,
 		supportsMidConvoSystemMessages: false,
@@ -2029,12 +2030,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					compat: { ...XAI_RESPONSES_COMPAT },
 					reasoning: m.reasoning === true,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 				});
