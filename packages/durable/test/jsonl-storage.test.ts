@@ -66,24 +66,30 @@ class ReopeningStorage implements Storage {
 
 	mintId: Storage["mintId"] = () => this.current.mintId();
 	conversation: Storage["conversation"] = (id, readContext) => this.current.conversation(id, readContext);
-	scanConversations: Storage["scanConversations"] = (cursor, limit, readContext) =>
-		this.current.scanConversations(cursor, limit, readContext);
-	entry: Storage["entry"] = (id, readContext) => this.current.entry(id, readContext);
+	scanConversations: Storage["scanConversations"] = (limit, cursor, readContext) =>
+		this.current.scanConversations(limit, cursor, readContext);
+	entry(id: number, readContext: Context): ReturnType<Storage["entry"]>;
+	entry(conversationId: number, id: number, readContext: Context): ReturnType<Storage["entry"]>;
+	entry(idOrConversationId: number, idOrContext: number | Context, readContext?: Context) {
+		return readContext === undefined
+			? this.current.entry(idOrConversationId, idOrContext as Context)
+			: this.current.entry(idOrConversationId, idOrContext as number, readContext);
+	}
 	findLatestHeadMarker: Storage["findLatestHeadMarker"] = (conversationId, at, readContext) =>
 		this.current.findLatestHeadMarker(conversationId, at, readContext);
-	scanEntries: Storage["scanEntries"] = (query, cursor, limit, readContext) =>
-		this.current.scanEntries(query, cursor, limit, readContext);
+	scanEntries: Storage["scanEntries"] = (query, limit, cursor, readContext) =>
+		this.current.scanEntries(query, limit, cursor, readContext);
 	task: Storage["task"] = (id, readContext) => this.current.task(id, readContext);
-	scanTasks: Storage["scanTasks"] = (query, cursor, limit, readContext) =>
-		this.current.scanTasks(query, cursor, limit, readContext);
+	scanTasks: Storage["scanTasks"] = (query, limit, cursor, readContext) =>
+		this.current.scanTasks(query, limit, cursor, readContext);
 	submission: Storage["submission"] = (id, readContext) => this.current.submission(id, readContext);
 	submissionByRequest: Storage["submissionByRequest"] = (conversationId, requestId, readContext) =>
 		this.current.submissionByRequest(conversationId, requestId, readContext);
 	findDocument: Storage["findDocument"] = (address, at, readContext) =>
 		this.current.findDocument(address, at, readContext);
 	document: Storage["document"] = (id, at, readContext) => this.current.document(id, at, readContext);
-	scanDocuments: Storage["scanDocuments"] = (query, cursor, limit, readContext) =>
-		this.current.scanDocuments(query, cursor, limit, readContext);
+	scanDocuments: Storage["scanDocuments"] = (query, limit, cursor, readContext) =>
+		this.current.scanDocuments(query, limit, cursor, readContext);
 
 	async close(closeContext: Context): Promise<void> {
 		if (this.closed) return;

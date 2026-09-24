@@ -2,7 +2,7 @@ import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { JsonValue } from "@earendil-works/chord";
+import type { Context, JsonValue } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { registerStorageConformance } from "@earendil-works/pi-durable/testing";
 import { afterEach, describe, expect, it } from "vitest";
@@ -55,24 +55,30 @@ class ReopeningStorage implements Storage {
 
 	mintId: Storage["mintId"] = () => this.current.mintId();
 	conversation: Storage["conversation"] = (id, readContext) => this.current.conversation(id, readContext);
-	scanConversations: Storage["scanConversations"] = (cursor, limit, readContext) =>
-		this.current.scanConversations(cursor, limit, readContext);
-	entry: Storage["entry"] = (id, readContext) => this.current.entry(id, readContext);
+	scanConversations: Storage["scanConversations"] = (limit, cursor, readContext) =>
+		this.current.scanConversations(limit, cursor, readContext);
+	entry(id: number, readContext: Context): ReturnType<Storage["entry"]>;
+	entry(conversationId: number, id: number, readContext: Context): ReturnType<Storage["entry"]>;
+	entry(idOrConversationId: number, idOrContext: number | Context, readContext?: Context) {
+		return readContext === undefined
+			? this.current.entry(idOrConversationId, idOrContext as Context)
+			: this.current.entry(idOrConversationId, idOrContext as number, readContext);
+	}
 	findLatestHeadMarker: Storage["findLatestHeadMarker"] = (conversationId, at, readContext) =>
 		this.current.findLatestHeadMarker(conversationId, at, readContext);
-	scanEntries: Storage["scanEntries"] = (query, cursor, limit, readContext) =>
-		this.current.scanEntries(query, cursor, limit, readContext);
+	scanEntries: Storage["scanEntries"] = (query, limit, cursor, readContext) =>
+		this.current.scanEntries(query, limit, cursor, readContext);
 	task: Storage["task"] = (id, readContext) => this.current.task(id, readContext);
-	scanTasks: Storage["scanTasks"] = (query, cursor, limit, readContext) =>
-		this.current.scanTasks(query, cursor, limit, readContext);
+	scanTasks: Storage["scanTasks"] = (query, limit, cursor, readContext) =>
+		this.current.scanTasks(query, limit, cursor, readContext);
 	submission: Storage["submission"] = (id, readContext) => this.current.submission(id, readContext);
 	submissionByRequest: Storage["submissionByRequest"] = (conversationId, requestId, readContext) =>
 		this.current.submissionByRequest(conversationId, requestId, readContext);
 	findDocument: Storage["findDocument"] = (address, at, readContext) =>
 		this.current.findDocument(address, at, readContext);
 	document: Storage["document"] = (id, at, readContext) => this.current.document(id, at, readContext);
-	scanDocuments: Storage["scanDocuments"] = (query, cursor, limit, readContext) =>
-		this.current.scanDocuments(query, cursor, limit, readContext);
+	scanDocuments: Storage["scanDocuments"] = (query, limit, cursor, readContext) =>
+		this.current.scanDocuments(query, limit, cursor, readContext);
 
 	async close(closeContext: Parameters<Storage["close"]>[0]): Promise<void> {
 		if (this.closed) return;
@@ -193,6 +199,82 @@ describe("Pico SqliteStorage", () => {
 		await expect(storage.document(id, "current", context)).rejects.toThrow(
 			`Document ${id} is missing a required base`,
 		);
+	});
+
+	it("replays detached root replacements and follow-up edits while rejecting corrupt operations", async () => {
+		const { storage, path } = await createSqliteStorage();
+		await createRoot(storage);
+		const id = await storage.mintId();
+		await storage.commit(
+			[
+				{
+					type: "document.create",
+					record: { id, kind: "replay", scope: { kind: "session" } },
+					content: { kind: "base", version: 1, value: { nested: { value: 1 }, rows: [] } },
+				},
+			],
+			context,
+		);
+		await storage.commit(
+			[
+				{
+					type: "document.change",
+					id,
+					content: {
+						kind: "delta",
+						version: 1,
+						ops: [["r", { nested: { value: 2 }, rows: [{ id: 1 }] }]],
+					},
+				},
+			],
+			context,
+		);
+		await storage.commit(
+			[
+				{
+					type: "document.change",
+					id,
+					content: {
+						kind: "delta",
+						version: 1,
+						ops: [
+							["s", ["nested", "value"], 3],
+							["p", ["rows"], 1, 0, [{ id: 2 }]],
+							["m", ["rows"], [1, 0]],
+						],
+					},
+				},
+			],
+			context,
+		);
+		await storage.commit(
+			[
+				{
+					type: "document.change",
+					id,
+					content: { kind: "delta", version: 1, ops: [["s", ["nested", "value"], 4]] },
+				},
+			],
+			context,
+		);
+
+		const expected = { nested: { value: 4 }, rows: [{ id: 2 }, { id: 1 }] };
+		const first = (await storage.document(id, "current", context))!;
+		expect(first.value).toEqual(expected);
+		(first.value.nested as { value: number }).value = 99;
+		(first.value.rows as Array<{ id: number }>)[0]!.id = 99;
+		expect((await storage.document(id, "current", context))?.value).toEqual(expected);
+
+		const database = new DatabaseSync(path);
+		try {
+			database
+				.prepare(`UPDATE document_revisions SET content = ? WHERE document_id = ? AND seq =
+					(SELECT max(seq) FROM document_revisions WHERE document_id = ?)`)
+				.run('[["unknown"]]', id, id);
+		} finally {
+			database.close();
+		}
+		await expect(storage.document(id, "current", context)).rejects.toThrow("unknown op verb");
 	});
 
 	it("rolls SQL rows and sequence allocation back as one transaction", async () => {

@@ -1,5 +1,5 @@
 import type { Context, JsonValue } from "@earendil-works/chord";
-import { applyImmutable, type Op } from "@earendil-works/chord/delta";
+import { apply, type Op } from "@earendil-works/chord/delta";
 import type {
 	ConversationRecord,
 	Cursor,
@@ -213,8 +213,8 @@ export class SqliteStorage implements Storage {
 	}
 
 	async scanConversations(
-		cursor: Cursor | undefined,
 		limit: number,
+		cursor: Cursor | undefined,
 		_context: Context,
 	): Promise<Page<ConversationRecord, Cursor>> {
 		this.assertOpen();
@@ -230,13 +230,36 @@ export class SqliteStorage implements Storage {
 		);
 	}
 
-	async entry(
+	entry(id: Id, context: Context): Promise<{ readonly entry: EntryRecord; readonly commitSeq: Seq } | undefined>;
+	entry(
+		conversationId: Id,
 		id: Id,
-		_context: Context,
+		context: Context,
+	): Promise<{ readonly entry: EntryRecord; readonly commitSeq: Seq } | undefined>;
+	async entry(
+		idOrConversationId: Id,
+		idOrContext: Id | Context,
+		context?: Context,
 	): Promise<{ readonly entry: EntryRecord; readonly commitSeq: Seq } | undefined> {
 		this.assertOpen();
+		let conversation = context === undefined ? undefined : this.readConversation(idOrConversationId);
+		if (context !== undefined && conversation === undefined) {
+			throw new Error(`Unknown conversation: ${idOrConversationId}`);
+		}
+		const id = context === undefined ? idOrConversationId : (idOrContext as Id);
 		const row = getRow<EntryJsonRow>(this.db.prepare("SELECT record, commit_seq FROM entries WHERE id = ?"), id);
-		return row === undefined ? undefined : { entry: parseJson<EntryRecord>(row.record), commitSeq: row.commit_seq };
+		if (row === undefined) return undefined;
+		const entry = parseJson<EntryRecord>(row.record);
+		if (conversation !== undefined) {
+			let upperEntryId = Number.POSITIVE_INFINITY;
+			while (conversation.id !== entry.conversationId) {
+				if (conversation.parent === undefined) return undefined;
+				upperEntryId = Math.min(upperEntryId, conversation.parent.at);
+				conversation = this.readConversation(conversation.parent.conversationId)!;
+			}
+			if (entry.id > upperEntryId) return undefined;
+		}
+		return { entry, commitSeq: row.commit_seq };
 	}
 
 	async findLatestHeadMarker(
@@ -273,8 +296,8 @@ export class SqliteStorage implements Storage {
 
 	async scanEntries(
 		query: EntryQuery,
-		cursor: Cursor | undefined,
 		limit: number,
+		cursor: Cursor | undefined,
 		_context: Context,
 	): Promise<Page<EntryRecord, Cursor>> {
 		this.assertOpen();
@@ -317,8 +340,8 @@ export class SqliteStorage implements Storage {
 
 	async scanTasks(
 		query: TaskQuery,
-		cursor: Cursor | undefined,
 		limit: number,
+		cursor: Cursor | undefined,
 		_context: Context,
 	): Promise<Page<StoredTask, Cursor>> {
 		this.assertOpen();
@@ -426,15 +449,15 @@ export class SqliteStorage implements Storage {
 			if (revision.kind !== "delta" || revision.version !== base.version) {
 				throw new Error(`Document ${id} crosses a stored version boundary without a base`);
 			}
-			value = applyImmutable(value, parseJson<readonly Op[]>(revision.content)) as JsonObject;
+			value = apply(value, parseJson<readonly Op[]>(revision.content)) as JsonObject;
 		}
 		return { record, version: base.version, value };
 	}
 
 	async scanDocuments(
 		query: DocumentQuery,
-		cursor: Cursor | undefined,
 		limit: number,
+		cursor: Cursor | undefined,
 		_context: Context,
 	): Promise<Page<DocumentRecord, Cursor>> {
 		this.assertOpen();
@@ -544,9 +567,6 @@ export class SqliteStorage implements Storage {
 			if (action.create === undefined && existing === undefined) throw new Error(`Unknown document: ${id}`);
 			if (action.create !== undefined && existing !== undefined) throw new Error(`Document ${id} already exists`);
 			if (existing?.retiredAt !== undefined) throw new Error(`Document ${id} is retired`);
-			if (action.create !== undefined && action.content?.kind !== "base") {
-				throw new Error(`Document ${id} creation requires a base`);
-			}
 			if (action.content?.kind === "delta") {
 				const previous = getRow<{ readonly version: number }>(
 					this.db.prepare(
