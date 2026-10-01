@@ -126,7 +126,8 @@ describe("MCP OAuth", () => {
 			if (url.pathname === "/register") {
 				const metadata = JSON.parse(await readBody(request)) as Record<string, unknown>;
 				response.writeHead(201, { "content-type": "application/json" });
-				response.end(JSON.stringify({ ...metadata, client_id: "test-client" }));
+				// Empty and null optional fields count as absent (#10266).
+				response.end(JSON.stringify({ ...metadata, client_id: "test-client", client_secret: "" }));
 				return;
 			}
 			if (url.pathname === "/authorize") {
@@ -142,7 +143,14 @@ describe("MCP OAuth", () => {
 				if (params.get("grant_type") === "refresh_token") {
 					refreshes++;
 					response.setHeader("content-type", "application/json");
-					response.end(JSON.stringify({ access_token: "refreshed-token", token_type: "Bearer" }));
+					response.end(
+						JSON.stringify({
+							access_token: "refreshed-token",
+							token_type: "Bearer",
+							refresh_token: "",
+							expires_in: null,
+						}),
+					);
 					return;
 				}
 				const challenge = createHash("sha256")
@@ -155,7 +163,12 @@ describe("MCP OAuth", () => {
 				}
 				response.setHeader("content-type", "application/json");
 				response.end(
-					JSON.stringify({ access_token: "first-token", refresh_token: "refresh-token", token_type: "Bearer" }),
+					JSON.stringify({
+						access_token: "first-token",
+						refresh_token: "refresh-token",
+						token_type: "Bearer",
+						scope: "",
+					}),
 				);
 				return;
 			}
@@ -178,7 +191,8 @@ describe("MCP OAuth", () => {
 			if (token !== "Bearer first-token" && token !== "Bearer refreshed-token") {
 				await readBody(request);
 				response.writeHead(401, {
-					"www-authenticate": `Bearer resource_metadata="${serverOrigin}/.well-known/oauth-protected-resource/mcp", scope="org:read"`,
+					// An empty scope falls through to the resource metadata's scopes_supported.
+					"www-authenticate": `Bearer resource_metadata="${serverOrigin}/.well-known/oauth-protected-resource/mcp", scope=""`,
 				});
 				response.end("Unauthorized");
 				return;
@@ -251,7 +265,13 @@ describe("MCP OAuth", () => {
 				openGetStream: false,
 			}),
 		);
-		expect(provider.tokenSet?.access_token).toBe("refreshed-token");
+		// Neither token response names a scope, so the grant has the requested scope.
+		expect(provider.tokenSet).toEqual({
+			access_token: "refreshed-token",
+			refresh_token: "refresh-token",
+			token_type: "Bearer",
+			scope: "org:read",
+		});
 		expect(refreshes).toBe(1);
 		await refreshedClient.close();
 		await callback.close();
@@ -261,6 +281,12 @@ describe("MCP OAuth", () => {
 		const grants: string[] = [];
 		const origin = await listen(async (request, response, serverOrigin) => {
 			const url = new URL(request.url ?? "/", serverOrigin);
+			if (url.pathname === "/.well-known/oauth-protected-resource/mcp") {
+				// Invalid resource metadata falls back to the server origin instead of failing discovery.
+				response.setHeader("content-type", "application/json");
+				response.end(JSON.stringify({ resource: `${serverOrigin}/mcp`, authorization_servers: ["not a url"] }));
+				return;
+			}
 			if (url.pathname === "/.well-known/oauth-authorization-server") {
 				response.setHeader("content-type", "application/json");
 				response.end(
@@ -323,7 +349,7 @@ describe("MCP OAuth", () => {
 	it("asks for authorization instead of refreshing when the server needs more scope", async () => {
 		const provider = new TestOAuthProvider("http://127.0.0.1/callback");
 		provider.client = { client_id: "client" };
-		provider.tokenSet = { access_token: "a1", refresh_token: "r1", token_type: "Bearer" };
+		provider.tokenSet = { access_token: "a1", refresh_token: "r1", token_type: "Bearer", scope: "repo read:org" };
 		const origin = await listen(async (request, response, serverOrigin) => {
 			const url = new URL(request.url ?? "/", serverOrigin);
 			if (url.pathname === "/.well-known/oauth-authorization-server") {
@@ -353,7 +379,8 @@ describe("MCP OAuth", () => {
 				token: "a1",
 			}),
 		).rejects.toBeInstanceOf(McpOAuthAuthorizationRequiredError);
-		expect(provider.authorizationUrl?.searchParams.get("scope")).toBe("repo admin");
+		// The challenge may list only the missing scopes; the new grant keeps the old ones too.
+		expect(provider.authorizationUrl?.searchParams.get("scope")).toBe("repo read:org admin");
 		// The working grant is kept until the user authorizes the new scope.
 		expect(provider.tokenSet?.access_token).toBe("a1");
 	});
