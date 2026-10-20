@@ -2,18 +2,12 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import {
-	APP_NAME,
-	ENV_AGENT_DIR,
-	ENV_SESSION_DIR,
-	getAgentDir,
-	getSessionsDir,
-} from "../src/config.ts";
+import { APP_NAME, ENV_AGENT_DIR, ENV_SESSION_DIR, getAgentDir, getSessionsDir } from "../src/config.ts";
 import {
 	applyLiRuntimeEnv,
-	LiRuntimeEnvConflictError,
 	LI_AGENT_DIR_VAR,
 	LI_SESSION_DIR_VAR,
+	LiRuntimeEnvConflictError,
 	PI_AGENT_DIR_VAR,
 	PI_SESSION_DIR_VAR,
 	resolveLiRuntimeEnv,

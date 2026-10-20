@@ -611,7 +611,9 @@ function isLiRuntime(): boolean {
 function rejectLiSelfUpdate(): boolean {
 	console.error(chalk.red(`${APP_NAME} does not self-update. Li is upgraded by reviewing and merging upstream`));
 	console.error(chalk.red(`into the li/stable source branch, then rebuilding (see docs/li-maintenance.md).`));
-	console.error(chalk.dim(`Never use ${APP_NAME} update or pi update to upgrade Li; they install the upstream npm package.`));
+	console.error(
+		chalk.dim(`Never use ${APP_NAME} update or pi update to upgrade Li; they install the upstream npm package.`),
+	);
 	process.exitCode = 1;
 	return true;
 }

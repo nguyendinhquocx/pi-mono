@@ -35,11 +35,7 @@ describe("li profile migration rehearsal", () => {
 			JSON.stringify({ zai: { type: "oauth", access: "legacy-token" } }),
 			"utf8",
 		);
-		writeFileSync(
-			join(agentDir, "settings.json"),
-			JSON.stringify({ apiKeys: { deepseek: "legacy-key" } }),
-			"utf8",
-		);
+		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ apiKeys: { deepseek: "legacy-key" } }), "utf8");
 
 		const { migratedAuthProviders } = runMigrations(cwd);
 

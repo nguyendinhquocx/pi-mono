@@ -92,7 +92,8 @@ function validateSessionFileEntries(entries: FileEntry[], filePath: string): voi
 	if (entries.length === 0) return;
 	const header = entries[0];
 	if (header.type === "session") {
-		const version = typeof (header as { version?: unknown }).version === "number" ? (header as { version: number }).version : 1;
+		const version =
+			typeof (header as { version?: unknown }).version === "number" ? (header as { version: number }).version : 1;
 		if (version > CURRENT_SESSION_VERSION) {
 			throw new UnsupportedSessionVersionError(version, filePath, APP_NAME);
 		}

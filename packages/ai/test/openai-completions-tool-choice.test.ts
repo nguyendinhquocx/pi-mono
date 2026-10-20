@@ -1761,7 +1761,8 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("uses OpenRouter reasoning object instead of reasoning_effort", async () => {
-		const model = getModel("openrouter", "deepseek/deepseek-r1")!;
+		// deepseek/deepseek-r1 was replaced by the -0528 snapshot in newer catalogs.
+		const model = getModel("openrouter", "deepseek/deepseek-r1-0528")!;
 		let payload: unknown;
 
 		await streamSimple(

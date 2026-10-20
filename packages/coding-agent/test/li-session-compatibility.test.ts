@@ -2,17 +2,16 @@ import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { APP_NAME } from "../src/config.ts";
 import {
 	buildSessionProjection,
 	CURRENT_SESSION_VERSION,
-	type FileEntry,
 	KNOWN_SESSION_ENTRY_TYPES,
 	loadEntriesFromFile,
 	type SessionEntry,
 	UnknownSessionEntryTypeError,
 	UnsupportedSessionVersionError,
 } from "../src/core/session-manager.ts";
-import { APP_NAME } from "../src/config.ts";
 
 function fixtureDir(): string {
 	return mkdtempSync(join(tmpdir(), "li-session-compat-"));
@@ -53,8 +52,7 @@ const CONTEXT_EDIT = (id: string, parentId: string, targetId: string, replacemen
 		parentId,
 		timestamp: "2026-10-19T00:00:02.000Z",
 		targetId,
-		replacement:
-			replacementText === null ? null : { content: [{ type: "text", text: replacementText }] },
+		replacement: replacementText === null ? null : { content: [{ type: "text", text: replacementText }] },
 	});
 
 describe("li session compatibility: context_edit projection", () => {
@@ -88,10 +86,7 @@ describe("li session compatibility: context_edit projection", () => {
 
 describe("li session compatibility: fail closed before any write", () => {
 	it("refuses a newer session format version and keeps bytes + mtime", () => {
-		const filePath = writeSession("v4.jsonl", [
-			HEADER(CURRENT_SESSION_VERSION + 1),
-			USER_MESSAGE("m1", "hello"),
-		]);
+		const filePath = writeSession("v4.jsonl", [HEADER(CURRENT_SESSION_VERSION + 1), USER_MESSAGE("m1", "hello")]);
 		const before = snapshot(filePath);
 		expect(() => loadEntriesFromFile(filePath)).toThrow(UnsupportedSessionVersionError);
 		const after = snapshot(filePath);
@@ -121,7 +116,10 @@ describe("li session compatibility: fail closed before any write", () => {
 	it("does not append the trailing-newline repair when the file is refused", () => {
 		const filePath = writeSession(
 			"unknown-entry-no-newline.jsonl",
-			[HEADER(CURRENT_SESSION_VERSION), JSON.stringify({ type: "mystery", id: "x1", parentId: null, timestamp: "t" })],
+			[
+				HEADER(CURRENT_SESSION_VERSION),
+				JSON.stringify({ type: "mystery", id: "x1", parentId: null, timestamp: "t" }),
+			],
 			false,
 		);
 		const before = snapshot(filePath);
@@ -151,8 +149,21 @@ describe("li session compatibility: known entry types stay loadable", () => {
 		const lines = [
 			HEADER(CURRENT_SESSION_VERSION),
 			USER_MESSAGE("m1", "hello"),
-			JSON.stringify({ type: "thinking_level_change", id: "t1", parentId: "m1", timestamp: "t", thinkingLevel: "high" }),
-			JSON.stringify({ type: "model_change", id: "mc1", parentId: "t1", timestamp: "t", provider: "zai", modelId: "glm" }),
+			JSON.stringify({
+				type: "thinking_level_change",
+				id: "t1",
+				parentId: "m1",
+				timestamp: "t",
+				thinkingLevel: "high",
+			}),
+			JSON.stringify({
+				type: "model_change",
+				id: "mc1",
+				parentId: "t1",
+				timestamp: "t",
+				provider: "zai",
+				modelId: "glm",
+			}),
 			JSON.stringify({
 				type: "usage",
 				id: "u1",
