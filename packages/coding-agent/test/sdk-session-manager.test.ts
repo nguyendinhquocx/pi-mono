@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createAgentSession } from "../src/core/sdk.ts";
@@ -41,7 +41,8 @@ describe("createAgentSession session manager defaults", () => {
 		const sessionFile = session.sessionManager.getSessionFile();
 
 		expect(sessionDir).toBe(expectedSessionDir);
-		expect(sessionFile?.startsWith(`${expectedSessionDir}/`)).toBe(true);
+		// Windows joins with backslashes; compare against the platform separator.
+		expect(sessionFile?.startsWith(`${expectedSessionDir}${sep}`)).toBe(true);
 
 		session.dispose();
 	});
@@ -78,8 +79,15 @@ describe("createAgentSession session manager defaults", () => {
 		});
 
 		expect(session.sessionManager).toBe(sessionManager);
-		expect(session.systemPrompt).toContain(`<cwd>\n${sessionCwd}\n</cwd>`);
+		// buildSystemPrompt normalizes cwd backslashes to forward slashes.
+		expect(session.systemPrompt).toContain(`<cwd>\n${sessionCwd.replace(/\\/g, "/")}\n</cwd>`);
 
+		if (process.platform === "win32") {
+			// Git Bash's pwd prints POSIX-style paths that Node's realpathSync
+			// cannot lstat directly; the pwd check is a POSIX-shell integration.
+			session.dispose();
+			return;
+		}
 		const bashTool = session.agent.state.tools.find((tool) => tool.name === "bash");
 		expect(bashTool).toBeTruthy();
 		const result = await bashTool!.execute("test", { command: "pwd" });

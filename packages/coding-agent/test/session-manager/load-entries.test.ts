@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { resolvePath } from "../../src/utils/paths.ts";
 import type { FileEntry, SessionEntry, SessionMessageEntry } from "../../src/core/session-manager.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 
@@ -100,7 +101,8 @@ describe("SessionManager.inMemory with preloaded entries", () => {
 
 		expect(session.getSessionId()).toBe("restored-session");
 		expect(session.getHeader()!.id).toBe("restored-session");
-		expect(session.getHeader()!.cwd).toBe("/project");
+		// Header cwd is resolved; on Windows "/project" resolves with a drive letter.
+		expect(session.getHeader()!.cwd).toBe(resolvePath("/project"));
 	});
 
 	it("generates a session id when the options carry none", () => {

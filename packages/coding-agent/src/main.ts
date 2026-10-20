@@ -56,7 +56,7 @@ import {
 	MissingSessionCwdError,
 	type SessionCwdIssue,
 } from "./core/session-cwd.ts";
-import { assertValidSessionId, SessionManager } from "./core/session-manager.ts";
+import { assertValidSessionId, SessionManager, UnknownSessionEntryTypeError, UnsupportedSessionVersionError } from "./core/session-manager.ts";
 import { collectSettingsDiagnostics, deduplicateDiagnostics } from "./core/settings-diagnostics.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
@@ -703,7 +703,18 @@ export async function main(args: string[], options?: MainOptions) {
 		(parsed.sessionDir ? normalizePath(parsed.sessionDir) : undefined) ??
 		(envSessionDir ? expandTildePath(envSessionDir) : undefined) ??
 		startupSettingsManager.getSessionDir();
-	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
+	let sessionManager: SessionManager;
+	try {
+		sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
+	} catch (error) {
+		// Incompatible session formats must surface as a clear refusal (never a
+		// stack trace and never a silent rewrite); the session stays untouched.
+		if (error instanceof UnsupportedSessionVersionError || error instanceof UnknownSessionEntryTypeError) {
+			console.error(chalk.red(`Error: ${error.message}`));
+			process.exit(1);
+		}
+		throw error;
+	}
 	const missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
 	if (missingSessionCwdIssue) {
 		if (appMode === "interactive") {

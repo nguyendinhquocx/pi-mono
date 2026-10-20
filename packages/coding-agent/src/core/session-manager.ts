@@ -40,6 +40,71 @@ import {
 } from "./messages.ts";
 export const CURRENT_SESSION_VERSION = 3;
 
+/** Every entry type this build can parse and persist. Anything else fails closed. */
+export const KNOWN_SESSION_ENTRY_TYPES: ReadonlySet<string> = new Set([
+	"message",
+	"thinking_level_change",
+	"model_change",
+	"usage",
+	"compaction",
+	"branch_summary",
+	"custom",
+	"label",
+	"session_info",
+	"custom_message",
+	"context_edit",
+]);
+
+/**
+ * Session file written by a newer release (header version above what this
+ * build supports). The file must stay byte-identical: a runtime that cannot
+ * understand the format must not repair, migrate, or rewrite it.
+ */
+export class UnsupportedSessionVersionError extends Error {
+	constructor(version: number, filePath: string, appName: string) {
+		super(
+			`Session was written by a newer ${appName} release (format v${version}; this ${appName} supports up to v${CURRENT_SESSION_VERSION}).\n` +
+				`File left untouched: ${filePath}\n` +
+				`Open this session with the newer Pi (${appName === "li" ? "pi" : appName}) instead of editing it here.`,
+		);
+		this.name = "UnsupportedSessionVersionError";
+	}
+}
+
+/** Session contains an entry type this build does not know. Fail closed, keep bytes. */
+export class UnknownSessionEntryTypeError extends Error {
+	constructor(entryType: string, entryId: string | undefined, filePath: string, appName: string) {
+		super(
+			`Session contains an entry type this ${appName} does not understand (type "${entryType}"${entryId ? `, id ${entryId}` : ""}).\n` +
+				`File left untouched: ${filePath}\n` +
+				`Open this session with a runtime that supports this entry type; replaying the raw transcript here could corrupt or leak context.`,
+		);
+		this.name = "UnknownSessionEntryTypeError";
+	}
+}
+
+/**
+ * Fail-closed format check for session files this build may otherwise modify.
+ * Runs before the trailing-newline repair in loadEntriesFromFile so a session
+ * from a newer/unknown format is never written to.
+ */
+function validateSessionFileEntries(entries: FileEntry[], filePath: string): void {
+	if (entries.length === 0) return;
+	const header = entries[0];
+	if (header.type === "session") {
+		const version = typeof (header as { version?: unknown }).version === "number" ? (header as { version: number }).version : 1;
+		if (version > CURRENT_SESSION_VERSION) {
+			throw new UnsupportedSessionVersionError(version, filePath, APP_NAME);
+		}
+	}
+	for (const [index, entry] of entries.entries()) {
+		if (index === 0 && entry.type === "session") continue; // header, not an entry
+		if (!KNOWN_SESSION_ENTRY_TYPES.has(entry.type)) {
+			throw new UnknownSessionEntryTypeError(entry.type, entry.id, filePath, APP_NAME);
+		}
+	}
+}
+
 export interface SessionHeader {
 	type: "session";
 	version?: number; // v1 sessions don't have this
@@ -664,6 +729,10 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 	if (header.type !== "session" || typeof (header as { id?: unknown }).id !== "string") {
 		return [];
 	}
+
+	// Fail closed on unknown formats BEFORE any repair/write. A session from a
+	// newer runtime must stay byte-identical (bytes and mtime) after refusal.
+	validateSessionFileEntries(entries, resolvedFilePath);
 
 	if (pending) appendFileSync(resolvedFilePath, "\n");
 	return entries;

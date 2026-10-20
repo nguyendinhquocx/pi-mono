@@ -4,7 +4,7 @@
 
 import chalk from "chalk";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
-import { dirname, join } from "path";
+import { basename, dirname, join } from "path";
 import { CONFIG_DIR_NAME, getAgentDir, getBinDir } from "./config.ts";
 import { migrateKeybindingsConfig } from "./core/keybindings.ts";
 import { stripBom } from "./utils/text.ts";
@@ -118,8 +118,11 @@ export function migrateSessionsFromAgentRoot(): void {
 			}
 
 			// Move the file
-			const fileName = file.split("/").pop() || file.split("\\").pop();
-			const newPath = join(correctDir, fileName!);
+			// basename() instead of split("/"): on Windows paths contain backslashes,
+			// so split("/").pop() returned the whole path and renameSync silently
+			// failed (caught below) — the migration never moved anything on Windows.
+			const fileName = basename(file);
+			const newPath = join(correctDir, fileName);
 
 			if (existsSync(newPath)) continue; // Skip if target exists
 
