@@ -34,7 +34,7 @@ node "%PI_CORE_CLI_PATH%" %*
 exit /b %ERRORLEVEL%
 
 :version
-node -e "const fs=require('fs');let r;try{r=JSON.parse(fs.readFileSync(process.argv[1],'utf8'))}catch(e){console.error('[li] Li build receipt missing or unreadable: '+process.argv[1]);console.error('[li] Build Li first: node scripts/build-li.mjs');process.exit(1)};console.log('li '+(r.baseVersion||'?')+' (source '+(r.shortSha||'?')+')')" "%PI_PACKAGE_DIR%\dist\li-build-receipt.json"
+node -e "const fs=require('fs');let r;try{r=JSON.parse(fs.readFileSync(process.argv[1],'utf8'))}catch(e){console.error('[li] Li build receipt missing or unreadable: '+process.argv[1]);console.error('[li] Build Li first: node scripts/build-li.mjs');process.exit(1)};console.log('li '+(r.baseVersion||'?')+' (source '+(r.gitShortSha||'?')+')')" "%PI_PACKAGE_DIR%\dist\li-build-receipt.json"
 exit /b %ERRORLEVEL%
 
 :no_node

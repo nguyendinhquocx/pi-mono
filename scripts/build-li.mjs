@@ -82,7 +82,9 @@ function parseArgs(argv) {
 
 function run(command, args, options = {}) {
 	console.log(`[build-li] > ${command} ${args.join(" ")}`);
-	const result = spawnSync(command, args, { cwd: repoRoot, stdio: "inherit", shell: false, ...options });
+	// npm/pnpm are .cmd shims on Windows; spawnSync needs a shell to resolve them.
+	const shell = process.platform === "win32";
+	const result = spawnSync(command, args, { cwd: repoRoot, stdio: "inherit", shell, ...options });
 	if (result.status !== 0) {
 		fail(`${command} ${args.join(" ")} exited with code ${result.status ?? "unknown"}`);
 	}
