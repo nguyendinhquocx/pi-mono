@@ -378,6 +378,11 @@ Short forms:
   ${APP_NAME} update <source>       Update one package
   ${APP_NAME} update pi             Update pi only (self works as alias to pi)
 `);
+			if (isLiRuntime()) {
+				console.log(
+					`\n${chalk.bold("Li notes:")}\n  Li does not self-update. Upgrade Li by reviewing and merging upstream into\n  the li/stable source branch, then rebuilding (docs/li-maintenance.md).\n  --extensions/--models change package state shared by both Pi and Li.\n`,
+				);
+			}
 			return;
 
 		case "list":
@@ -596,6 +601,27 @@ function parsePackageCommand(args: string[]): PackageCommandOptions | undefined 
 
 function updateTargetIncludesSelf(target: UpdateTarget): boolean {
 	return target.type === "all" || target.type === "self";
+}
+
+/** Li is a source-built fork runtime; never upgrade it through package-manager self-update. */
+function isLiRuntime(): boolean {
+	return APP_NAME === "li" || process.env.LI_RUNTIME === "1";
+}
+
+function rejectLiSelfUpdate(): boolean {
+	console.error(chalk.red(`${APP_NAME} does not self-update. Li is upgraded by reviewing and merging upstream`));
+	console.error(chalk.red(`into the li/stable source branch, then rebuilding (see docs/li-maintenance.md).`));
+	console.error(chalk.dim(`Never use ${APP_NAME} update or pi update to upgrade Li; they install the upstream npm package.`));
+	process.exitCode = 1;
+	return true;
+}
+
+function warnLiSharedPackageCache(): void {
+	console.error(
+		chalk.yellow(
+			`Warning: extension/model package state lives in the shared profile and is used by both Pi and Li; this update affects both runtimes.`,
+		),
+	);
 }
 
 function updateTargetIncludesExtensions(target: UpdateTarget): boolean {
@@ -938,6 +964,9 @@ export async function handlePackageCommand(
 	}
 
 	if (options.command === "update" && options.updateTarget?.type === "models") {
+		if (isLiRuntime()) {
+			warnLiSharedPackageCache();
+		}
 		try {
 			await refreshModelCatalogs(getAgentDir());
 		} catch (error: unknown) {
@@ -1031,12 +1060,21 @@ export async function handlePackageCommand(
 
 			case "update": {
 				const target = options.updateTarget ?? { type: "self" };
+				// Li builds from source: every self-targeting update (including
+				// --all/--force and combos) must be refused before extensions update
+				// or any package-manager subprocess runs.
+				if (isLiRuntime() && updateTargetIncludesSelf(target)) {
+					return rejectLiSelfUpdate();
+				}
 				if (options.showExtensionsSkippedNote) {
 					console.log(
 						chalk.dim(`Extensions are skipped. Run ${APP_NAME} update --extensions to update extensions.`),
 					);
 				}
 				if (updateTargetIncludesExtensions(target)) {
+					if (isLiRuntime()) {
+						warnLiSharedPackageCache();
+					}
 					const updateSource = target.type === "extensions" ? target.source : undefined;
 					await packageManager.update(updateSource);
 					if (updateSource) {
