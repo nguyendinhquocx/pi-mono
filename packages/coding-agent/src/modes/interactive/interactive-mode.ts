@@ -995,12 +995,13 @@ export class InteractiveMode {
 		this.ui.setFocus(this.editor);
 
 		// Li quiet startup: in regular mode the transcript is a plain scrolling list, so with no header
-		// the input dock would glue itself to the top row. Blank scrollback pushes it to the bottom.
+		// the input dock would glue itself to the top row. A blank spacer pushes it toward the bottom.
 		if (this.isLiQuietStartup() && this.renderer.mode === "regular") {
 			const rows = this.renderer.terminal.rows;
-			const dockRows = 8; // editor (3) + footer separator/line + margin
-			const filler = Math.max(1, rows - dockRows);
-			process.stdout.write("\n".repeat(filler));
+			const dockRows = 8; // working dots + editor + footer + margin
+			if (Number.isFinite(rows) && rows > dockRows) {
+				this.widgetContainerAbove.addChild(new Spacer(rows - dockRows));
+			}
 		}
 
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
@@ -2335,7 +2336,9 @@ export class InteractiveMode {
 		this.activeWorkingIndicatorEmbedded = false;
 		this.statusContainer.clear();
 		this.setEditorWorkingStatusIndicator(undefined);
-		if (this.setEditorWorkingStatusIndicator(indicator)) {
+		// Li hides the editor borders, so a border-embedded indicator would be invisible; render it
+		// as its own line just above the input instead.
+		if (!this.isLiQuietStartup() && this.setEditorWorkingStatusIndicator(indicator)) {
 			this.activeWorkingIndicatorEmbedded = true;
 			return;
 		}
@@ -2381,7 +2384,8 @@ export class InteractiveMode {
 			new WorkingStatusIndicator(
 				this.ui,
 				this.liWorkingBorderMessage(this.workingMessage ?? this.defaultWorkingMessage),
-				this.workingIndicatorOptions,
+				// Li pulses one-to-three dots instead of the braille spinner.
+				APP_NAME === "li" ? { frames: [".", "..", "..."], intervalMs: 400 } : this.workingIndicatorOptions,
 				colorFn,
 			),
 		);

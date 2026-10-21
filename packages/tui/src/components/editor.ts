@@ -243,6 +243,9 @@ export interface EditorTheme {
 export interface EditorOptions {
 	paddingX?: number;
 	autocompleteMaxVisible?: number;
+	/** Omit the solid top/bottom borders for a minimal input dock. Scroll indicators
+	 *  (↑ N more / ↓ N more) still render while hidden lines exist. */
+	hideBorders?: boolean;
 }
 
 const SLASH_COMMAND_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
@@ -312,6 +315,8 @@ export class Editor implements Component, Focusable {
 	private lastWidth: number = 80;
 	private renderedVisibleLineCount = 1;
 	private renderedAutocompleteHeight = 0;
+	private hideBorders = false;
+	private renderedTopBorderHeight = 1;
 
 	// Vertical scrolling support
 	private scrollOffset: number = 0;
@@ -379,6 +384,7 @@ export class Editor implements Component, Focusable {
 		this.paddingX = Number.isFinite(paddingX) ? Math.max(0, Math.floor(paddingX)) : 0;
 		const maxVisible = options.autocompleteMaxVisible ?? 5;
 		this.autocompleteMaxVisible = Number.isFinite(maxVisible) ? Math.max(3, Math.min(20, Math.floor(maxVisible))) : 5;
+		this.hideBorders = options.hideBorders ?? false;
 	}
 
 	/** Set of currently valid paste IDs, for marker-aware segmentation. */
@@ -561,7 +567,9 @@ export class Editor implements Component, Focusable {
 		const rightPadding = leftPadding;
 
 		// Render top border (with scroll indicator if scrolled down)
-		result.push(this.renderTopBorder(width, this.scrollOffset));
+		const showTopBorder = !this.hideBorders || this.scrollOffset > 0;
+		this.renderedTopBorderHeight = showTopBorder ? 1 : 0;
+		if (showTopBorder) result.push(this.renderTopBorder(width, this.scrollOffset));
 
 		// Render each visible layout line
 		// Emit hardware cursor marker when focused so TUI can position the
@@ -613,7 +621,7 @@ export class Editor implements Component, Focusable {
 
 		// Render bottom border (with scroll indicator if more content below)
 		const linesBelow = layoutLines.length - (this.scrollOffset + visibleLines.length);
-		result.push(this.renderBottomBorder(width, linesBelow));
+		if (!this.hideBorders || linesBelow > 0) result.push(this.renderBottomBorder(width, linesBelow));
 
 		// Add autocomplete list if active
 		this.renderedAutocompleteHeight = 0;
@@ -631,7 +639,7 @@ export class Editor implements Component, Focusable {
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-		const autocompleteStartRow = this.renderedVisibleLineCount + 2;
+		const autocompleteStartRow = this.renderedTopBorderHeight + this.renderedVisibleLineCount;
 		if (
 			this.autocompleteState &&
 			this.autocompleteList &&
