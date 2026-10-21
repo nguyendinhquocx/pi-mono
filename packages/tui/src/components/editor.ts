@@ -243,9 +243,10 @@ export interface EditorTheme {
 export interface EditorOptions {
 	paddingX?: number;
 	autocompleteMaxVisible?: number;
-	/** Omit the solid top/bottom borders for a minimal input dock. Scroll indicators
-	 *  (↑ N more / ↓ N more) still render while hidden lines exist. */
+	/** Omit solid top/bottom borders for a minimal input dock. */
 	hideBorders?: boolean;
+	/** Blank rows between the editor text and the autocomplete list. */
+	autocompleteGap?: number;
 }
 
 const SLASH_COMMAND_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
@@ -315,6 +316,7 @@ export class Editor implements Component, Focusable {
 	private lastWidth: number = 80;
 	private renderedVisibleLineCount = 1;
 	private renderedAutocompleteHeight = 0;
+	private autocompleteGap = 0;
 	private hideBorders = false;
 	private renderedTopBorderHeight = 1;
 
@@ -384,6 +386,8 @@ export class Editor implements Component, Focusable {
 		this.paddingX = Number.isFinite(paddingX) ? Math.max(0, Math.floor(paddingX)) : 0;
 		const maxVisible = options.autocompleteMaxVisible ?? 5;
 		this.autocompleteMaxVisible = Number.isFinite(maxVisible) ? Math.max(3, Math.min(20, Math.floor(maxVisible))) : 5;
+		const autocompleteGap = options.autocompleteGap ?? 0;
+		this.autocompleteGap = Number.isFinite(autocompleteGap) ? Math.max(0, Math.floor(autocompleteGap)) : 0;
 		this.hideBorders = options.hideBorders ?? false;
 	}
 
@@ -566,8 +570,8 @@ export class Editor implements Component, Focusable {
 		const leftPadding = " ".repeat(paddingX);
 		const rightPadding = leftPadding;
 
-		// Render top border (with scroll indicator if scrolled down)
-		const showTopBorder = !this.hideBorders || this.scrollOffset > 0;
+		// Render top border only when requested; Li hides even scroll indicators for a borderless dock.
+		const showTopBorder = !this.hideBorders;
 		this.renderedTopBorderHeight = showTopBorder ? 1 : 0;
 		if (showTopBorder) result.push(this.renderTopBorder(width, this.scrollOffset));
 
@@ -619,13 +623,14 @@ export class Editor implements Component, Focusable {
 			result.push(`${leftPadding}${displayText}${padding}${lineRightPadding}`);
 		}
 
-		// Render bottom border (with scroll indicator if more content below)
+		// Hide scroll indicators together with the borders for a minimal editor.
 		const linesBelow = layoutLines.length - (this.scrollOffset + visibleLines.length);
-		if (!this.hideBorders || linesBelow > 0) result.push(this.renderBottomBorder(width, linesBelow));
+		if (!this.hideBorders) result.push(this.renderBottomBorder(width, linesBelow));
 
 		// Add autocomplete list if active
 		this.renderedAutocompleteHeight = 0;
 		if (this.autocompleteState && this.autocompleteList) {
+			for (let gap = 0; gap < this.autocompleteGap; gap++) result.push("");
 			const autocompleteResult = this.autocompleteList.render(contentWidth);
 			this.renderedAutocompleteHeight = autocompleteResult.length;
 			for (const line of autocompleteResult) {
@@ -639,7 +644,7 @@ export class Editor implements Component, Focusable {
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-		const autocompleteStartRow = this.renderedTopBorderHeight + this.renderedVisibleLineCount;
+		const autocompleteStartRow = this.renderedTopBorderHeight + this.renderedVisibleLineCount + this.autocompleteGap;
 		if (
 			this.autocompleteState &&
 			this.autocompleteList &&
@@ -664,10 +669,13 @@ export class Editor implements Component, Focusable {
 		// The renderer synthesizes a click when press and release land on the same
 		// cell without movement, which is the gesture that positions the cursor.
 		if (event.type !== "click" || event.button !== "left") return undefined;
-		if (event.y <= 0 || event.y > this.renderedVisibleLineCount) return { handled: true, focus: true };
+		const editorStartRow = this.renderedTopBorderHeight;
+		if (event.y < editorStartRow || event.y >= editorStartRow + this.renderedVisibleLineCount) {
+			return { handled: true, focus: true };
+		}
 
 		const visualLines = this.buildVisualLineMap(this.lastWidth);
-		const visualLineIndex = this.scrollOffset + event.y - 1;
+		const visualLineIndex = this.scrollOffset + event.y - editorStartRow;
 		const visualLine = visualLines[visualLineIndex];
 		if (!visualLine) return { handled: true, focus: true };
 		const logicalLine = this.state.lines[visualLine.logicalLine] ?? "";

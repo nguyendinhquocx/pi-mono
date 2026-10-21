@@ -4,6 +4,7 @@ import { Box, Container, Markdown, type MarkdownTheme, Spacer, Text } from "@ear
 import type { MessageRenderer } from "../../../core/extensions/types.ts";
 import type { CustomMessage } from "../../../core/messages.ts";
 import { getMarkdownTheme, theme } from "../theme/theme.ts";
+import { isLiToolOutputBlank } from "../tool-output-style.ts";
 
 /**
  * Component that renders a custom message entry from extensions.
@@ -32,8 +33,8 @@ export class CustomMessageComponent extends Container {
 
 		this.addChild(new Spacer(1));
 
-		// Create box with purple background (used for default rendering)
-		this.box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
+		// Li's blank style keeps the custom message label/foregrounds without a panel fill.
+		this.box = new Box(1, 1, (t) => (isLiToolOutputBlank() ? t : theme.bg("customMessageBg", t)));
 
 		this.rebuild();
 	}

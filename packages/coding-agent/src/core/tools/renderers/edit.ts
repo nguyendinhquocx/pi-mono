@@ -9,6 +9,7 @@
 import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { renderDiff } from "../../../modes/interactive/components/diff.ts";
 import type { Theme } from "../../../modes/interactive/theme/theme.ts";
+import { isLiToolOutputBlank } from "../../../modes/interactive/tool-output-style.ts";
 import type { ToolDefinition } from "../../extensions/types.ts";
 import type { EditToolDetails } from "../edit.ts";
 import { computeEditsDiff, type Edit, type EditDiffError, type EditDiffResult } from "../edit-diff.ts";
@@ -117,6 +118,7 @@ function getEditHeaderBg(
 	settledError: boolean | undefined,
 	theme: Theme,
 ): (text: string) => string {
+	if (isLiToolOutputBlank()) return (text) => text;
 	if (preview) {
 		if ("error" in preview) {
 			return (text: string) => theme.bg("toolErrorBg", text);

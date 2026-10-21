@@ -25,7 +25,11 @@ export class CustomEditor extends Editor {
 	public onExtensionShortcut?: (data: string) => boolean;
 
 	constructor(tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager, options?: CustomEditorOptions) {
-		super(tui, theme, { ...options, hideBorders: options?.hideBorders ?? APP_NAME === "li" });
+		super(tui, theme, {
+			...options,
+			hideBorders: options?.hideBorders ?? APP_NAME === "li",
+			autocompleteGap: options?.autocompleteGap ?? (APP_NAME === "li" ? 1 : 0),
+		});
 		this.keybindings = keybindings;
 		this.embedWorkingStatus = options?.embedWorkingStatus ?? false;
 	}
@@ -34,26 +38,10 @@ export class CustomEditor extends Editor {
 		this.workingStatusIndicator = indicator;
 	}
 
-	/** Li marks its input dock with dotted borders so it reads differently from Pi at a glance.
-	 *  Swapping glyphs 1:1 keeps widths (and the working-status layout math) intact. */
-	private dottedForLi(border: string): string {
-		return APP_NAME === "li" ? border.replaceAll("─", "┄") : border;
-	}
-
 	protected override renderTopBorder(width: number, hiddenLineCount: number): string {
-		// Li: borders are hidden (hideBorders); this only renders for the scroll indicator, and the
-		// spinner stays out of it — the minimal dock shows nothing while the agent works.
-		if (APP_NAME === "li") return this.dottedForLi(super.renderTopBorder(width, hiddenLineCount));
-		const border =
-			this.embedWorkingStatus && this.workingStatusIndicator
-				? this.renderTopBorderWithStatus(width, hiddenLineCount)
-				: super.renderTopBorder(width, hiddenLineCount);
-		return border;
-	}
-
-	protected override renderBottomBorder(width: number, hiddenLineCount: number): string {
-		if (APP_NAME === "li") return this.dottedForLi(super.renderBottomBorder(width, hiddenLineCount));
-		return super.renderBottomBorder(width, hiddenLineCount);
+		return this.embedWorkingStatus && this.workingStatusIndicator
+			? this.renderTopBorderWithStatus(width, hiddenLineCount)
+			: super.renderTopBorder(width, hiddenLineCount);
 	}
 
 	private renderTopBorderWithStatus(width: number, hiddenLineCount: number): string {

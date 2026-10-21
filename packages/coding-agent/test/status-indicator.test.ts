@@ -25,24 +25,21 @@ describe("status indicators", () => {
 		expect(lines).toEqual([" ".repeat(20), " ".repeat(20)]);
 	});
 
-	it("keeps the top border unchanged unless the editor opts in", () => {
+	it("hides Li editor borders and renders only the dot pulse for working", () => {
 		initTheme("dark");
-		const tui = {
-			requestRender: vi.fn(),
-			terminal: { rows: 10 },
-		} as unknown as TUI;
+		const tui = { requestRender: vi.fn(), terminal: { rows: 10 } } as unknown as TUI;
 		const editor = new CustomEditor(tui, getEditorTheme(), KeybindingsManager.create());
-		const indicator = new WorkingStatusIndicator(tui, "Working");
+		const indicator = new WorkingStatusIndicator(tui, "Working", { frames: [".", "..", "..."], intervalMs: 400 });
 		editor.setWorkingStatusIndicator(indicator);
-
-		expect(stripAnsi(editor.render(20)[0]!)).toBe("─".repeat(20));
-		const standaloneLine = indicator.render(20)[1]!;
-		expect(standaloneLine).toContain(theme.getFgAnsi("accent"));
-		expect(standaloneLine).toContain(theme.getFgAnsi("muted"));
-		indicator.dispose();
+		try {
+			expect(editor.render(20)).toHaveLength(1);
+			expect(indicator.render(20)).toEqual(["."]);
+		} finally {
+			indicator.dispose();
+		}
 	});
 
-	it("embeds the working indicator when the editor opts in", () => {
+	it("embeds the working indicator when the editor opts in to borders", () => {
 		initTheme("dark");
 		const tui = {
 			requestRender: vi.fn(),
@@ -50,6 +47,7 @@ describe("status indicators", () => {
 		} as unknown as TUI;
 		const editor = new CustomEditor(tui, getEditorTheme(), KeybindingsManager.create(), {
 			embedWorkingStatus: true,
+			hideBorders: false,
 		});
 		expect(editor.embedWorkingStatus).toBe(true);
 		editor.borderColor = theme.getThinkingBorderColor("high");
@@ -69,6 +67,7 @@ describe("status indicators", () => {
 		const tui = { requestRender: vi.fn(), terminal: { rows: 10 } } as unknown as TUI;
 		const editor = new CustomEditor(tui, getEditorTheme(), KeybindingsManager.create(), {
 			embedWorkingStatus: true,
+			hideBorders: false,
 		});
 		const indicators = [
 			new CompactionStatusIndicator(tui, "manual"),

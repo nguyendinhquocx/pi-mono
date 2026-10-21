@@ -27,6 +27,9 @@ export const SETTINGS_DEFAULTS = {
 	hideThinkingBlock: false,
 	showCacheMissNotices: false,
 	quietStartup: false,
+	li: {
+		toolOutputStyle: "blank",
+	},
 	defaultProjectTrust: "ask",
 	collapseChangelog: false,
 	enableInstallTelemetry: true,

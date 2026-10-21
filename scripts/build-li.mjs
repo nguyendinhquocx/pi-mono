@@ -17,6 +17,7 @@ import { existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync 
 import { spawnSync } from "node:child_process";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { neutralizeLiTerminalColorQuery } from "./li-osc-patch.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
@@ -156,6 +157,26 @@ if (!existsSync(join(bundleDir, "cli.js"))) {
 	fail(`Bundle build did not produce ${join(bundleDir, "cli.js")}`);
 }
 
+let terminalColorQueryPatch;
+try {
+	terminalColorQueryPatch = neutralizeLiTerminalColorQuery(bundleDir);
+} catch (error) {
+	fail(`Li OSC build-time patch failed closed: ${error instanceof Error ? error.message : String(error)}`);
+}
+const oscPatchReceipt = {
+	schemaVersion: 1,
+	runtime: "li",
+	patchStrategy: "build-time",
+	sourceSha: provenance.gitHead,
+	profileSnapshotId: provenance.profileSnapshotId,
+	packageVersion: provenance.baseVersion,
+	bundleDir,
+	patchedAt: new Date().toISOString(),
+	...terminalColorQueryPatch,
+};
+writeFileSync(join(codingAgentDir, "dist", "li-osc-patch-receipt.json"), `${JSON.stringify(oscPatchReceipt, null, "\t")}\n`, "utf8");
+console.log(`[build-li] Li OSC query ${terminalColorQueryPatch.status} (${terminalColorQueryPatch.markerCount} marker(s))`);
+
 const artifact = hashTree(bundleDir);
 writeReceipt({
 	...provenance,
@@ -163,4 +184,5 @@ writeReceipt({
 	artifactHash: artifact.aggregateHash,
 	artifactAlgorithm: artifact.algorithm,
 	artifactFileCount: artifact.fileCount,
+	terminalColorQueryPatch,
 });

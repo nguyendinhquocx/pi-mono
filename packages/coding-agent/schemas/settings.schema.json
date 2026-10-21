@@ -229,6 +229,25 @@
       "description": "When true, hide all startup output. When \"header\", keep only the startup header.",
       "default": false
     },
+    "li": {
+      "type": "object",
+      "properties": {
+        "toolOutputStyle": {
+          "anyOf": [
+            {
+              "type": "string",
+              "const": "blank"
+            },
+            {
+              "type": "string",
+              "const": "current"
+            }
+          ],
+          "description": "Li-only transcript style: blank removes user/tool/custom-message/diff backgrounds; current restores them.",
+          "default": "blank"
+        }
+      }
+    },
     "defaultProjectTrust": {
       "anyOf": [
         {

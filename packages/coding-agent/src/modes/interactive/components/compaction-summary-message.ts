@@ -1,6 +1,7 @@
 import { Box, Container, Markdown, type MarkdownTheme, MouseRegion, Spacer, Text } from "@earendil-works/pi-tui";
 import type { CompactionSummaryMessage } from "../../../core/messages.ts";
 import { getMarkdownTheme, theme } from "../theme/theme.ts";
+import { isLiToolOutputBlank } from "../tool-output-style.ts";
 import { keyText } from "./keybinding-hints.ts";
 
 /**
@@ -13,7 +14,7 @@ export class CompactionSummaryMessageComponent extends Box {
 	private markdownTheme: MarkdownTheme;
 
 	constructor(message: CompactionSummaryMessage, markdownTheme: MarkdownTheme = getMarkdownTheme(), outputPad = 1) {
-		super(outputPad, 1, (t) => theme.bg("customMessageBg", t));
+		super(outputPad, 1, (t) => (isLiToolOutputBlank() ? t : theme.bg("customMessageBg", t)));
 		this.message = message;
 		this.markdownTheme = markdownTheme;
 		this.updateDisplay();

@@ -1,4 +1,5 @@
 import { type Component, Loader, type TUI, truncateToWidth } from "@earendil-works/pi-tui";
+import { APP_NAME } from "../../../config.ts";
 import type { WorkingIndicatorOptions } from "../../../core/extensions/index.ts";
 import { theme } from "../theme/theme.ts";
 import { CountdownTimer } from "./countdown-timer.ts";
@@ -19,6 +20,15 @@ export class StatusIndicator extends Loader {
 	) {
 		super(ui, spinnerColorFn, messageColorFn, message, indicator);
 		this.kind = kind;
+	}
+
+	override render(width: number): string[] {
+		// Li's working state is one compact dot pulse above the prompt; avoid Loader's
+		// leading blank line and any spinner/message chrome.
+		if (APP_NAME === "li" && this.kind === "working") {
+			return [truncateToWidth(this.getRenderedIndicator(), width, "")];
+		}
+		return super.render(width);
 	}
 
 	renderInBorder(width: number): string {

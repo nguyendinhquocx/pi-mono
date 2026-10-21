@@ -111,6 +111,26 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	describe("Li-only tool output style", () => {
+		it("defaults to blank and persists the current-style opt-in under the Li namespace", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(settingsPath, JSON.stringify({ theme: "dark" }));
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getLiToolOutputStyle()).toBe("blank");
+			manager.setLiToolOutputStyle("current");
+			await manager.flush();
+
+			const saved = JSON.parse(readFileSync(settingsPath, "utf-8")) as {
+				theme: string;
+				li: { toolOutputStyle: string };
+			};
+			expect(saved.theme).toBe("dark");
+			expect(saved.li.toolOutputStyle).toBe("current");
+			expect(SettingsManager.create(projectDir, agentDir).getLiToolOutputStyle()).toBe("current");
+		});
+	});
+
 	describe("deviceId", () => {
 		it("creates one global device ID and reuses it in later processes", async () => {
 			const settingsPath = join(agentDir, "settings.json");

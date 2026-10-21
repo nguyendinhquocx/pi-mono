@@ -145,6 +145,16 @@ const WarningSettingsSchema = Type.Object({
 	anthropicExtraUsage: Type.Optional(Type.Boolean({ default: SETTINGS_DEFAULTS.warnings.anthropicExtraUsage })),
 });
 
+const LiSettingsSchema = Type.Object({
+	toolOutputStyle: Type.Optional(
+		Type.Union([Type.Literal("blank"), Type.Literal("current")], {
+			description:
+				"Li-only transcript style: blank removes user/tool/custom-message/diff backgrounds; current restores them.",
+			default: SETTINGS_DEFAULTS.li.toolOutputStyle,
+		}),
+	),
+});
+
 function codemodeMode(options?: TSchemaOptions) {
 	return Type.Union([Type.Literal("on"), Type.Literal("only")], options);
 }
@@ -263,6 +273,7 @@ export const SettingsSchema = Type.Object(
 				default: SETTINGS_DEFAULTS.quietStartup,
 			}),
 		),
+		li: Type.Optional(LiSettingsSchema),
 		defaultProjectTrust: Type.Optional(
 			Type.Union([Type.Literal("ask"), Type.Literal("always"), Type.Literal("never")], {
 				description: "Global setting only.",
@@ -466,6 +477,8 @@ export interface ThinkingBudgetsSettings extends Static<typeof ThinkingBudgetsSe
 export type MermaidRenderingMode = NonNullable<Static<typeof MarkdownSettingsSchema>["mermaid"]>;
 export interface MarkdownSettings extends Static<typeof MarkdownSettingsSchema> {}
 export interface WarningSettings extends Static<typeof WarningSettingsSchema> {}
+export type LiToolOutputStyle = NonNullable<Static<typeof LiSettingsSchema>["toolOutputStyle"]>;
+export interface LiSettings extends Static<typeof LiSettingsSchema> {}
 export type CodemodeMode = Static<typeof CodemodeModeSchema>;
 export interface CodemodeSettings extends Static<typeof CodemodeSettingsSchema> {}
 export type DefaultProjectTrust = NonNullable<SettingsInput["defaultProjectTrust"]>;

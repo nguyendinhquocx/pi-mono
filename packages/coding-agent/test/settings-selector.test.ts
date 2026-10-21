@@ -63,6 +63,24 @@ describe("SettingsSelectorComponent", () => {
 		expect(onWheelScrollLinesChange.mock.calls.flat()).toEqual([10, "auto", 1]);
 	});
 
+	it("offers Li tool output backgrounds with blank as the default", () => {
+		const onLiToolOutputStyleChange = vi.fn();
+		const config = {
+			liToolOutputStyle: "blank",
+			defaultModel: "not set",
+			availableDefaultModels: [],
+			availableThinkingLevels: [],
+			modelThinkingLevels: {},
+			warnings: {},
+		} as unknown as SettingsConfig;
+		const callbacks = { onLiToolOutputStyleChange } as unknown as SettingsCallbacks;
+		const list = new SettingsSelectorComponent(config, callbacks).getSettingsList();
+
+		list.selectItem("li-tool-output-style");
+		list.handleInput("\r");
+		expect(onLiToolOutputStyleChange).toHaveBeenCalledWith("current");
+	});
+
 	it("cycles through share destinations", () => {
 		const onSessionShareDestinationChange = vi.fn();
 		const config = {

@@ -1,5 +1,6 @@
 import * as Diff from "diff";
 import { theme } from "../theme/theme.ts";
+import { isLiToolOutputBlank } from "../tool-output-style.ts";
 
 /**
  * Parse diff line to extract prefix, line number, and content.
@@ -42,7 +43,7 @@ function renderIntraLineDiff(oldContent: string, newContent: string): { removedL
 				isFirstRemoved = false;
 			}
 			if (value) {
-				removedLine += theme.inverse(value);
+				removedLine += isLiToolOutputBlank() ? theme.bold(value) : theme.inverse(value);
 			}
 		} else if (part.added) {
 			let value = part.value;
@@ -54,7 +55,7 @@ function renderIntraLineDiff(oldContent: string, newContent: string): { removedL
 				isFirstAdded = false;
 			}
 			if (value) {
-				addedLine += theme.inverse(value);
+				addedLine += isLiToolOutputBlank() ? theme.bold(value) : theme.inverse(value);
 			}
 		} else {
 			removedLine += part.value;

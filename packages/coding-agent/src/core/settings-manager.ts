@@ -15,6 +15,7 @@ import type {
 	CompactionModelOverride,
 	DefaultProjectTrust,
 	FullscreenExitOutput,
+	LiToolOutputStyle,
 	MermaidRenderingMode,
 	PackageSource,
 	QuietStartup,
@@ -36,6 +37,8 @@ export type {
 	DefaultProjectTrust,
 	FullscreenExitOutput,
 	ImageSettings,
+	LiSettings,
+	LiToolOutputStyle,
 	MarkdownSettings,
 	MermaidRenderingMode,
 	PackageSource,
@@ -1001,6 +1004,16 @@ export class SettingsManager {
 	setQuietStartup(quiet: QuietStartup): void {
 		this.globalSettings.quietStartup = quiet;
 		this.markModified("quietStartup");
+		this.save();
+	}
+
+	getLiToolOutputStyle(): LiToolOutputStyle {
+		return this.globalSettings.li?.toolOutputStyle === "current" ? "current" : SETTINGS_DEFAULTS.li.toolOutputStyle;
+	}
+
+	setLiToolOutputStyle(style: LiToolOutputStyle): void {
+		this.globalSettings.li = { ...(this.globalSettings.li ?? {}), toolOutputStyle: style };
+		this.markModified("li");
 		this.save();
 	}
 

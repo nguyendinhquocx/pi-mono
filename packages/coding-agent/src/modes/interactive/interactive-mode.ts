@@ -201,6 +201,7 @@ import {
 	theme,
 } from "./theme/theme.ts";
 import { InteractiveThemeController } from "./theme/theme-controller.ts";
+import { setLiToolOutputStyle } from "./tool-output-style.ts";
 import { createInteractiveTui, createInteractiveTuiReference } from "./tui-renderer.ts";
 
 export { createInteractiveTui, createInteractiveTuiReference } from "./tui-renderer.ts";
@@ -607,6 +608,7 @@ export class InteractiveMode {
 
 	constructor(runtimeHost: AgentSessionRuntime, options: InteractiveModeOptions = {}) {
 		this.runtimeHost = runtimeHost;
+		setLiToolOutputStyle(this.settingsManager.getLiToolOutputStyle());
 		setCapabilityOverrides(this.settingsManager.getTerminalCapabilityOverrides());
 		const tuiMode = options.tuiMode ?? this.settingsManager.getTuiMode();
 		this.options = { ...options, tuiMode };
@@ -964,7 +966,7 @@ export class InteractiveMode {
 		}
 
 		// Keep one component tree and remount it when changing renderers.
-		this.renderWidgets(); // Initialize with default spacer
+		this.renderWidgets(); // Initialize extension widgets
 		const viewport = createChatViewport({
 			document: this.documentContainer,
 			pendingMessages: this.pendingMessagesContainer,
@@ -993,16 +995,6 @@ export class InteractiveMode {
 		this.defaultEditor.onCtrlD = () => this.handleCtrlD();
 		this.defaultEditor.onSubmit = (text) => this.handleStartupSubmit(text);
 		this.ui.setFocus(this.editor);
-
-		// Li quiet startup: in regular mode the transcript is a plain scrolling list, so with no header
-		// the input dock would glue itself to the top row. A blank spacer pushes it toward the bottom.
-		if (this.isLiQuietStartup() && this.renderer.mode === "regular") {
-			const rows = this.renderer.terminal.rows;
-			const dockRows = 8; // working dots + editor + footer + margin
-			if (Number.isFinite(rows) && rows > dockRows) {
-				this.widgetContainerAbove.addChild(new Spacer(rows - dockRows));
-			}
-		}
 
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
 		this.ui.start();
@@ -1433,20 +1425,20 @@ export class InteractiveMode {
 	 * so read the RAW setting and require an explicit false to opt Li back in. The shared profile
 	 * keeps Pi on upstream behavior. */
 	private isLiQuietStartup(): boolean {
-		return APP_NAME === "li" && this.settingsManager.getGlobalSettings().quietStartup !== false;
+		return APP_NAME === "li" && this.settingsManager.getSettings().quietStartup !== false;
 	}
 
-	/** Startup header (logo, version, key hints). Hidden only by quietStartup: true. */
+	/** Startup header (logo, version, key hints). Li's unset default is quiet; explicit "header" opts in. */
 	private shouldShowStartupHeader(): boolean {
 		if (this.options.verbose === true) return true;
-		if (this.isLiQuietStartup()) return false;
+		if (APP_NAME === "li" && this.settingsManager.getSettings().quietStartup === undefined) return false;
 		return this.settingsManager.getQuietStartup() !== true;
 	}
 
 	/** Startup details (model scope, loaded resources). Hidden by quietStartup: true or "header". */
 	private shouldShowStartupDetails(): boolean {
 		if (this.options.verbose === true) return true;
-		if (this.isLiQuietStartup()) return false;
+		if (APP_NAME === "li" && this.settingsManager.getSettings().quietStartup === undefined) return false;
 		return this.settingsManager.getQuietStartup() === false;
 	}
 
@@ -2336,9 +2328,10 @@ export class InteractiveMode {
 		this.activeWorkingIndicatorEmbedded = false;
 		this.statusContainer.clear();
 		this.setEditorWorkingStatusIndicator(undefined);
-		// Li hides the editor borders, so a border-embedded indicator would be invisible; render it
-		// as its own line just above the input instead.
-		if (!this.isLiQuietStartup() && this.setEditorWorkingStatusIndicator(indicator)) {
+		// Li's dot-only working row needs one blank line above it; loader-based exceptional
+		// states already include their own leading row.
+		if (APP_NAME === "li" && indicator.kind === "working") this.statusContainer.addChild(new Spacer(1));
+		if (APP_NAME !== "li" && this.setEditorWorkingStatusIndicator(indicator)) {
 			this.activeWorkingIndicatorEmbedded = true;
 			return;
 		}
@@ -2357,6 +2350,7 @@ export class InteractiveMode {
 		this.statusContainer.clear();
 		this.setEditorWorkingStatusIndicator(undefined);
 		if (
+			APP_NAME !== "li" &&
 			clearedIndicator &&
 			!clearedIndicatorWasEmbedded &&
 			this.options.tuiMode === "regular" &&
@@ -2366,8 +2360,8 @@ export class InteractiveMode {
 		}
 	}
 
-	/** Li trims the working label in the editor border down to the spinner alone; extension-provided
-	 *  messages (tool names etc.) still render in full. Pi keeps the upstream label. */
+	/** Li removes the default "Working" label; the separate status row carries only the dot pulse.
+	 *  Extension-provided messages (for example a tool name) still render in full. */
 	private liWorkingBorderMessage(message: string): string {
 		if (APP_NAME !== "li") return message;
 		return message === this.defaultWorkingMessage || message.startsWith(`${this.defaultWorkingMessage} (`)
@@ -2523,8 +2517,15 @@ export class InteractiveMode {
 	 */
 	private renderWidgets(): void {
 		if (!this.widgetContainerAbove || !this.widgetContainerBelow) return;
-		this.renderWidgetContainer(this.widgetContainerAbove, this.extensionWidgetsAbove, true, true);
-		this.renderWidgetContainer(this.widgetContainerBelow, this.extensionWidgetsBelow, false, false);
+		const liMinimal = this.isLiQuietStartup();
+		this.renderWidgetContainer(this.widgetContainerAbove, this.extensionWidgetsAbove, true, true, liMinimal);
+		this.renderWidgetContainer(
+			this.widgetContainerBelow,
+			this.extensionWidgetsBelow,
+			liMinimal,
+			liMinimal,
+			liMinimal,
+		);
 		this.ui.requestRender();
 	}
 
@@ -2533,6 +2534,7 @@ export class InteractiveMode {
 		widgets: Map<string, Component & { dispose?(): void }>,
 		spacerWhenEmpty: boolean,
 		leadingSpacer: boolean,
+		trailingSpacer = false,
 	): void {
 		container.clear();
 
@@ -2549,6 +2551,7 @@ export class InteractiveMode {
 		for (const component of widgets.values()) {
 			container.addChild(component);
 		}
+		if (trailingSpacer) container.addChild(new Spacer(1));
 	}
 
 	/**
@@ -4995,6 +4998,7 @@ export class InteractiveMode {
 					outputPad: this.settingsManager.getOutputPad(),
 					autocompleteMaxVisible: this.settingsManager.getAutocompleteMaxVisible(),
 					quietStartup: this.settingsManager.getQuietStartup(),
+					liToolOutputStyle: this.settingsManager.getLiToolOutputStyle(),
 					clearOnShrink: this.settingsManager.getClearOnShrink(),
 					showTerminalProgress: this.settingsManager.getShowTerminalProgress(),
 					tuiMode: this.ui.mode,
@@ -5105,6 +5109,11 @@ export class InteractiveMode {
 					},
 					onQuietStartupChange: (quiet) => {
 						this.settingsManager.setQuietStartup(quiet);
+					},
+					onLiToolOutputStyleChange: (style) => {
+						this.settingsManager.setLiToolOutputStyle(style);
+						setLiToolOutputStyle(style);
+						this.rebuildChatFromMessages();
 					},
 					onDefaultProjectTrustChange: (defaultProjectTrust) => {
 						this.settingsManager.setDefaultProjectTrust(defaultProjectTrust);
@@ -5812,7 +5821,7 @@ export class InteractiveMode {
 			if (result.cancelled) {
 				return result;
 			}
-			this.showStatus("Resumed session");
+			if (APP_NAME !== "li") this.showStatus("Resumed session");
 			return result;
 		} catch (error: unknown) {
 			if (error instanceof MissingSessionCwdError) {
@@ -5829,7 +5838,7 @@ export class InteractiveMode {
 				if (result.cancelled) {
 					return result;
 				}
-				this.showStatus("Resumed session in current cwd");
+				if (APP_NAME !== "li") this.showStatus("Resumed session in current cwd");
 				return result;
 			}
 			return this.handleFatalRuntimeError("Failed to resume session", error);

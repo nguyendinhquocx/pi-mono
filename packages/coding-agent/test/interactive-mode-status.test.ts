@@ -72,6 +72,52 @@ type ExtensionFixture = {
 	sourceInfo?: SourceInfo;
 };
 
+describe("Li resume UI", () => {
+	test("does not append a Resumed session status line", async () => {
+		type ResumeHarness = {
+			clearStatusIndicator: () => void;
+			runtimeHost: { switchSession: (...args: unknown[]) => Promise<{ cancelled: boolean }> };
+			showStatus: (message: string) => void;
+		};
+		const fakeThis: ResumeHarness = {
+			clearStatusIndicator: vi.fn(),
+			runtimeHost: { switchSession: vi.fn(async () => ({ cancelled: false })) },
+			showStatus: vi.fn(),
+		};
+		const resume = Reflect.get(InteractiveMode.prototype, "handleResumeSession") as (
+			this: ResumeHarness,
+			sessionPath: string,
+		) => Promise<{ cancelled: boolean }>;
+
+		await resume.call(fakeThis, "session.jsonl");
+
+		expect(fakeThis.showStatus).not.toHaveBeenCalled();
+	});
+});
+
+describe("Li minimal dock spacing", () => {
+	test("keeps one blank line around the prompt and extension widgets", () => {
+		const fakeThis: any = {
+			widgetContainerAbove: new Container(),
+			widgetContainerBelow: new Container(),
+			extensionWidgetsAbove: new Map<string, Component>(),
+			extensionWidgetsBelow: new Map<string, Component>(),
+			isLiQuietStartup: () => true,
+			ui: { requestRender: vi.fn() },
+		};
+		fakeThis.renderWidgetContainer = (...args: unknown[]) =>
+			(InteractiveMode as any).prototype.renderWidgetContainer.call(fakeThis, ...args);
+
+		(InteractiveMode as any).prototype.renderWidgets.call(fakeThis);
+		expect(fakeThis.widgetContainerAbove.render(20)).toEqual([""]);
+		expect(fakeThis.widgetContainerBelow.render(20)).toEqual([""]);
+
+		fakeThis.extensionWidgetsAbove.set("status", { render: () => ["widget"], invalidate: () => {} });
+		(InteractiveMode as any).prototype.renderWidgets.call(fakeThis);
+		expect(fakeThis.widgetContainerAbove.render(20)).toEqual(["", "widget", ""]);
+	});
+});
+
 describe("InteractiveMode.showStatus", () => {
 	beforeAll(() => {
 		// showStatus uses the global theme instance
@@ -619,6 +665,7 @@ describe("InteractiveMode.showLoadedResources", () => {
 			chatContainer: new Container(),
 			settingsManager: {
 				getQuietStartup: () => options.quietStartup,
+				getSettings: () => ({ quietStartup: options.quietStartup }),
 			},
 			sessionManager: {
 				getCwd: () => options.cwd ?? "/tmp/project",
@@ -673,6 +720,8 @@ describe("InteractiveMode.showLoadedResources", () => {
 			formatDiagnostics: () => "diagnostics",
 			getBuiltInCommandConflictDiagnostics: () => [],
 		};
+
+		fakeThis.isLiQuietStartup = () => (InteractiveMode as any).prototype.isLiQuietStartup.call(fakeThis);
 
 		if (options.useRealScopeGroups) {
 			fakeThis.getScopeGroup = (sourceInfo?: SourceInfo) =>

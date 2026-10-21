@@ -16,7 +16,9 @@ Li đã build.
 | User PATH entry | `D:\pcloud\workspace\code\pi-mono-li\bin` — không copy `li.cmd` ra chỗ khác vì `LI_ROOT` được tính từ thư mục wrapper |
 | Li CLI entry | `packages/coding-agent/dist/bundle/cli.js` (generated) |
 | Build receipt | `packages/coding-agent/dist/li-build-receipt.json` (generated) |
-| Profile dùng chung | `~/.pi/agent` (`configDir` giữ `.pi`; Pi và Li chia sẻ) |
+| Profile dùng chung | `~/.pi/agent` (`configDir` giữ `.pi`; Pi và Li chia sẻ, gồm cả `tuiMode`) |
+| Li TUI mặc định | quiet, borderless; working pulse `.`, `..`, `...`; input theo sát transcript, tới đáy khi regular scrollback lấp viewport |
+| Li transcript style | `/settings` → `Li transcript style`; `li.toolOutputStyle`: `blank` mặc định (bỏ background user/tool/custom/diff, giữ foreground/bold), `current` khôi phục nền; Pi bỏ qua key này |
 
 ## Rebuild Li sau khi đổi source
 
@@ -39,7 +41,9 @@ Sau khi sửa test count, merge summary vào receipt:
 `node scripts/build-li.mjs --record-tests <test-summary.json>`.
 
 `build-li.mjs` ghi receipt với: full HEAD SHA, base Pi version, source tree hash, Node version,
-artifact hash. `li --version` đọc receipt này (`li <base-version> (source <short-sha>)`).
+artifact hash. Trước khi hash, build neutralize `TERMINAL_COLOR_QUERY` ngay trong Li bundle và ghi
+`li-osc-patch-receipt.json` với SHA trước/sau; runtime guard không cần vá bundle Li lúc mở session.
+`li --version` đọc receipt này (`li <base-version> (source <short-sha>)`).
 Trước lần boot đầu trên profile thật, snapshot `.pi` xong phải rebuild kèm snapshot ID để provenance
 receipt truy được đúng bản backup:
 
@@ -50,9 +54,9 @@ node scripts/build-li.mjs --offline
 
 Thay ID bằng tên snapshot thực tế. Source bẩn (uncommitted) → build vẫn chạy nhưng receipt đánh dấu
 `gitDirty: true` — đó là candidate, KHÔNG dùng làm runtime ổn định. Li shell tool bỏ runtime routing
-vars trước khi chạy lệnh ngoài; gọi `li` từ shell sẽ thiết lập lại chúng qua wrapper. Nếu OSC guard
-patch bundle Li lần đầu, nó ghi file + SHA trước/sau vào
-`packages/coding-agent/dist/li-osc-patch-receipt.json`; Pi global dist không được chạm.
+vars trước khi chạy lệnh ngoài; gọi `li` từ shell sẽ thiết lập lại chúng qua wrapper. Runtime guard
+không nên vá Li lúc `session_start`; nếu nó vẫn báo `neutralized TERMINAL_COLOR_QUERY`, build
+receipt/patch receipt không khớp bundle đang chạy. Pi global dist vẫn được runtime guard xử lý riêng.
 
 ## Quy trình xét update upstream (compare → candidate → promote)
 

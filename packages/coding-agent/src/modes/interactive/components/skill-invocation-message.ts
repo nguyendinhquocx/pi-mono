@@ -1,6 +1,7 @@
 import { Box, Container, Markdown, type MarkdownTheme, MouseRegion, Text } from "@earendil-works/pi-tui";
 import type { ParsedSkillBlock } from "../../../core/agent-session.ts";
 import { getMarkdownTheme, theme } from "../theme/theme.ts";
+import { isLiToolOutputBlank } from "../tool-output-style.ts";
 import { keyText } from "./keybinding-hints.ts";
 
 /**
@@ -14,7 +15,7 @@ export class SkillInvocationMessageComponent extends Box {
 	private markdownTheme: MarkdownTheme;
 
 	constructor(skillBlock: ParsedSkillBlock, markdownTheme: MarkdownTheme = getMarkdownTheme(), outputPad = 1) {
-		super(outputPad, 1, (t) => theme.bg("customMessageBg", t));
+		super(outputPad, 1, (t) => (isLiToolOutputBlank() ? t : theme.bg("customMessageBg", t)));
 		this.skillBlock = skillBlock;
 		this.markdownTheme = markdownTheme;
 		this.updateDisplay();

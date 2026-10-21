@@ -1,4 +1,5 @@
 import type { Component } from "@earendil-works/pi-tui";
+import { APP_NAME } from "../../../config.ts";
 import { theme } from "../theme/theme.ts";
 
 /**
@@ -20,6 +21,8 @@ export class DynamicBorder implements Component {
 	}
 
 	render(width: number): string[] {
+		// Li keeps selectors and status cards borderless; Pi retains upstream separators.
+		if (APP_NAME === "li") return [];
 		return [this.color("─".repeat(Math.max(1, width)))];
 	}
 }

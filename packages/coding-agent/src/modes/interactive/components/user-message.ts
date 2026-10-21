@@ -1,6 +1,7 @@
 import { Container, Markdown, type MarkdownTheme } from "@earendil-works/pi-tui";
 import type { MarkdownTransformer } from "../../../core/extensions/types.ts";
 import { getMarkdownTheme, theme } from "../theme/theme.ts";
+import { isLiToolOutputBlank } from "../tool-output-style.ts";
 import { createMarkdownTransform } from "./markdown-transform.ts";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
@@ -47,7 +48,7 @@ export class UserMessageComponent extends Container {
 				this.markdownTheme,
 				{
 					color: (content: string) => theme.fg("userMessageText", content),
-					bgColor: (content: string) => theme.bg("userMessageBg", content),
+					bgColor: (content: string) => (isLiToolOutputBlank() ? content : theme.bg("userMessageBg", content)),
 				},
 				{
 					preserveOrderedListMarkers: true,

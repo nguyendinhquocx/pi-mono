@@ -704,6 +704,37 @@ describe("Editor component", () => {
 	});
 
 	describe("Scroll indicators", () => {
+		it("hides all borders and scroll indicators when hideBorders is enabled", () => {
+			const editor = new Editor(createTestTUI(20, 8), defaultEditorTheme, { hideBorders: true });
+			editor.setText(Array.from({ length: 20 }, (_, index) => `line ${index}`).join("\n"));
+
+			const lines = editor.render(20);
+			assert.ok(lines.length < 20);
+			assert.ok(lines.every((line) => !line.includes("─") && !line.includes("↑") && !line.includes("↓")));
+		});
+
+		it("maps clicks to the first text row when borders are hidden", () => {
+			const editor = new Editor(createTestTUI(20), defaultEditorTheme, { hideBorders: true });
+			editor.setText("abc");
+			editor.render(20);
+
+			const result = editor.handleMouse({
+				type: "click",
+				button: "left",
+				x: 2,
+				y: 0,
+				screenX: 2,
+				screenY: 0,
+				width: 20,
+				height: 1,
+				shift: false,
+				alt: false,
+				ctrl: false,
+			});
+			assert.strictEqual(result?.focus, true);
+			assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 2 });
+		});
+
 		it("centers scroll indicators on wide borders", () => {
 			const width = 40;
 			const editor = new Editor(createTestTUI(width), defaultEditorTheme);
@@ -2427,6 +2458,31 @@ describe("Editor component", () => {
 			editor.handleInput("\t");
 			assert.strictEqual(editor.getText(), "src/");
 			assert.strictEqual(editor.isShowingAutocomplete(), false);
+		});
+
+		it("inserts the configured blank gap between prompt and autocomplete options", async () => {
+			const editor = new Editor(createTestTUI(40), defaultEditorTheme, { hideBorders: true, autocompleteGap: 1 });
+			editor.setAutocompleteProvider({
+				getSuggestions: async (_lines, _cursorLine, _cursorCol, options) =>
+					options.force
+						? {
+								items: [
+									{ value: "src/", label: "src/" },
+									{ value: "src.txt", label: "src.txt" },
+								],
+								prefix: "src",
+							}
+						: null,
+				applyCompletion,
+			});
+
+			for (const character of "src") editor.handleInput(character);
+			editor.handleInput("\t");
+			await flushAutocomplete();
+			const lines = editor.render(40);
+
+			assert.strictEqual(lines[1], "");
+			assert.ok(lines[2]?.includes("src/"));
 		});
 
 		it("keeps suggestions open when typing in force mode (Tab-triggered)", async () => {

@@ -12,6 +12,7 @@ import {
 	Text,
 	type WheelScrollLines,
 } from "@earendil-works/pi-tui";
+import { APP_NAME } from "../../../config.ts";
 import { formatHttpIdleTimeoutMs, HTTP_IDLE_TIMEOUT_CHOICES } from "../../../core/http-dispatcher.ts";
 import { SETTINGS_DEFAULTS } from "../../../core/settings-defaults.ts";
 import {
@@ -19,6 +20,7 @@ import {
 	type CacheWarmingMode,
 	type DefaultProjectTrust,
 	type FullscreenExitOutput,
+	type LiToolOutputStyle,
 	type MermaidRenderingMode,
 	type QuietStartup,
 	type SessionShareDestination,
@@ -92,6 +94,7 @@ export interface SettingsConfig {
 	outputPad: 0 | 1;
 	autocompleteMaxVisible: number;
 	quietStartup: QuietStartup;
+	liToolOutputStyle?: LiToolOutputStyle;
 	defaultProjectTrust: DefaultProjectTrust;
 	clearOnShrink: boolean;
 	showTerminalProgress: boolean;
@@ -132,6 +135,7 @@ export interface SettingsCallbacks {
 	onOutputPadChange: (padding: 0 | 1) => void;
 	onAutocompleteMaxVisibleChange: (maxVisible: number) => void;
 	onQuietStartupChange: (quiet: QuietStartup) => void;
+	onLiToolOutputStyleChange?: (style: LiToolOutputStyle) => void;
 	onDefaultProjectTrustChange: (defaultProjectTrust: DefaultProjectTrust) => void;
 	onClearOnShrinkChange: (enabled: boolean) => void;
 	onShowTerminalProgressChange: (enabled: boolean) => void;
@@ -767,6 +771,17 @@ export class SettingsSelectorComponent extends Container {
 			},
 		];
 
+		if (APP_NAME === "li" && callbacks.onLiToolOutputStyleChange) {
+			const quietStartupIndex = items.findIndex((item) => item.id === "quiet-startup");
+			items.splice(quietStartupIndex + 1, 0, {
+				id: "li-tool-output-style",
+				label: "Li transcript style",
+				description: "blank removes user/tool/custom-message/diff backgrounds; current restores them",
+				currentValue: config.liToolOutputStyle ?? "blank",
+				values: ["blank", "current"],
+			});
+		}
+
 		// Only show image toggle if terminal supports it
 		if (supportsImages) {
 			// Insert after autocompact
@@ -938,6 +953,9 @@ export class SettingsSelectorComponent extends Container {
 						break;
 					case "quiet-startup":
 						callbacks.onQuietStartupChange(newValue === "header" ? "header" : newValue === "true");
+						break;
+					case "li-tool-output-style":
+						callbacks.onLiToolOutputStyleChange?.(newValue as LiToolOutputStyle);
 						break;
 					case "install-telemetry":
 						callbacks.onEnableInstallTelemetryChange(newValue === "true");
