@@ -1419,18 +1419,25 @@ export class InteractiveMode {
 		return this.options.verbose || this.toolOutputExpanded;
 	}
 
+	/** Li defaults to a quiet startup: upstream's quietStartup default is false (show everything),
+	 * so read the RAW setting and require an explicit false to opt Li back in. The shared profile
+	 * keeps Pi on upstream behavior. */
+	private isLiQuietStartup(): boolean {
+		return APP_NAME === "li" && this.settingsManager.getGlobalSettings().quietStartup !== false;
+	}
+
 	/** Startup header (logo, version, key hints). Hidden only by quietStartup: true. */
 	private shouldShowStartupHeader(): boolean {
 		if (this.options.verbose === true) return true;
-		// Li hides the startup header by default — the shared profile's quietStartup would otherwise
-		// leak into Pi. quietStartup:false opts Li back in; --verbose always shows it.
-		if (APP_NAME === "li" && this.settingsManager.getQuietStartup() !== false) return false;
+		if (this.isLiQuietStartup()) return false;
 		return this.settingsManager.getQuietStartup() !== true;
 	}
 
 	/** Startup details (model scope, loaded resources). Hidden by quietStartup: true or "header". */
 	private shouldShowStartupDetails(): boolean {
-		return this.options.verbose === true || this.settingsManager.getQuietStartup() === false;
+		if (this.options.verbose === true) return true;
+		if (this.isLiQuietStartup()) return false;
+		return this.settingsManager.getQuietStartup() === false;
 	}
 
 	/**
