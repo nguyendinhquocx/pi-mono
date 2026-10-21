@@ -12,6 +12,12 @@
 
 # Pi
 
+> **Li fork:** nhánh `li/stable` của repo này là bản fork chạy song song với Pi global trên cùng
+> profile `~/.pi` — identity riêng (`li`), tự build từ source (`node scripts/build-li.mjs --offline`,
+> kèm `LI_PROFILE_SNAPSHOT_ID`), tự chặn self-update (`li update` bị từ chối trong code), session
+> mới hơn format Li bị từ chối mở. Chỉ upstream sync thủ công có review. Runbook đầy đủ:
+> [`docs/li-maintenance.md`](docs/li-maintenance.md).
+
 Pi is a minimal, extensible agent harness that you can make your own.
 
 Adapt Pi to your workflows, not the other way around. Customize Pi with [extensions](packages/coding-agent/docs/extensions.md), [skills](packages/coding-agent/docs/skills.md), [prompt templates](packages/coding-agent/docs/prompt-templates.md), and [themes](packages/coding-agent/docs/themes.md). Bundle them as [Pi packages](packages/coding-agent/docs/packages.md) and share via npm or git.
