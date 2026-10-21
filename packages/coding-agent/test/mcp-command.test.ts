@@ -2,6 +2,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { APP_NAME } from "../src/config.ts";
 import { runMcpCommand } from "../src/extensions/mcp/cli.ts";
 
 const FIXTURE = resolve(import.meta.dirname, "../../mcp/test/fixtures/stdio-server.mjs");
@@ -41,9 +42,13 @@ describe("pi mcp", () => {
 		expect(exitCode).toBe(1);
 		expect(output).toContain("fixture: connected, 1 tool (codemode, global)\n");
 		expect(output).toContain("  tools: echo");
-		expect(output).toContain(
-			"broken: failed (codemode, global)\n  pi-test-missing-mcp-server\n  spawn pi-test-missing-mcp-server ENOENT",
-		);
+		expect(output).toContain("broken: failed (codemode, global)\n  pi-test-missing-mcp-server");
+		// Windows cmd reports the missing binary as an unrecognized command instead of a Node spawn ENOENT.
+		if (process.platform === "win32") {
+			expect(output).toContain("is not recognized as an internal or external command");
+		} else {
+			expect(output).toContain("spawn pi-test-missing-mcp-server ENOENT");
+		}
 		expect(output).toContain("parked: disabled (codemode, global)");
 		expect(output).toContain("config error: ");
 		expect(output).toContain('server "bad" needs either "command"');
@@ -142,7 +147,7 @@ describe("pi mcp", () => {
 			undefined,
 			agentDir,
 		);
-		expect(oauth.output).toContain("If it requires sign-in: pi mcp login sentry");
+		expect(oauth.output).toContain(`If it requires sign-in: ${APP_NAME} mcp login sentry`);
 		expect(readConfig(join(agentDir, "mcp.json")).mcpServers).toMatchObject({
 			sentry: { url: "https://mcp.sentry.dev/mcp", oauth: { clientId: "pi", clientName: "Claude Code" } },
 		});

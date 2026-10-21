@@ -2,8 +2,8 @@ import assert from "node:assert";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { afterEach, beforeEach, describe, it, test } from "node:test";
+import { dirname, join, resolve } from "node:path";
+import { afterEach, beforeEach, describe, it, type TestContext, test } from "node:test";
 import { CombinedAutocompleteProvider } from "../src/autocomplete.ts";
 
 const resolveFdPath = (): string | null => {
@@ -35,6 +35,25 @@ const setupFolder = (baseDir: string, structure: FolderStructure = {}): void => 
 		writeFileSync(fullPath, contents);
 	});
 };
+
+function createSymlinkOrSkip(
+	context: TestContext,
+	target: string,
+	linkPath: string,
+	type?: "file" | "dir" | "junction",
+): boolean {
+	try {
+		symlinkSync(target, linkPath, type);
+		return true;
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (process.platform === "win32" && (code === "EPERM" || code === "EACCES")) {
+			context.skip("Windows symlink privilege unavailable (enable Developer Mode or run elevated).");
+			return false;
+		}
+		throw error;
+	}
+}
 
 const fdPath = resolveFdPath();
 const isFdInstalled = Boolean(fdPath);
@@ -425,7 +444,7 @@ describe("CombinedAutocompleteProvider", () => {
 			assert.ok(!values.some((value) => value === "@.git" || value.startsWith("@.git/")));
 		});
 
-		test("follows symlinked directories for fuzzy @ search", async () => {
+		test("follows symlinked directories for fuzzy @ search", async (t) => {
 			setupFolder(baseDir, {
 				files: {
 					"dir/some_file.txt": "real",
@@ -436,7 +455,9 @@ describe("CombinedAutocompleteProvider", () => {
 					"some_file.txt": "symlinked",
 				},
 			});
-			symlinkSync("../outside", join(baseDir, "symlinked_dir"));
+			const linkTarget = process.platform === "win32" ? resolve(outsideDir) : "../outside";
+			const linkType = process.platform === "win32" ? "junction" : undefined;
+			if (!createSymlinkOrSkip(t, linkTarget, join(baseDir, "symlinked_dir"), linkType)) return;
 
 			const provider = new CombinedAutocompleteProvider([], baseDir, requireFdPath());
 			const line = "@some";
@@ -447,13 +468,15 @@ describe("CombinedAutocompleteProvider", () => {
 			assert.ok(values.includes("@symlinked_dir/some_file.txt"));
 		});
 
-		test("returns symlinked directories when matching their name", async () => {
+		test("returns symlinked directories when matching their name", async (t) => {
 			setupFolder(outsideDir, {
 				files: {
 					"nested/file.txt": "symlinked",
 				},
 			});
-			symlinkSync("../outside", join(baseDir, "symlinked_dir"));
+			const linkTarget = process.platform === "win32" ? resolve(outsideDir) : "../outside";
+			const linkType = process.platform === "win32" ? "junction" : undefined;
+			if (!createSymlinkOrSkip(t, linkTarget, join(baseDir, "symlinked_dir"), linkType)) return;
 
 			const provider = new CombinedAutocompleteProvider([], baseDir, requireFdPath());
 			const line = "@symlinked";
@@ -463,14 +486,15 @@ describe("CombinedAutocompleteProvider", () => {
 			assert.ok(values.includes("@symlinked_dir/"));
 		});
 
-		test("returns symlinked files without requiring type l", async () => {
+		test("returns symlinked files without requiring type l", async (t) => {
 			setupFolder(baseDir, {
 				files: {
 					"original.txt": "content",
 				},
 			});
 			const linkPath = join(baseDir, "link.txt");
-			symlinkSync("original.txt", linkPath);
+			if (!createSymlinkOrSkip(t, "original.txt", linkPath, process.platform === "win32" ? "file" : undefined))
+				return;
 
 			const provider = new CombinedAutocompleteProvider([], baseDir, requireFdPath());
 			const line = "@link";

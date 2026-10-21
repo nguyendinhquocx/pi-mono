@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { spawn, spawnSync } from "child_process";
-import { getBinDir } from "../config.ts";
+import { APP_NAME, getBinDir } from "../config.ts";
 
 export interface ShellConfig {
 	shell: string;
@@ -136,15 +136,34 @@ export function getPowerShellConfig(): ShellConfig {
 }
 
 export function getShellEnv(): NodeJS.ProcessEnv {
+	const shellEnv: NodeJS.ProcessEnv = { ...process.env };
+	if (APP_NAME === "li") {
+		// Li's wrapper must set these overrides for the current Pi process, but
+		// child shells should not pass them into a separately invoked global `pi`.
+		// Keep the shared profile by translating Li-only profile vars back to Pi.
+		if (!shellEnv.PI_CODING_AGENT_DIR?.trim() && shellEnv.LI_CODING_AGENT_DIR?.trim()) {
+			shellEnv.PI_CODING_AGENT_DIR = shellEnv.LI_CODING_AGENT_DIR;
+		}
+		if (!shellEnv.PI_CODING_AGENT_SESSION_DIR?.trim() && shellEnv.LI_CODING_AGENT_SESSION_DIR?.trim()) {
+			shellEnv.PI_CODING_AGENT_SESSION_DIR = shellEnv.LI_CODING_AGENT_SESSION_DIR;
+		}
+		for (const key of Object.keys(shellEnv)) {
+			if (key.startsWith("LI_")) delete shellEnv[key];
+		}
+		for (const key of ["PI_PACKAGE_DIR", "PI_CORE_CLI_PATH", "PI_OSC_GUARD_DIST", "PI_SKIP_VERSION_CHECK"]) {
+			delete shellEnv[key];
+		}
+	}
+
 	const binDir = getBinDir();
-	const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
-	const currentPath = process.env[pathKey] ?? "";
+	const pathKey = Object.keys(shellEnv).find((key) => key.toLowerCase() === "path") ?? "PATH";
+	const currentPath = shellEnv[pathKey] ?? "";
 	const pathEntries = currentPath.split(delimiter).filter(Boolean);
 	const hasBinDir = pathEntries.includes(binDir);
 	const updatedPath = hasBinDir ? currentPath : [binDir, currentPath].filter(Boolean).join(delimiter);
 
 	return {
-		...process.env,
+		...shellEnv,
 		[pathKey]: updatedPath,
 	};
 }

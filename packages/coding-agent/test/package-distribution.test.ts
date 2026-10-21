@@ -16,7 +16,9 @@ const packageJson = JSON.parse(
 
 describe("package distribution entrypoints", () => {
 	test("uses the bundle for executables and modular output for libraries", () => {
-		expect(packageJson.bin.pi).toBe("dist/bundle/cli.js");
+		// Li renames the executable (bin.li) while Pi keeps bin.pi; both point at the same bundle.
+		const cliEntry = packageJson.bin.li ?? packageJson.bin.pi;
+		expect(cliEntry).toBe("dist/bundle/cli.js");
 		expect(packageJson.main).toBe("./dist/index.js");
 		expect(packageJson.exports["."].import).toBe("./dist/index.js");
 		expect(packageJson.exports["./rpc-entry"].import).toBe("./dist/bundle/rpc-entry.js");

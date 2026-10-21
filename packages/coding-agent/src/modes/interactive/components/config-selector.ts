@@ -863,12 +863,14 @@ class ResourceList implements Component, Focusable {
 		if (item.metadata.source === "builtin") return item.path;
 		const scope = item.metadata.scope as "user" | "project";
 		const baseDir = item.metadata.baseDir ?? this.getTopLevelBaseDir(scope);
-		return relative(baseDir, item.path);
+		// Settings files are portable across machines: persist POSIX-style relative identifiers
+		// even when the local filesystem uses backslashes (Windows).
+		return relative(baseDir, item.path).replaceAll("\\", "/");
 	}
 
 	private getPackageResourcePattern(item: ResourceItem): string {
 		const baseDir = item.metadata.baseDir ?? dirname(item.path);
-		return relative(baseDir, item.path);
+		return relative(baseDir, item.path).replaceAll("\\", "/");
 	}
 }
 

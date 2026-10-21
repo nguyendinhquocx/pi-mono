@@ -793,7 +793,19 @@ describe("imageFallback", () => {
 		try {
 			const abs = join(homedir(), ".pi", "agent", "shot.png");
 			const result = imageFallback("image/png", { widthPx: 1280, heightPx: 720 }, abs);
-			assert.strictEqual(result, "[Image: ~/.pi/agent/shot.png [image/png] 1280x720]");
+			assert.strictEqual(result, `[Image: ${join("~", ".pi", "agent", "shot.png")} [image/png] 1280x720]`);
+		} finally {
+			resetCapabilitiesCache();
+		}
+	});
+
+	it("shortens home-prefixed paths when home and input separators differ", () => {
+		setCapabilities({ images: null, trueColor: false, hyperlinks: false });
+		try {
+			const forwardSlashHome = homedir().replace(/\\/g, "/").replace(/\/+$/, "");
+			const mixedPath = `${forwardSlashHome}/.pi/agent/shot.png`;
+			const result = imageFallback("image/png", { widthPx: 1280, heightPx: 720 }, mixedPath);
+			assert.strictEqual(result, `[Image: ${join("~", ".pi", "agent", "shot.png")} [image/png] 1280x720]`);
 		} finally {
 			resetCapabilitiesCache();
 		}
@@ -811,7 +823,7 @@ describe("imageFallback", () => {
 			);
 			// Visible text must use ~/... not the expanded home path.
 			const visible = result.replace(/\x1b\]8;;.*?\x1b\\/g, "");
-			assert.strictEqual(visible, "[Image: ~/.pi/agent/shot.png [image/png] 10x10]");
+			assert.strictEqual(visible, `[Image: ${join("~", ".pi", "agent", "shot.png")} [image/png] 10x10]`);
 		} finally {
 			resetCapabilitiesCache();
 		}

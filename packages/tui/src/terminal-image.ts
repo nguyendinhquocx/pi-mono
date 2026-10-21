@@ -1,6 +1,6 @@
 import { execSync } from "node:child_process";
 import { homedir } from "node:os";
-import { isAbsolute } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { TerminalColorMode } from "./colors.ts";
 
@@ -735,11 +735,26 @@ export function hyperlink(text: string, url: string): string {
 
 /** Shorten home-prefixed absolute paths to ~/... for compact display. */
 function shortenImagePath(filename: string): string {
+	if (!isAbsolute(filename)) return filename;
 	const home = homedir();
-	if (home && (filename === home || filename.startsWith(`${home}/`) || filename.startsWith(`${home}\\`))) {
-		return `~${filename.slice(home.length)}`;
-	}
-	return filename;
+	if (!home) return filename;
+
+	// Environment-isolated Windows tests and shells can express the same home
+	// path with mixed slash directions. Compare canonical paths, then preserve
+	// the platform-native separator in the user-facing suffix.
+	const resolvedHome = resolve(home);
+	const resolvedFilename = resolve(filename);
+	const normalizeForCompare = (path: string): string => {
+		const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
+		return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+	};
+	const normalizedHome = normalizeForCompare(resolvedHome);
+	const normalizedFilename = normalizeForCompare(resolvedFilename);
+	if (normalizedFilename === normalizedHome) return "~";
+	if (!normalizedFilename.startsWith(`${normalizedHome}/`)) return filename;
+
+	const relativePath = relative(resolvedHome, resolvedFilename);
+	return relativePath ? `~${sep}${relativePath}` : "~";
 }
 
 /**

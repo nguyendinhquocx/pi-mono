@@ -13,6 +13,7 @@ Li đã build.
 | Worktree Li (branch `li/stable`) | `D:\pcloud\workspace\code\pi-mono-li` |
 | Nhánh source Li | `li/stable` (local; không push nếu user chưa duyệt) |
 | Wrapper command | `bin/li.cmd` trong worktree |
+| User PATH entry | `D:\pcloud\workspace\code\pi-mono-li\bin` — không copy `li.cmd` ra chỗ khác vì `LI_ROOT` được tính từ thư mục wrapper |
 | Li CLI entry | `packages/coding-agent/dist/bundle/cli.js` (generated) |
 | Build receipt | `packages/coding-agent/dist/li-build-receipt.json` (generated) |
 | Profile dùng chung | `~/.pi/agent` (`configDir` giữ `.pi`; Pi và Li chia sẻ) |
@@ -27,10 +28,31 @@ npm run check
 bash ./test.sh        (Git Bash)
 ```
 
+Windows full-suite gate: `test.sh` trên máy thường (không symlink privilege) không green 100% —
+các test upstream còn fail vì lý do môi trường, KHÔNG phải Li: symlink EPERM (paths,
+package-manager, resource-loader, session-selector, durable/jsonl, env-node fs), shell/process
+timeout (env-node, harness-tools-recovery), message spawn Windows (đã có assertion platform-aware
+nội repo), PM thật trên máy làm fixture self-update fail (config.test), upstream catalog drift
+(xai-responses `xhigh`), chord boundary. Full-suite green là gate của Linux CI; trên Windows
+chấp nhận khi residual failures rơi đúng các nhóm trên và `npm run check` + focused suites PASS.
+Sau khi sửa test count, merge summary vào receipt:
+`node scripts/build-li.mjs --record-tests <test-summary.json>`.
+
 `build-li.mjs` ghi receipt với: full HEAD SHA, base Pi version, source tree hash, Node version,
 artifact hash. `li --version` đọc receipt này (`li <base-version> (source <short-sha>)`).
-Source bẩn (uncommitted) → build vẫn chạy nhưng receipt đánh dấu `gitDirty: true` — đó là
-candidate, KHÔNG dùng làm runtime ổn định.
+Trước lần boot đầu trên profile thật, snapshot `.pi` xong phải rebuild kèm snapshot ID để provenance
+receipt truy được đúng bản backup:
+
+```
+$env:LI_PROFILE_SNAPSHOT_ID = "pi-snapshot-2026-10-20-pre-li"
+node scripts/build-li.mjs --offline
+```
+
+Thay ID bằng tên snapshot thực tế. Source bẩn (uncommitted) → build vẫn chạy nhưng receipt đánh dấu
+`gitDirty: true` — đó là candidate, KHÔNG dùng làm runtime ổn định. Li shell tool bỏ runtime routing
+vars trước khi chạy lệnh ngoài; gọi `li` từ shell sẽ thiết lập lại chúng qua wrapper. Nếu OSC guard
+patch bundle Li lần đầu, nó ghi file + SHA trước/sau vào
+`packages/coding-agent/dist/li-osc-patch-receipt.json`; Pi global dist không được chạm.
 
 ## Quy trình xét update upstream (compare → candidate → promote)
 
@@ -77,6 +99,13 @@ Mỗi lần xét update là thủ công, có review. Không auto-merge vào `li/
 - Extension spawn/OSC (source ở `D:\pcloud\workspace\code\python\app_presets\pi\extensions\`):
   `shared/resolve-runtime-cli.ts`, `subagent-tab/index.ts`, `handoff/index.ts`,
   `peer-sessions/parent-launcher.ts`, `pi-osc-patch-guard/index.ts`
+
+## UAT trước khi chấp nhận coexistence
+
+- Từ cùng CWD, chạy `li` rồi `pi`; xác nhận cùng profile/session list nhưng identity/version riêng, và không mở cùng session file đồng thời.
+- Từ Li chạy `subagent_tab`, handoff và peer parent launch; child phải chạy Li, không dùng Pi global CLI.
+- Chạy `li update` và xác nhận bị từ chối trước mọi package-manager side effect; `pi --version` vẫn là Pi global.
+- Chạy Pi-absent smoke trên fixture profile với `APPDATA`/`PATH` cô lập; mọi child command line vẫn trỏ Li. Chỉ sau các bước này mới cân nhắc gỡ Pi thật.
 
 ## Rollback
 
