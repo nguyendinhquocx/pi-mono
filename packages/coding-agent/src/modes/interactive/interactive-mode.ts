@@ -1421,7 +1421,11 @@ export class InteractiveMode {
 
 	/** Startup header (logo, version, key hints). Hidden only by quietStartup: true. */
 	private shouldShowStartupHeader(): boolean {
-		return this.options.verbose === true || this.settingsManager.getQuietStartup() !== true;
+		if (this.options.verbose === true) return true;
+		// Li hides the startup header by default — the shared profile's quietStartup would otherwise
+		// leak into Pi. quietStartup:false opts Li back in; --verbose always shows it.
+		if (APP_NAME === "li" && this.settingsManager.getQuietStartup() !== false) return false;
+		return this.settingsManager.getQuietStartup() !== true;
 	}
 
 	/** Startup details (model scope, loaded resources). Hidden by quietStartup: true or "header". */

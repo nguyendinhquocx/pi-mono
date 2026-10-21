@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, test } from "vitest";
 
 interface CodingAgentPackageJson {
-	bin: { pi: string };
+	bin: { pi?: string; li?: string };
 	main: string;
 	exports: {
 		".": { import: string; types: string };
