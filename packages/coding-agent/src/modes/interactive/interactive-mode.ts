@@ -994,6 +994,15 @@ export class InteractiveMode {
 		this.defaultEditor.onSubmit = (text) => this.handleStartupSubmit(text);
 		this.ui.setFocus(this.editor);
 
+		// Li quiet startup: in regular mode the transcript is a plain scrolling list, so with no header
+		// the input dock would glue itself to the top row. Blank scrollback pushes it to the bottom.
+		if (this.isLiQuietStartup() && this.renderer.mode === "regular") {
+			const rows = this.renderer.terminal.rows;
+			const dockRows = 8; // editor (3) + footer separator/line + margin
+			const filler = Math.max(1, rows - dockRows);
+			process.stdout.write("\n".repeat(filler));
+		}
+
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
 		this.ui.start();
 		this.isInitialized = true;
@@ -2354,6 +2363,15 @@ export class InteractiveMode {
 		}
 	}
 
+	/** Li trims the working label in the editor border down to the spinner alone; extension-provided
+	 *  messages (tool names etc.) still render in full. Pi keeps the upstream label. */
+	private liWorkingBorderMessage(message: string): string {
+		if (APP_NAME !== "li") return message;
+		return message === this.defaultWorkingMessage || message.startsWith(`${this.defaultWorkingMessage} (`)
+			? ""
+			: message;
+	}
+
 	private showWorkingStatusIndicator(): void {
 		const colorFn = isEmbeddedStatus(this.editor)
 			? (text: string) =>
@@ -2362,7 +2380,7 @@ export class InteractiveMode {
 		this.showStatusIndicator(
 			new WorkingStatusIndicator(
 				this.ui,
-				this.workingMessage ?? this.defaultWorkingMessage,
+				this.liWorkingBorderMessage(this.workingMessage ?? this.defaultWorkingMessage),
 				this.workingIndicatorOptions,
 				colorFn,
 			),
@@ -2487,7 +2505,7 @@ export class InteractiveMode {
 		this.setWorkingIndicator();
 		if (this.activeStatusIndicator?.kind === "working") {
 			this.activeStatusIndicator.setMessage(
-				`${this.defaultWorkingMessage} (${keyText("app.interrupt")} to interrupt)`,
+				this.liWorkingBorderMessage(`${this.defaultWorkingMessage} (${keyText("app.interrupt")} to interrupt)`),
 			);
 		}
 		this.setHiddenThinkingLabel();

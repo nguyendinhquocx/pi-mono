@@ -1,4 +1,5 @@
 import { Editor, type EditorOptions, type EditorTheme, type TUI, visibleWidth } from "@earendil-works/pi-tui";
+import { APP_NAME } from "../../../config.ts";
 import type { AppKeybinding, KeybindingsManager } from "../../../core/keybindings.ts";
 import type { StatusIndicator } from "./status-indicator.ts";
 
@@ -33,7 +34,25 @@ export class CustomEditor extends Editor {
 		this.workingStatusIndicator = indicator;
 	}
 
+	/** Li marks its input dock with dotted borders so it reads differently from Pi at a glance.
+	 *  Swapping glyphs 1:1 keeps widths (and the working-status layout math) intact. */
+	private dottedForLi(border: string): string {
+		return APP_NAME === "li" ? border.replaceAll("─", "┄") : border;
+	}
+
 	protected override renderTopBorder(width: number, hiddenLineCount: number): string {
+		const border =
+			this.embedWorkingStatus && this.workingStatusIndicator
+				? this.renderTopBorderWithStatus(width, hiddenLineCount)
+				: super.renderTopBorder(width, hiddenLineCount);
+		return this.dottedForLi(border);
+	}
+
+	protected override renderBottomBorder(width: number, hiddenLineCount: number): string {
+		return this.dottedForLi(super.renderBottomBorder(width, hiddenLineCount));
+	}
+
+	private renderTopBorderWithStatus(width: number, hiddenLineCount: number): string {
 		if (!this.embedWorkingStatus || !this.workingStatusIndicator || width <= 0) {
 			return super.renderTopBorder(width, hiddenLineCount);
 		}
