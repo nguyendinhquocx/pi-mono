@@ -136,7 +136,11 @@ function createBundle(root, { sourceCommit, packageVersion }) {
 	writeFileSync(join(distRoot, "bundle", "cli.js"), "// isolated smoke fixture\n", "utf8");
 	writeFileSync(
 		join(distRoot, "li-build-receipt.json"),
-		JSON.stringify({ gitHead: sourceCommit, gitShortSha: sourceCommit.slice(0, 10), baseVersion: packageVersion, profileSnapshotId: snapshotId }),
+		`${JSON.stringify(
+			{ gitHead: sourceCommit, gitShortSha: sourceCommit.slice(0, 10), baseVersion: packageVersion, profileSnapshotId: snapshotId },
+			null,
+			2,
+		)}\n`,
 		"utf8",
 	);
 	writeFileSync(join(packageRoot, "node_modules", "jiti", "package.json"), '{"name":"jiti","version":"2.7.0"}\n', "utf8");
