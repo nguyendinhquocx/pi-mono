@@ -718,6 +718,19 @@ export class Markdown implements Component {
 					break;
 				}
 
+				case "image": {
+					// The TUI cannot draw inline images, and the default fallthrough prints only the alt
+					// text — for the common `![](path)` shape that is empty, so the reference vanished
+					// from the transcript. Keep the path (and alt, when present) visible instead.
+					const href = typeof token.href === "string" ? token.href : "";
+					const alt = typeof token.text === "string" ? token.text : "";
+					const label = alt.length > 0 ? `${alt} ` : "";
+					const styledImage = this.theme.link(this.theme.underline(`${label}${href}`));
+					result +=
+						(href && getCapabilities().hyperlinks ? hyperlink(styledImage, href) : styledImage) + stylePrefix;
+					break;
+				}
+
 				case "br":
 					result += "\n";
 					break;

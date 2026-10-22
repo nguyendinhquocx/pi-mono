@@ -1,5 +1,6 @@
 import { stripVTControlCharacters } from "node:util";
 import { setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
+import chalk from "chalk";
 import { beforeAll, beforeEach, describe, expect, test } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type {
@@ -734,6 +735,30 @@ describe("TreeSelectorComponent", () => {
 
 			selector.handleInput(DOWN); // user-3a → asst-3a (not user-3b)
 			expect(list.getSelectedNode()?.entry.id).toBe("asst-3a");
+		});
+	});
+
+	describe("selection style (Li)", () => {
+		test("marks the selected row with an arrow and bold instead of a background", () => {
+			const originalColorLevel = chalk.level;
+			chalk.level = 3;
+			try {
+				const tree = buildTree([userMessage("user-1", null, "hello"), userMessage("user-2", "user-1", "again")]);
+				const selector = new TreeSelectorComponent(
+					tree,
+					"user-1",
+					24,
+					() => {},
+					() => {},
+				);
+
+				const raw = selector.getTreeList().render(200).join("\n");
+				expect(raw).toContain("→");
+				expect(raw).toContain("\u001b[1m");
+				expect(raw).not.toContain("\u001b[44m");
+			} finally {
+				chalk.level = originalColorLevel;
+			}
 		});
 	});
 });

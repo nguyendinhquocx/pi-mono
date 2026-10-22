@@ -7,6 +7,9 @@ import { keyText } from "./keybinding-hints.ts";
 
 export type StatusIndicatorKind = "working" | "retry" | "compaction" | "branchSummary";
 
+/** Li replaces the braille wheel with a one-to-three dot pulse in every status. */
+const LI_PULSE_INDICATOR = { frames: [".", "..", "..."], intervalMs: 400 };
+
 export class StatusIndicator extends Loader {
 	readonly kind: StatusIndicatorKind;
 
@@ -18,7 +21,7 @@ export class StatusIndicator extends Loader {
 		message: string,
 		indicator?: WorkingIndicatorOptions,
 	) {
-		super(ui, spinnerColorFn, messageColorFn, message, indicator);
+		super(ui, spinnerColorFn, messageColorFn, message, APP_NAME === "li" ? LI_PULSE_INDICATOR : indicator);
 		this.kind = kind;
 	}
 

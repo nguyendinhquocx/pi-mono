@@ -17,7 +17,8 @@ Li đã build.
 | Li CLI entry | `packages/coding-agent/dist/bundle/cli.js` (generated) |
 | Build receipt | `packages/coding-agent/dist/li-build-receipt.json` (generated) |
 | Profile dùng chung | `~/.pi/agent` (`configDir` giữ `.pi`; Pi và Li chia sẻ, gồm cả `tuiMode`) |
-| Li TUI mặc định | quiet, borderless; working pulse `.`, `..`, `...`; input theo sát transcript, tới đáy khi regular scrollback lấp viewport |
+| Li TUI mặc định | quiet, borderless; mọi trạng thái chạy (working/compaction/retry/bash/modal) pulse `.` `..` `...`; input theo sát transcript, tới đáy khi regular scrollback lấp viewport |
+| Li selection + prompt | `/resume` và `/tree` chọn bằng `→` + chữ đậm, không nền; prompt user nhập hiển thị bold italic trong `blank` style |
 | Li transcript style | `/settings` → `Li transcript style`; `li.toolOutputStyle`: `blank` mặc định (bỏ background user/tool/custom/diff, giữ foreground/bold), `current` khôi phục nền; Pi bỏ qua key này |
 
 ## Rebuild Li sau khi đổi source

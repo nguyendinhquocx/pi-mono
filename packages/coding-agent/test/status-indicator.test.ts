@@ -39,6 +39,26 @@ describe("status indicators", () => {
 		}
 	});
 
+	it("pulses dots instead of the braille wheel for compaction, retry, and branch summary", () => {
+		initTheme("dark");
+		const tui = { requestRender: vi.fn(), terminal: { rows: 10 } } as unknown as TUI;
+		const indicators = [
+			new CompactionStatusIndicator(tui, "manual"),
+			new RetryStatusIndicator(tui, 1, 3, 5000),
+			new BranchSummaryStatusIndicator(tui),
+		];
+		try {
+			for (const indicator of indicators) {
+				const lines = indicator.render(60);
+				const visible = stripAnsi(lines.join("\n"));
+				expect(lines.join("\n")).not.toContain("⠋");
+				expect(visible.trim()).toMatch(/^\./);
+			}
+		} finally {
+			for (const indicator of indicators) indicator.dispose();
+		}
+	});
+
 	it("embeds the working indicator when the editor opts in to borders", () => {
 		initTheme("dark");
 		const tui = {
@@ -55,9 +75,11 @@ describe("status indicators", () => {
 		editor.setWorkingStatusIndicator(indicator);
 
 		const topBorder = editor.render(20)[0]!;
-		expect(stripAnsi(topBorder)).toBe("── ⠋ Working ───────");
+		// Li pulses dots everywhere, including the border-embedded working indicator.
+		expect(stripAnsi(topBorder)).toBe("── . Working ───────");
 		expect(visibleWidth(topBorder)).toBe(20);
-		expect(topBorder.split(theme.getFgAnsi("thinkingHigh"))).toHaveLength(5);
+		// The verbatim dot pulse is uncolored, so the border color splits into one fewer segment.
+		expect(topBorder.split(theme.getFgAnsi("thinkingHigh"))).toHaveLength(4);
 		indicator.dispose();
 	});
 

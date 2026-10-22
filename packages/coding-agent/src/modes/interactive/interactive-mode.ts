@@ -2378,8 +2378,7 @@ export class InteractiveMode {
 			new WorkingStatusIndicator(
 				this.ui,
 				this.liWorkingBorderMessage(this.workingMessage ?? this.defaultWorkingMessage),
-				// Li pulses one-to-three dots instead of the braille spinner.
-				APP_NAME === "li" ? { frames: [".", "..", "..."], intervalMs: 400 } : this.workingIndicatorOptions,
+				this.workingIndicatorOptions,
 				colorFn,
 			),
 		);

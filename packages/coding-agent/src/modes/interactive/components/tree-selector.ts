@@ -12,6 +12,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import { APP_NAME } from "../../../config.ts";
 import type { SessionTreeNode } from "../../../core/session-manager.ts";
 import { formatReadLineRange } from "../../../core/tools/render-utils.ts";
 import { theme } from "../theme/theme.ts";
@@ -692,7 +693,7 @@ class TreeList implements Component {
 			const isSelected = i === this.selectedIndex;
 
 			// Build line: cursor + prefix + path marker + label + content
-			const cursor = isSelected ? theme.fg("accent", "› ") : "  ";
+			const cursor = isSelected ? theme.fg("accent", APP_NAME === "li" ? "→ " : "› ") : "  ";
 
 			// If multiple roots, shift display (roots at 0, not 1)
 			const displayIndent = this.multipleRoots ? Math.max(0, flatNode.indent - 1) : flatNode.indent;
@@ -754,8 +755,14 @@ class TreeList implements Component {
 			let gutter = cursor;
 			let body = prefixPart + label + labelTimestamp + content;
 			if (isSelected) {
-				gutter = theme.bg("selectedBg", gutter);
-				body = theme.bg("selectedBg", body);
+				// Li marks the selection with the arrow and bold only; Pi keeps the filled background.
+				if (APP_NAME === "li") {
+					gutter = theme.bold(gutter);
+					body = theme.bold(body);
+				} else {
+					gutter = theme.bg("selectedBg", gutter);
+					body = theme.bg("selectedBg", body);
+				}
 			}
 			renderedRows.push({ gutter, body, anchorCol, bodyWidth: visibleWidth(body), isSelected });
 		}

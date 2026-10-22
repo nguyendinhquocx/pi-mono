@@ -13,6 +13,7 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
+import { APP_NAME } from "../../../config.ts";
 import { KeybindingsManager } from "../../../core/keybindings.ts";
 import type { SessionInfo, SessionListProgress } from "../../../core/session-manager.ts";
 import { canonicalizePath as _canonicalizePath } from "../../../utils/paths.ts";
@@ -481,7 +482,7 @@ class SessionList implements Component, Focusable {
 			}
 
 			// Cursor
-			const cursor = isSelected ? theme.fg("accent", "› ") : "  ";
+			const cursor = isSelected ? theme.fg("accent", APP_NAME === "li" ? "→ " : "› ") : "  ";
 
 			// Calculate available width for message
 			const prefixWidth = visibleWidth(prefix);
@@ -512,7 +513,8 @@ class SessionList implements Component, Focusable {
 
 			let line = leftPart + " ".repeat(spacing) + styledRight;
 			if (isSelected) {
-				line = theme.bg("selectedBg", line);
+				// Li marks the selection with the arrow and bold only; Pi keeps the filled background.
+				line = APP_NAME === "li" ? theme.bold(line) : theme.bg("selectedBg", line);
 			}
 			lines.push(truncateToWidth(line, width));
 		}

@@ -1,4 +1,5 @@
 import { CancellableLoader, Container, Loader, Spacer, Text, type TUI } from "@earendil-works/pi-tui";
+import { APP_NAME } from "../../../config.ts";
 import type { Theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { keyHint } from "./keybinding-hints.ts";
@@ -20,6 +21,8 @@ export class BorderedLoader extends Container {
 				(s) => theme.fg("accent", s),
 				(s) => theme.fg("muted", s),
 				message,
+				// Li pulses dots instead of the braille wheel.
+				APP_NAME === "li" ? { frames: [".", "..", "..."], intervalMs: 400 } : undefined,
 			);
 		} else {
 			this.signalController = new AbortController();
@@ -28,6 +31,7 @@ export class BorderedLoader extends Container {
 				(s) => theme.fg("accent", s),
 				(s) => theme.fg("muted", s),
 				message,
+				APP_NAME === "li" ? { frames: [".", "..", "..."], intervalMs: 400 } : undefined,
 			);
 		}
 		this.addChild(this.loader);

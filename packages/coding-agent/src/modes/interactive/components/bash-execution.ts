@@ -3,6 +3,7 @@
  */
 
 import { Container, Loader, Spacer, Text, type TUI } from "@earendil-works/pi-tui";
+import { APP_NAME } from "../../../config.ts";
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
@@ -54,6 +55,8 @@ export class BashExecutionComponent extends Container {
 			(spinner) => theme.fg(this.colorKey, spinner),
 			(text) => theme.fg("muted", text),
 			`Running... (${keyText("tui.select.cancel")} to cancel)`, // Plain text for loader
+			// Li pulses dots instead of the braille wheel.
+			APP_NAME === "li" ? { frames: [".", "..", "..."], intervalMs: 400 } : undefined,
 		);
 
 		// Bottom border

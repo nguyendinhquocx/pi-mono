@@ -65,6 +65,28 @@ describe("Markdown component", () => {
 		});
 	});
 
+	describe("Images", () => {
+		it("keeps image references visible instead of collapsing empty alt text", () => {
+			const markdown = new Markdown("xem thử ![](D:\\pcloud\\a.png) end", 0, 0, defaultMarkdownTheme);
+			const text = markdown
+				.render(100)
+				.map((line) => stripAnsi(line))
+				.join("\n");
+			assert.ok(text.includes("D:\\pcloud\\a.png"), `Missing image path in: ${text}`);
+			assert.ok(text.includes("xem thử"));
+		});
+
+		it("shows alt text alongside the image path", () => {
+			const markdown = new Markdown("![sơ đồ](img.png)", 0, 0, defaultMarkdownTheme);
+			const text = markdown
+				.render(100)
+				.map((line) => stripAnsi(line))
+				.join("\n");
+			assert.ok(text.includes("sơ đồ"), `Missing alt text in: ${text}`);
+			assert.ok(text.includes("img.png"), `Missing image path in: ${text}`);
+		});
+	});
+
 	describe("Lists", () => {
 		it("should render simple nested list", () => {
 			const markdown = new Markdown(

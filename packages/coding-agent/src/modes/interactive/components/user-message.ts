@@ -47,7 +47,11 @@ export class UserMessageComponent extends Container {
 				1,
 				this.markdownTheme,
 				{
-					color: (content: string) => theme.fg("userMessageText", content),
+					color: (content: string) => {
+						const base = theme.fg("userMessageText", content);
+						// Li's blank style marks sent prompts with bold italic so they stand out when scrolling back.
+						return isLiToolOutputBlank() ? theme.italic(theme.bold(base)) : base;
+					},
 					bgColor: (content: string) => (isLiToolOutputBlank() ? content : theme.bg("userMessageBg", content)),
 				},
 				{

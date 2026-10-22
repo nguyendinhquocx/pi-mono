@@ -61,24 +61,36 @@ describe("Li tool output style", () => {
 		);
 		const newline = String.fromCharCode(10);
 		const backgroundPrefix = `${String.fromCharCode(27)}[48`;
+		// fg/bg use precomputed theme ANSI, but bold/italic go through chalk and need an explicit level.
+		const originalColorLevel = chalk.level;
+		chalk.level = 3;
 
-		setLiToolOutputStyle("blank");
-		const blankCustom = customMessage.render(100).join(newline);
-		const blankUser = userMessage.render(100).join(newline);
-		const blankTool = toolOutput.render(100).join(newline);
-		expect(blankCustom).not.toContain(backgroundPrefix);
-		expect(blankUser).not.toContain(backgroundPrefix);
-		expect(blankTool).not.toContain(backgroundPrefix);
+		try {
+			setLiToolOutputStyle("blank");
+			const blankCustom = customMessage.render(100).join(newline);
+			const blankUser = userMessage.render(100).join(newline);
+			const blankTool = toolOutput.render(100).join(newline);
+			expect(blankCustom).not.toContain(backgroundPrefix);
+			expect(blankUser).not.toContain(backgroundPrefix);
+			expect(blankTool).not.toContain(backgroundPrefix);
+			// Sent prompts stand out with bold italic while blank.
+			expect(blankUser).toContain("\u001b[1m");
+			expect(blankUser).toContain("\u001b[3m");
 
-		setLiToolOutputStyle("current");
-		customMessage.invalidate();
-		userMessage.invalidate();
-		toolOutput.invalidate();
-		const currentCustom = customMessage.render(100).join(newline);
-		const currentUser = userMessage.render(100).join(newline);
-		const currentTool = toolOutput.render(100).join(newline);
-		expect(currentCustom).toContain(backgroundPrefix);
-		expect(currentUser).toContain(backgroundPrefix);
-		expect(currentTool).toContain(backgroundPrefix);
+			setLiToolOutputStyle("current");
+			customMessage.invalidate();
+			userMessage.invalidate();
+			toolOutput.invalidate();
+			const currentCustom = customMessage.render(100).join(newline);
+			const currentUser = userMessage.render(100).join(newline);
+			const currentTool = toolOutput.render(100).join(newline);
+			expect(currentCustom).toContain(backgroundPrefix);
+			expect(currentUser).toContain(backgroundPrefix);
+			expect(currentTool).toContain(backgroundPrefix);
+			// Current style matches Pi exactly: plain fg, no bold italic.
+			expect(currentUser).not.toContain("\u001b[3m");
+		} finally {
+			chalk.level = originalColorLevel;
+		}
 	});
 });
