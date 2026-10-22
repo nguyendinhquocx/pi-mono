@@ -29,6 +29,7 @@ export const SETTINGS_DEFAULTS = {
 	quietStartup: false,
 	li: {
 		toolOutputStyle: "blank",
+		language: "en",
 	},
 	defaultProjectTrust: "ask",
 	collapseChangelog: false,

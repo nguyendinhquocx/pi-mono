@@ -182,6 +182,7 @@ import { TrustSelectorComponent } from "./components/trust-selector.ts";
 import { UserMessageComponent } from "./components/user-message.ts";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.ts";
 import { editInExternalEditor } from "./external-editor.ts";
+import { applyLiLocale, liCopy } from "./locale.ts";
 import { refreshModelCatalogs } from "./model-catalog-refresh.ts";
 import { getModelSearchText } from "./model-search.ts";
 import { type BlockedStatus, ProgramStatusReporter } from "./program-status-reporter.ts";
@@ -609,6 +610,7 @@ export class InteractiveMode {
 	constructor(runtimeHost: AgentSessionRuntime, options: InteractiveModeOptions = {}) {
 		this.runtimeHost = runtimeHost;
 		setLiToolOutputStyle(this.settingsManager.getLiToolOutputStyle());
+		applyLiLocale(this.settingsManager.getLiLanguage());
 		setCapabilityOverrides(this.settingsManager.getTerminalCapabilityOverrides());
 		const tuiMode = options.tuiMode ?? this.settingsManager.getTuiMode();
 		this.options = { ...options, tuiMode };
@@ -728,7 +730,9 @@ export class InteractiveMode {
 		// Define commands for autocomplete
 		const slashCommands: SlashCommand[] = BUILTIN_SLASH_COMMANDS.map((command) => ({
 			name: command.name,
-			description: command.description,
+			// Li renders built-in descriptions through the locale catalog; liCopy()
+			// pins "en" under Pi so the wording there stays verbatim.
+			description: liCopy().slashCommands[command.name]?.description ?? command.description,
 			...(command.argumentHint && { argumentHint: command.argumentHint }),
 		}));
 
@@ -2004,7 +2008,7 @@ export class InteractiveMode {
 						const result = await this.runtimeHost.fork(entryId, options);
 						if (!result.cancelled) {
 							this.editor.setText(result.selectedText ?? "");
-							this.showStatus("Forked to new session");
+							this.showStatus(liCopy().status.forked);
 						}
 						return { cancelled: result.cancelled };
 					} catch (error: unknown) {
@@ -2027,7 +2031,7 @@ export class InteractiveMode {
 					if (result.editorText && !this.editor.getText().trim()) {
 						this.editor.setText(result.editorText);
 					}
-					this.showStatus("Navigated to selected point");
+					this.showStatus(liCopy().status.navigated);
 					void this.flushCompactionQueue({ willRetry: false });
 					return { cancelled: false };
 				},
@@ -3230,7 +3234,7 @@ export class InteractiveMode {
 
 	private handleStartupSubmit(text: string): void {
 		this.editor.setText(text);
-		this.showStatus("Startup is still in progress");
+		this.showStatus(liCopy().status.startupInProgress);
 	}
 
 	private setupEditorSubmitHandler(): void {
@@ -3739,7 +3743,7 @@ export class InteractiveMode {
 					if (event.reason === "manual") {
 						this.showError("Compaction cancelled");
 					} else {
-						this.showStatus("Auto-compaction cancelled");
+						this.showStatus(liCopy().status.autoCompactionCancelled);
 					}
 				} else if (event.result) {
 					const entries = this.sessionManager.buildContextEntries();
@@ -4266,8 +4270,7 @@ export class InteractiveMode {
 		const allEntries = this.sessionManager.getEntries();
 		const compactionCount = allEntries.filter((e) => e.type === "compaction").length;
 		if (compactionCount > 0) {
-			const times = compactionCount === 1 ? "1 time" : `${compactionCount} times`;
-			this.showStatus(`Session compacted ${times}`);
+			this.showStatus(liCopy().status.sessionCompacted(compactionCount));
 		}
 	}
 
@@ -4486,7 +4489,7 @@ export class InteractiveMode {
 
 	private handleCtrlZ(): void {
 		if (process.platform === "win32") {
-			this.showStatus("Suspend to background is not supported on Windows");
+			this.showStatus(liCopy().status.suspendNotSupported);
 			return;
 		}
 
@@ -4556,9 +4559,9 @@ export class InteractiveMode {
 	private handleDequeue(): void {
 		const restored = this.restoreQueuedMessagesToEditor();
 		if (restored === 0) {
-			this.showStatus("No queued messages to restore");
+			this.showStatus(liCopy().status.noQueuedMessages);
 		} else {
-			this.showStatus(`Restored ${restored} queued message${restored > 1 ? "s" : ""} to editor`);
+			this.showStatus(liCopy().status.restoredQueued(restored));
 		}
 	}
 
@@ -4576,11 +4579,11 @@ export class InteractiveMode {
 	private cycleThinkingLevel(): void {
 		const newLevel = this.session.cycleThinkingLevel();
 		if (newLevel === undefined) {
-			this.showStatus("Current model does not support thinking");
+			this.showStatus(liCopy().status.modelNoThinking);
 		} else {
 			this.footer.invalidate();
 			this.updateEditorBorderColor();
-			this.showStatus(`Thinking level: ${newLevel}`);
+			this.showStatus(liCopy().status.thinkingLevel(newLevel));
 		}
 	}
 
@@ -4588,14 +4591,19 @@ export class InteractiveMode {
 		try {
 			const result = await this.session.cycleModel(direction);
 			if (result === undefined) {
-				const msg = this.session.scopedModels.length > 0 ? "Only one model in scope" : "Only one model available";
+				const msg =
+					this.session.scopedModels.length > 0
+						? liCopy().status.onlyOneModelInScope
+						: liCopy().status.onlyOneModelAvailable;
 				this.showStatus(msg);
 			} else {
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
 				const thinkingStr =
-					result.model.reasoning && result.thinkingLevel !== "off" ? ` (thinking: ${result.thinkingLevel})` : "";
-				this.showStatus(`Switched to ${result.model.name || result.model.id}${thinkingStr}`);
+					result.model.reasoning && result.thinkingLevel !== "off"
+						? liCopy().status.thinkingSuffix(result.thinkingLevel)
+						: "";
+				this.showStatus(liCopy().status.switchedTo(result.model.name || result.model.id, thinkingStr));
 				void this.maybeWarnAboutAnthropicSubscriptionAuth(result.model);
 			}
 		} catch (error) {
@@ -4622,7 +4630,7 @@ export class InteractiveMode {
 				}
 			}
 		}
-		this.showStatus(`Tool output: ${expanded ? "expanded" : "collapsed"}`);
+		this.showStatus(liCopy().status.toolOutput(expanded));
 	}
 
 	/** Update rendered assistant messages without rebuilding live tool components. */
@@ -4639,7 +4647,7 @@ export class InteractiveMode {
 		this.hideThinkingBlock = !this.hideThinkingBlock;
 		this.settingsManager.setHideThinkingBlock(this.hideThinkingBlock);
 		this.updateThinkingBlockVisibility();
-		this.showStatus(`Thinking blocks: ${this.hideThinkingBlock ? "hidden" : "visible"}`);
+		this.showStatus(liCopy().status.thinkingBlocks(this.hideThinkingBlock));
 	}
 
 	private async handleOpenExternalEditor(): Promise<void> {
@@ -4814,7 +4822,7 @@ export class InteractiveMode {
 		this.editor.addToHistory?.(text);
 		this.editor.setText("");
 		this.updatePendingMessagesDisplay();
-		this.showStatus("Queued message for after compaction");
+		this.showStatus(liCopy().status.queuedAfterCompaction);
 	}
 
 	private isExtensionCommand(text: string): boolean {
@@ -4955,7 +4963,7 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	private showSettingsSelector(): void {
+	private showSettingsSelector(focusItemId?: string): void {
 		this.showSelector((done) => {
 			let selector: SettingsSelectorComponent | undefined;
 			const defaultProvider = this.settingsManager.getDefaultProvider();
@@ -4998,6 +5006,7 @@ export class InteractiveMode {
 					autocompleteMaxVisible: this.settingsManager.getAutocompleteMaxVisible(),
 					quietStartup: this.settingsManager.getQuietStartup(),
 					liToolOutputStyle: this.settingsManager.getLiToolOutputStyle(),
+					liLanguage: this.settingsManager.getLiLanguage(),
 					clearOnShrink: this.settingsManager.getClearOnShrink(),
 					showTerminalProgress: this.settingsManager.getShowTerminalProgress(),
 					tuiMode: this.ui.mode,
@@ -5054,11 +5063,11 @@ export class InteractiveMode {
 					onHttpIdleTimeoutMsChange: (timeoutMs) => {
 						this.settingsManager.setHttpIdleTimeoutMs(timeoutMs);
 						configureHttpDispatcher(timeoutMs);
-						this.showStatus(`HTTP idle timeout: ${formatHttpIdleTimeoutMs(timeoutMs)}`);
+						this.showStatus(liCopy().status.httpIdleTimeout(formatHttpIdleTimeoutMs(timeoutMs)));
 					},
 					onCacheWarmingModeChange: (mode) => {
 						this.session.setCacheWarmingMode(mode);
-						this.showStatus(`Cache warming: ${mode}`);
+						this.showStatus(liCopy().status.cacheWarming(mode));
 					},
 					onModelThinkingLevelChange: (provider, modelId, level) => {
 						this.settingsManager.setModelThinkingLevel(provider, modelId, level);
@@ -5114,6 +5123,15 @@ export class InteractiveMode {
 						setLiToolOutputStyle(style);
 						this.rebuildChatFromMessages();
 					},
+					onLiLanguageChange: (locale) => {
+						this.settingsManager.setLiLanguage(locale);
+						applyLiLocale(locale);
+						// The autocomplete provider snapshots command descriptions, so
+						// rebuild it as well as the settings view for an immediate switch.
+						this.setupAutocompleteProvider();
+						// Keep the cursor on the language row after rebuilding Settings.
+						this.showSettingsSelector("li-language");
+					},
 					onDefaultProjectTrustChange: (defaultProjectTrust) => {
 						this.settingsManager.setDefaultProjectTrust(defaultProjectTrust);
 					},
@@ -5166,12 +5184,12 @@ export class InteractiveMode {
 					onTuiModeChange: (mode) => {
 						if (!this.switchTuiMode(mode)) {
 							selector?.getSettingsList().updateValue("tui-mode", this.ui.mode);
-							this.showStatus("Close active overlays before changing TUI mode");
+							this.showStatus(liCopy().status.closeOverlaysFirst);
 							return;
 						}
 						this.settingsManager.setTuiMode(mode);
 						if (!this.activeStatusIndicator) this.statusContainer.clear();
-						this.showStatus(`TUI mode: ${mode}`);
+						this.showStatus(liCopy().status.tuiMode(mode));
 					},
 					onFullscreenExitOutputChange: (output) => {
 						this.settingsManager.setFullscreenExitOutput(output);
@@ -5196,7 +5214,13 @@ export class InteractiveMode {
 						this.ui.requestRender();
 					},
 				},
+				// liCopy() must be evaluated at construction so a locale change that
+				// rebuilds this selector (onLiLanguageChange) picks up the new language.
+				liCopy(),
 			);
+			if (focusItemId) {
+				selector.getSettingsList().selectItem(focusItemId);
+			}
 			return { component: selector, focus: selector.getSettingsList() };
 		});
 	}
@@ -5223,7 +5247,7 @@ export class InteractiveMode {
 			this.session.setThinkingLevel(level, { persist });
 			this.footer.invalidate();
 			this.updateEditorBorderColor();
-			this.showStatus(persist ? `Default thinking level: ${level}` : `Thinking level: ${level}`);
+			this.showStatus(persist ? liCopy().status.defaultThinkingLevel(level) : liCopy().status.thinkingLevel(level));
 		} catch (error) {
 			this.showError(error instanceof Error ? error.message : String(error));
 		}
@@ -5262,7 +5286,7 @@ export class InteractiveMode {
 				await this.session.setModel(model, { persist: false });
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
-				this.showStatus(`Model: ${model.id}`);
+				this.showStatus(liCopy().status.modelLabel(model.id));
 				void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
 			} catch (error) {
 				this.showError(error instanceof Error ? error.message : String(error));
@@ -5281,7 +5305,7 @@ export class InteractiveMode {
 		const cachedMatch = findExactModelReferenceMatch(searchTerm, cachedModels);
 		if (cachedMatch || this.session.scopedModels.length > 0) return cachedMatch;
 
-		this.showStatus("Refreshing model catalogs…");
+		this.showStatus(liCopy().status.refreshingModelCatalogs);
 		const controller = new AbortController();
 		let timedOut = false;
 		const timeout = setTimeout(() => {
@@ -5385,9 +5409,7 @@ export class InteractiveMode {
 				onSelect: (selection) => {
 					trustStore.setMany(selection.updates);
 					done();
-					this.showStatus(
-						`Saved trust decision: ${selection.trusted ? "trusted" : "untrusted"}. Restart ${APP_NAME} for this to take effect.`,
-					);
+					this.showStatus(liCopy().status.savedTrustDecision(selection.trusted, APP_NAME));
 				},
 				onCancel: () => {
 					done();
@@ -5407,7 +5429,11 @@ export class InteractiveMode {
 					this.footer.invalidate();
 					this.updateEditorBorderColor();
 					done();
-					this.showStatus(persist ? `Default model: ${model.provider}/${model.id}` : `Model: ${model.id}`);
+					this.showStatus(
+						persist
+							? liCopy().status.defaultModel(model.provider, model.id)
+							: liCopy().status.modelLabel(model.id),
+					);
 					void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
 				} catch (error) {
 					done();
@@ -5487,7 +5513,7 @@ export class InteractiveMode {
 				{
 					allModels: availableModels,
 					enabledModelIds: currentEnabledIds,
-					refreshStatus: "Refreshing model catalogs…",
+					refreshStatus: liCopy().status.refreshingModelCatalogs,
 				},
 				{
 					onChange: (enabledIds) => {
@@ -5501,7 +5527,7 @@ export class InteractiveMode {
 							enabledIds.every((id) => availableModelIds.has(id));
 						const newPatterns = enabledIds === null || allEnabled ? undefined : enabledIds;
 						this.settingsManager.setEnabledModels(newPatterns ? [...newPatterns] : undefined);
-						this.showStatus("Model selection saved to settings");
+						this.showStatus(liCopy().status.modelSelectionSaved);
 					},
 					onCancel: () => {
 						done();
@@ -5529,7 +5555,7 @@ export class InteractiveMode {
 							"warning",
 						);
 					} else {
-						selector.setRefreshStatus("Model catalogs refreshed.", "success");
+						selector.setRefreshStatus(liCopy().status.modelCatalogsRefreshed, "success");
 					}
 					this.ui.requestRender();
 				})
@@ -5560,7 +5586,7 @@ export class InteractiveMode {
 		const userMessages = this.session.getUserMessagesForForking();
 
 		if (userMessages.length === 0) {
-			this.showStatus("No messages to fork from");
+			this.showStatus(liCopy().status.noMessagesToFork);
 			return;
 		}
 
@@ -5579,7 +5605,7 @@ export class InteractiveMode {
 						}
 
 						this.editor.setText(result.selectedText ?? "");
-						this.showStatus("Forked to new session");
+						this.showStatus(liCopy().status.forked);
 					} catch (error: unknown) {
 						this.showError(error instanceof Error ? error.message : String(error));
 					}
@@ -5597,7 +5623,7 @@ export class InteractiveMode {
 	private async handleCloneCommand(): Promise<void> {
 		const leafId = this.sessionManager.getLeafId();
 		if (!leafId) {
-			this.showStatus("Nothing to clone yet");
+			this.showStatus(liCopy().status.nothingToClone);
 			return;
 		}
 
@@ -5609,7 +5635,7 @@ export class InteractiveMode {
 			}
 
 			this.editor.setText("");
-			this.showStatus("Cloned to new session");
+			this.showStatus(liCopy().status.cloned);
 		} catch (error: unknown) {
 			this.showError(error instanceof Error ? error.message : String(error));
 		}
@@ -5621,7 +5647,7 @@ export class InteractiveMode {
 		const initialFilterMode = this.settingsManager.getTreeFilterMode();
 
 		if (tree.length === 0) {
-			this.showStatus("No entries in session");
+			this.showStatus(liCopy().status.noEntriesInSession);
 			return;
 		}
 
@@ -5634,7 +5660,7 @@ export class InteractiveMode {
 					// Selecting the current leaf is a no-op (already there)
 					if (entryId === this.sessionManager.getLeafId()) {
 						done();
-						this.showStatus("Already at this point");
+						this.showStatus(liCopy().status.alreadyAtPoint);
 						return;
 					}
 
@@ -5711,12 +5737,12 @@ export class InteractiveMode {
 
 						if (result.aborted) {
 							// Summarization aborted - re-show tree selector with same selection
-							this.showStatus("Branch summarization cancelled");
+							this.showStatus(liCopy().status.branchSummaryCancelled);
 							this.showTreeSelector(entryId);
 							return;
 						}
 						if (result.cancelled) {
-							this.showStatus("Navigation cancelled");
+							this.showStatus(liCopy().status.navigationCancelled);
 							return;
 						}
 
@@ -5726,7 +5752,7 @@ export class InteractiveMode {
 						if (result.editorText && !this.editor.getText().trim()) {
 							this.editor.setText(result.editorText);
 						}
-						this.showStatus("Navigated to selected point");
+						this.showStatus(liCopy().status.navigated);
 						void this.flushCompactionQueue({ willRetry: false });
 					} catch (error) {
 						this.showError(error instanceof Error ? error.message : String(error));
@@ -5755,7 +5781,7 @@ export class InteractiveMode {
 				}
 				try {
 					await copyToClipboard(text);
-					this.showStatus("Copied selected message to clipboard");
+					this.showStatus(liCopy().status.copiedSelectedMessage);
 				} catch (error) {
 					this.showError(error instanceof Error ? error.message : String(error));
 				}
@@ -5826,7 +5852,7 @@ export class InteractiveMode {
 			if (error instanceof MissingSessionCwdError) {
 				const selectedCwd = await this.promptForMissingSessionCwd(error);
 				if (!selectedCwd) {
-					this.showStatus("Resume cancelled");
+					this.showStatus(liCopy().status.resumeCancelled);
 					return { cancelled: true };
 				}
 				const result = await this.runtimeHost.switchSession(sessionPath, {
@@ -5966,7 +5992,7 @@ export class InteractiveMode {
 		if (radiusLabel) options.push(radiusLabel);
 
 		if (options.length === 0) {
-			this.showStatus("No login methods available.");
+			this.showStatus(liCopy().status.noLoginMethods);
 			return;
 		}
 
@@ -6022,10 +6048,10 @@ export class InteractiveMode {
 		if (providerOptions.length === 0) {
 			const message =
 				authType === "oauth"
-					? "No account providers available."
+					? liCopy().status.noAccountProviders
 					: authType === "api_key"
-						? "No API key providers available."
-						: "No login providers available.";
+						? liCopy().status.noApiKeyProviders
+						: liCopy().status.noLoginProviders;
 			this.showStatus(message);
 			return;
 		}
@@ -6076,9 +6102,7 @@ export class InteractiveMode {
 			return;
 		}
 		if (providerOptions.length === 0) {
-			this.showStatus(
-				"No stored credentials to remove. /logout only removes credentials saved by /login; environment variables and models.json config are unchanged.",
-			);
+			this.showStatus(liCopy().status.noStoredCredentials);
 			return;
 		}
 
@@ -6101,8 +6125,8 @@ export class InteractiveMode {
 						await this.updateAvailableProviderCount();
 						const message =
 							providerOption.authType === "oauth"
-								? `Logged out of ${providerOption.name}`
-								: `Removed stored API key for ${providerOption.name}. Environment variables and models.json config are unchanged.`;
+								? liCopy().status.loggedOut(providerOption.name)
+								: liCopy().status.removedApiKey(providerOption.name);
 						this.showStatus(message);
 					} catch (error: unknown) {
 						const message = error instanceof Error ? error.message : String(error);
@@ -6129,6 +6153,9 @@ export class InteractiveMode {
 		previousModel: Model<any> | undefined,
 	): Promise<void> {
 		const actionLabel = authType === "oauth" ? `Logged in to ${providerName}` : `Saved API key for ${providerName}`;
+		// actionLabel stays EN for the error-path strings; only the status lines localize.
+		const statusActionLabel =
+			authType === "oauth" ? liCopy().status.loggedInTo(providerName) : liCopy().status.savedApiKeyFor(providerName);
 
 		const session = this.session;
 		// Dynamic catalogs may be empty until the first authenticated network refresh.
@@ -6175,10 +6202,10 @@ export class InteractiveMode {
 			this.footer.invalidate();
 			this.updateEditorBorderColor();
 			if (selectedModel) {
-				this.showStatus(`${actionLabel}. Selected ${selectedModel.id}. Credentials saved to ${getAuthPath()}`);
+				this.showStatus(liCopy().status.authSelectedModel(statusActionLabel, selectedModel.id, getAuthPath()));
 				void this.maybeWarnAboutAnthropicSubscriptionAuth(selectedModel);
 			} else {
-				this.showStatus(`${actionLabel}. Credentials saved to ${getAuthPath()}`);
+				this.showStatus(liCopy().status.authCredentialsSaved(statusActionLabel, getAuthPath()));
 				if (selectionError) {
 					this.showError(selectionError);
 				} else {
@@ -6187,7 +6214,7 @@ export class InteractiveMode {
 			}
 		};
 		if (deferSelection) {
-			this.showStatus(`${actionLabel}. Credentials saved to ${getAuthPath()}. Refreshing model catalog…`);
+			this.showStatus(liCopy().status.authCredentialsSavedRefreshing(statusActionLabel, getAuthPath()));
 		} else {
 			await finishAuthentication();
 		}
@@ -6561,11 +6588,7 @@ export class InteractiveMode {
 			if (modelsJsonError) {
 				this.showError(`models.json error: ${modelsJsonError}`);
 			}
-			this.showStatus(
-				savedImplicitProjectTrust
-					? "Reloaded keybindings, extensions, skills, prompts, themes, and context files; saved project trust"
-					: "Reloaded keybindings, extensions, skills, prompts, themes, and context files",
-			);
+			this.showStatus(liCopy().status.reloaded(savedImplicitProjectTrust));
 			dismissReloadBox(this.editor as Component);
 			reloadBoxDismissed = true;
 		} catch (error) {
@@ -6582,12 +6605,12 @@ export class InteractiveMode {
 		try {
 			if (outputPath?.endsWith(".jsonl")) {
 				const filePath = this.session.exportToJsonl(outputPath);
-				this.showStatus(`Session exported to: ${filePath}`);
+				this.showStatus(liCopy().status.sessionExported(filePath));
 			} else {
 				const filePath = await this.session.exportToHtml(outputPath, {
 					themeName: theme.name,
 				});
-				this.showStatus(`Session exported to: ${filePath}`);
+				this.showStatus(liCopy().status.sessionExported(filePath));
 			}
 		} catch (error: unknown) {
 			this.showError(`Failed to export session: ${error instanceof Error ? error.message : "Unknown error"}`);
@@ -6632,7 +6655,7 @@ export class InteractiveMode {
 
 		const confirmed = await this.showExtensionConfirm("Import session", `Replace current session with ${inputPath}?`);
 		if (!confirmed) {
-			this.showStatus("Import cancelled");
+			this.showStatus(liCopy().status.importCancelled);
 			return;
 		}
 
@@ -6640,23 +6663,23 @@ export class InteractiveMode {
 			this.clearStatusIndicator();
 			const result = await this.runtimeHost.importFromJsonl(inputPath);
 			if (result.cancelled) {
-				this.showStatus("Import cancelled");
+				this.showStatus(liCopy().status.importCancelled);
 				return;
 			}
-			this.showStatus(`Session imported from: ${inputPath}`);
+			this.showStatus(liCopy().status.sessionImported(inputPath));
 		} catch (error: unknown) {
 			if (error instanceof MissingSessionCwdError) {
 				const selectedCwd = await this.promptForMissingSessionCwd(error);
 				if (!selectedCwd) {
-					this.showStatus("Import cancelled");
+					this.showStatus(liCopy().status.importCancelled);
 					return;
 				}
 				const result = await this.runtimeHost.importFromJsonl(inputPath, selectedCwd);
 				if (result.cancelled) {
-					this.showStatus("Import cancelled");
+					this.showStatus(liCopy().status.importCancelled);
 					return;
 				}
-				this.showStatus(`Session imported from: ${inputPath}`);
+				this.showStatus(liCopy().status.sessionImported(inputPath));
 				return;
 			}
 			if (error instanceof SessionImportFileNotFoundError) {
@@ -6717,7 +6740,7 @@ export class InteractiveMode {
 			if (options.flashConfirmation && this.ui instanceof TuiAltScreen) {
 				this.ui.flash("Copied!");
 			} else {
-				this.showStatus("Copied last agent message to clipboard");
+				this.showStatus(liCopy().status.copiedLastMessage);
 			}
 		} catch (error) {
 			this.showError(error instanceof Error ? error.message : String(error));
@@ -6866,6 +6889,12 @@ export class InteractiveMode {
 	}
 
 	private handleHotkeysCommand(): void {
+		const copy = liCopy().hotkeys;
+		const newLineAction =
+			process.platform === "win32"
+				? `${copy.actions.newLine} (${copy.actions.windowsNewLineNote})`
+				: copy.actions.newLine;
+
 		// Navigation keybindings
 		const cursorUp = this.getEditorKeyDisplay("tui.editor.cursorUp");
 		const cursorDown = this.getEditorKeyDisplay("tui.editor.cursorDown");
@@ -6910,51 +6939,51 @@ export class InteractiveMode {
 		const pasteImage = this.getAppKeyDisplay("app.clipboard.pasteImage");
 
 		let hotkeys = `
-**Navigation**
-| Key | Action |
+**${copy.sections.navigation}**
+| ${copy.table.key} | ${copy.table.action} |
 |-----|--------|
-| \`${cursorUp}\` / \`${cursorDown}\` / \`${cursorLeft}\` / \`${cursorRight}\` | Move cursor / browse history |
-| \`${cursorWordLeft}\` / \`${cursorWordRight}\` | Move by word |
-| \`${cursorLineStart}\` | Start of line |
-| \`${cursorLineEnd}\` | End of line |
-| \`${jumpForward}\` | Jump forward to character |
-| \`${jumpBackward}\` | Jump backward to character |
-| \`${pageUp}\` / \`${pageDown}\` | Scroll by page |
+| \`${cursorUp}\` / \`${cursorDown}\` / \`${cursorLeft}\` / \`${cursorRight}\` | ${copy.actions.moveCursor} |
+| \`${cursorWordLeft}\` / \`${cursorWordRight}\` | ${copy.actions.moveByWord} |
+| \`${cursorLineStart}\` | ${copy.actions.startOfLine} |
+| \`${cursorLineEnd}\` | ${copy.actions.endOfLine} |
+| \`${jumpForward}\` | ${copy.actions.jumpForward} |
+| \`${jumpBackward}\` | ${copy.actions.jumpBackward} |
+| \`${pageUp}\` / \`${pageDown}\` | ${copy.actions.scrollByPage} |
 
-**Editing**
-| Key | Action |
+**${copy.sections.editing}**
+| ${copy.table.key} | ${copy.table.action} |
 |-----|--------|
-| \`${submit}\` | Send message |
-| \`${newLine}\` | New line${process.platform === "win32" ? " (Ctrl+Enter on Windows Terminal)" : ""} |
-| \`${deleteWordBackward}\` | Delete word backwards |
-| \`${deleteWordForward}\` | Delete word forwards |
-| \`${deleteToLineStart}\` | Delete to start of line |
-| \`${deleteToLineEnd}\` | Delete to end of line |
-| \`${yank}\` | Paste the most-recently-deleted text |
-| \`${yankPop}\` | Cycle through the deleted text after pasting |
-| \`${undo}\` | Undo |
+| \`${submit}\` | ${copy.actions.sendMessage} |
+| \`${newLine}\` | ${newLineAction} |
+| \`${deleteWordBackward}\` | ${copy.actions.deleteWordBackward} |
+| \`${deleteWordForward}\` | ${copy.actions.deleteWordForward} |
+| \`${deleteToLineStart}\` | ${copy.actions.deleteToLineStart} |
+| \`${deleteToLineEnd}\` | ${copy.actions.deleteToLineEnd} |
+| \`${yank}\` | ${copy.actions.pasteRecentDeleted} |
+| \`${yankPop}\` | ${copy.actions.cycleDeletedText} |
+| \`${undo}\` | ${copy.actions.undo} |
 
-**Other**
-| Key | Action |
+**${copy.sections.other}**
+| ${copy.table.key} | ${copy.table.action} |
 |-----|--------|
-| \`${tab}\` | Path completion / accept autocomplete |
-| \`${interrupt}\` | Cancel autocomplete / abort streaming |
-| \`${clear}\` | Clear editor (first) / exit (second) |
-| \`${exit}\` | Exit (when editor is empty) |
-| \`${suspend}\` | Suspend to background |
-| \`${cycleThinkingLevel}\` | Cycle thinking level |
-| \`${cycleModelForward}\` / \`${cycleModelBackward}\` | Cycle models |
-| \`${selectModel}\` | Open model selector |
-| \`${expandTools}\` | Toggle tool output expansion |
-| \`${toggleThinking}\` | Toggle thinking block visibility |
-| \`${externalEditor}\` | Edit message in external editor |
-| \`${copyMessage}\` | Copy selection or last assistant message |
-| \`${followUp}\` | Queue follow-up message |
-| \`${dequeue}\` | Restore queued messages |
-| \`${pasteImage}\` | Paste files on macOS, images, or text from clipboard |
-| \`/\` | Slash commands |
-| \`!\` | Run bash command |
-| \`!!\` | Run bash command (excluded from context) |
+| \`${tab}\` | ${copy.actions.pathCompletion} |
+| \`${interrupt}\` | ${copy.actions.cancelAutocomplete} |
+| \`${clear}\` | ${copy.actions.clearEditor} |
+| \`${exit}\` | ${copy.actions.exitWhenEmpty} |
+| \`${suspend}\` | ${copy.actions.suspend} |
+| \`${cycleThinkingLevel}\` | ${copy.actions.cycleThinking} |
+| \`${cycleModelForward}\` / \`${cycleModelBackward}\` | ${copy.actions.cycleModels} |
+| \`${selectModel}\` | ${copy.actions.openModelSelector} |
+| \`${expandTools}\` | ${copy.actions.expandToolOutput} |
+| \`${toggleThinking}\` | ${copy.actions.toggleThinking} |
+| \`${externalEditor}\` | ${copy.actions.externalEditor} |
+| \`${copyMessage}\` | ${copy.actions.copyMessage} |
+| \`${followUp}\` | ${copy.actions.queueFollowUp} |
+| \`${dequeue}\` | ${copy.actions.restoreQueued} |
+| \`${pasteImage}\` | ${copy.actions.pasteClipboard} |
+| \`/\` | ${copy.actions.slashCommands} |
+| \`!\` | ${copy.actions.runBash} |
+| \`!!\` | ${copy.actions.runBashWithoutContext} |
 `;
 
 		// Add extension-registered shortcuts
@@ -6962,8 +6991,8 @@ export class InteractiveMode {
 		const shortcuts = extensionRunner.getShortcuts(this.keybindings.getEffectiveConfig());
 		if (shortcuts.size > 0) {
 			hotkeys += `
-**Extensions**
-| Key | Action |
+**${copy.sections.extensions}**
+| ${copy.table.key} | ${copy.table.action} |
 |-----|--------|
 `;
 			for (const [key, shortcut] of shortcuts) {
@@ -6975,7 +7004,7 @@ export class InteractiveMode {
 
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new DynamicBorder());
-		this.chatContainer.addChild(new ThemedText(() => theme.bold(theme.fg("accent", "Keyboard Shortcuts")), 1, 0));
+		this.chatContainer.addChild(new ThemedText(() => theme.bold(theme.fg("accent", copy.title)), 1, 0));
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Markdown(hotkeys.trim(), 1, 1, this.getMarkdownThemeWithSettings()));
 		this.chatContainer.addChild(new DynamicBorder());

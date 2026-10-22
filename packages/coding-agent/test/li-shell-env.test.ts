@@ -7,6 +7,7 @@ const ENV_KEYS = [
 	"LI_ROOT",
 	"LI_CODING_AGENT_DIR",
 	"LI_CODING_AGENT_SESSION_DIR",
+	"LI_UI_LANGUAGE",
 	"PI_PACKAGE_DIR",
 	"PI_CORE_CLI_PATH",
 	"PI_OSC_GUARD_DIST",
@@ -35,6 +36,7 @@ describe("Li shell environment isolation", () => {
 		process.env.LI_ROOT = "D:\\work\\pi-mono-li";
 		process.env.LI_CODING_AGENT_DIR = "D:\\shared\\agent";
 		process.env.LI_CODING_AGENT_SESSION_DIR = "D:\\shared\\sessions";
+		process.env.LI_UI_LANGUAGE = "vi";
 		process.env.PI_PACKAGE_DIR = "D:\\work\\pi-mono-li\\packages\\coding-agent";
 		process.env.PI_CORE_CLI_PATH = "D:\\work\\pi-mono-li\\packages\\coding-agent\\dist\\bundle\\cli.js";
 		process.env.PI_OSC_GUARD_DIST = "D:\\work\\pi-mono-li\\packages\\coding-agent\\dist";
@@ -48,6 +50,7 @@ describe("Li shell environment isolation", () => {
 		expect(shellEnv.LI_ROOT).toBeUndefined();
 		expect(shellEnv.LI_CODING_AGENT_DIR).toBeUndefined();
 		expect(shellEnv.LI_CODING_AGENT_SESSION_DIR).toBeUndefined();
+		expect(shellEnv.LI_UI_LANGUAGE).toBeUndefined();
 		expect(shellEnv.PI_PACKAGE_DIR).toBeUndefined();
 		expect(shellEnv.PI_CORE_CLI_PATH).toBeUndefined();
 		expect(shellEnv.PI_OSC_GUARD_DIST).toBeUndefined();

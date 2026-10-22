@@ -20,6 +20,7 @@ Li đã build.
 | Li TUI mặc định | quiet, borderless; mọi trạng thái chạy (working/compaction/retry/bash/modal) pulse `.` `..` `...`; input theo sát transcript, tới đáy khi regular scrollback lấp viewport |
 | Li selection + prompt | `/resume` và `/tree` chọn bằng `→` + chữ đậm, không nền; prompt user nhập hiển thị bold italic trong `blank` style |
 | Li transcript style | `/settings` → `Li transcript style`; `li.toolOutputStyle`: `blank` mặc định (bỏ background user/tool/custom/diff, giữ foreground/bold), `current` khôi phục nền; Pi bỏ qua key này |
+| Ngôn ngữ giao diện | `/settings` → `Interface language`; `li.language`: `en` mặc định, `vi` chuyển static UI copy của Li sang tiếng Việt; có hiệu lực ngay, không cần restart; Pi bỏ qua key này. Catalog EN/VI nằm ở `packages/coding-agent/src/modes/interactive/locale.ts`; fallback English khi key thiếu/sai. Locale được bắc cầu qua env `LI_UI_LANGUAGE` cho hai extension first-party `pi-ask` và `pi-terminal-relay` (chỉ đọc khi `LI_RUNTIME=1`); ngoài Li hai extension giữ nguyên copy cũ. Biến `LI_*` (gồm `LI_UI_LANGUAGE`) bị `shell.ts` loại khỏi môi trường lệnh ngoài |
 
 ## Rebuild Li sau khi đổi source
 

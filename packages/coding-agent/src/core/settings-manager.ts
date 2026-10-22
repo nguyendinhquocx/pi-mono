@@ -15,6 +15,7 @@ import type {
 	CompactionModelOverride,
 	DefaultProjectTrust,
 	FullscreenExitOutput,
+	LiLocale,
 	LiToolOutputStyle,
 	MermaidRenderingMode,
 	PackageSource,
@@ -37,6 +38,7 @@ export type {
 	DefaultProjectTrust,
 	FullscreenExitOutput,
 	ImageSettings,
+	LiLocale,
 	LiSettings,
 	LiToolOutputStyle,
 	MarkdownSettings,
@@ -1013,6 +1015,16 @@ export class SettingsManager {
 
 	setLiToolOutputStyle(style: LiToolOutputStyle): void {
 		this.globalSettings.li = { ...(this.globalSettings.li ?? {}), toolOutputStyle: style };
+		this.markModified("li");
+		this.save();
+	}
+
+	getLiLanguage(): LiLocale {
+		return this.globalSettings.li?.language === "vi" ? "vi" : SETTINGS_DEFAULTS.li.language;
+	}
+
+	setLiLanguage(language: LiLocale): void {
+		this.globalSettings.li = { ...(this.globalSettings.li ?? {}), language };
 		this.markModified("li");
 		this.save();
 	}

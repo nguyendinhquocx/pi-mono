@@ -153,6 +153,13 @@ const LiSettingsSchema = Type.Object({
 			default: SETTINGS_DEFAULTS.li.toolOutputStyle,
 		}),
 	),
+	language: Type.Optional(
+		Type.Union([Type.Literal("en"), Type.Literal("vi")], {
+			description:
+				'Li-only UI language. "en" keeps the default English interface; "vi" switches Li static UI copy to Vietnamese. Pi ignores this key.',
+			default: SETTINGS_DEFAULTS.li.language,
+		}),
+	),
 });
 
 function codemodeMode(options?: TSchemaOptions) {
@@ -478,6 +485,7 @@ export type MermaidRenderingMode = NonNullable<Static<typeof MarkdownSettingsSch
 export interface MarkdownSettings extends Static<typeof MarkdownSettingsSchema> {}
 export interface WarningSettings extends Static<typeof WarningSettingsSchema> {}
 export type LiToolOutputStyle = NonNullable<Static<typeof LiSettingsSchema>["toolOutputStyle"]>;
+export type LiLocale = NonNullable<Static<typeof LiSettingsSchema>["language"]>;
 export interface LiSettings extends Static<typeof LiSettingsSchema> {}
 export type CodemodeMode = Static<typeof CodemodeModeSchema>;
 export interface CodemodeSettings extends Static<typeof CodemodeSettingsSchema> {}

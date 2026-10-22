@@ -765,4 +765,30 @@ describe("SettingsManager", () => {
 			expect(manager.getShellPath()).toBe(homedir());
 		});
 	});
+
+	describe("li language", () => {
+		it("defaults to en when the key is missing", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ theme: "dark" }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getLiLanguage()).toBe("en");
+		});
+
+		it("persists vi without disturbing sibling li keys", async () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ li: { toolOutputStyle: "current" } }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setLiLanguage("vi");
+			await manager.flush();
+
+			const saved = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8"));
+			expect(saved.li.language).toBe("vi");
+			expect(saved.li.toolOutputStyle).toBe("current");
+			expect(manager.getLiLanguage()).toBe("vi");
+		});
+
+		it("falls back to en for invalid stored values", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ li: { language: "fr" } }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getLiLanguage()).toBe("en");
+		});
+	});
 });

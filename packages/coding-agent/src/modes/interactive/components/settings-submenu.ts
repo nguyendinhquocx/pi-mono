@@ -17,11 +17,20 @@ const SUBMENU_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
 	maxPrimaryColumnWidth: 32,
 };
 
+export interface SelectSubmenuCopy {
+	/** Footer hint while searchable. Default: "  Type to filter · Enter to select · Esc to go back". */
+	searchHint?: string;
+	/** Footer hint without search. Default: "  Enter to select · Esc to go back". */
+	hint?: string;
+}
+
 export interface SelectSubmenuOptions {
 	/** Enable type-to-search fuzzy filtering. */
 	searchable?: boolean;
 	/** Override the select list layout (column widths). */
 	layout?: SelectListLayoutOptions;
+	/** Optional localized footer hints; callers that omit them keep the default English strings. */
+	copy?: SelectSubmenuCopy;
 }
 
 /**
@@ -85,9 +94,10 @@ export class SelectSubmenu extends Container {
 
 		// Hint
 		this.addChild(new Spacer(1));
+		const submenuCopy = submenuOptions?.copy;
 		const hint = submenuOptions?.searchable
-			? "  Type to filter \u00b7 Enter to select \u00b7 Esc to go back"
-			: "  Enter to select \u00b7 Esc to go back";
+			? (submenuCopy?.searchHint ?? "  Type to filter \u00b7 Enter to select \u00b7 Esc to go back")
+			: (submenuCopy?.hint ?? "  Enter to select \u00b7 Esc to go back");
 		this.addChild(new Text(theme.fg("dim", hint), 0, 0));
 	}
 
@@ -166,6 +176,11 @@ interface SteppedSubmenuOptions {
 	initialContext?: Record<string, string>;
 	/** After completing the last step, loop back to step 0 instead of closing. */
 	loop?: boolean;
+	/** Optional localized copy for the step prefix and submenu footer hints. */
+	copy?: {
+		stepPrefix?: (index: number, total: number) => string;
+		submenu?: SelectSubmenuCopy;
+	};
 }
 
 /**
@@ -201,7 +216,8 @@ export class SteppedSubmenu extends Container {
 	private buildStep(stepIndex: number): Component {
 		const step = this.steps[stepIndex];
 		const total = this.steps.length;
-		const stepLabel = total > 1 ? `Step ${stepIndex + 1}/${total} \u00b7 ` : "";
+		const stepLabel =
+			total > 1 ? (this.opts.copy?.stepPrefix ?? ((i, t) => `Step ${i + 1}/${t} \u00b7 `))(stepIndex, total) : "";
 
 		const title = typeof step.title === "function" ? step.title(this.context) : step.title;
 		const desc = typeof step.description === "function" ? step.description(this.context) : step.description;
@@ -240,7 +256,9 @@ export class SteppedSubmenu extends Container {
 				}
 			},
 			undefined,
-			step.searchable || step.layout ? { searchable: step.searchable, layout: step.layout } : undefined,
+			step.searchable || step.layout || this.opts.copy?.submenu
+				? { searchable: step.searchable, layout: step.layout, copy: this.opts.copy?.submenu }
+				: undefined,
 		);
 	}
 
