@@ -134,6 +134,8 @@ function createBundle(root, { sourceCommit, packageVersion }) {
 	setMode(join(runtimeRoot, "bin", "li"), "755");
 	writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: packageVersion }), "utf8");
 	writeFileSync(join(distRoot, "bundle", "cli.js"), "// isolated smoke fixture\n", "utf8");
+	// Prefix-colliding pair (cli.js / cli.js.map) so a path-sort vs full-string-sort mismatch fails the tree check.
+	writeFileSync(join(distRoot, "bundle", "cli.js.map"), "{\"version\":3,\"fixture\":true}\n", "utf8");
 	writeFileSync(
 		join(distRoot, "li-build-receipt.json"),
 		`${JSON.stringify(

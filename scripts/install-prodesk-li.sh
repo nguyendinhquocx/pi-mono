@@ -245,12 +245,12 @@ function walk(directory) {
     if (!info.isFile()) throw new Error("non-regular runtime entry refused");
     const relativePath = path.relative(root, fullPath).split(path.sep).join("/");
     const digest = crypto.createHash("sha256").update(fs.readFileSync(fullPath)).digest("hex");
-    files.push(`${relativePath}:${digest}`);
+    files.push({ path: relativePath, digest });
   }
 }
 walk(root);
-files.sort();
-const actualHash = crypto.createHash("sha256").update(files.join("\n")).digest("hex");
+files.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
+const actualHash = crypto.createHash("sha256").update(files.map((file) => `${file.path}:${file.digest}`).join("\n")).digest("hex");
 if (files.length !== expectedCount || actualHash !== expectedHash) process.exit(1);
 ' "$STAGED_LI_ROOT" "$RUNTIME_TREE_SHA" "$RUNTIME_FILE_COUNT"
 }
@@ -456,8 +456,8 @@ STAGED_RECEIPT="$STAGED_LI_ROOT/packages/coding-agent/dist/li-build-receipt.json
 [ "$(read_json_string baseVersion "$STAGED_RECEIPT")" = "$PACKAGE_VERSION" ] || { echo "$PROG_NAME: Li build receipt version mismatch." >&2; exit 1; }
 [ "$(read_json_string profileSnapshotId "$STAGED_RECEIPT")" = "$PROFILE_SNAPSHOT_ID" ] || { echo "$PROG_NAME: Li build receipt snapshot ID mismatch." >&2; exit 1; }
 
-verify_runtime_tree
 chmod 0700 "$STAGED_LI_ROOT/bin/li"
+verify_runtime_tree || { echo "$PROG_NAME: staged Li runtime tree hash mismatch; Li current is unchanged." >&2; exit 1; }
 mv "$STAGING/node" "$STAGED_LI_ROOT/node"
 STAGED_NODE_BIN="$STAGED_LI_ROOT/node/bin/node"
 [ -x "$STAGED_NODE_BIN" ] || { echo "$PROG_NAME: Li release Node executable is missing." >&2; exit 1; }
