@@ -135,7 +135,7 @@ flowchart TD
   - Dùng fixed laptop→ProDesk transfer + ProDesk Pi lane; không generic SSH/raw shell, không build source trên ProDesk.
   - ProDesk chạy `verification/scripts/install-prodesk-li.test.mjs` trên Node Linux với temp HOME: fixture install/rollback pass, Pi production/profile không bị đụng.
   - Trước apply, ProDesk verify source commit + archive hash; staged Li version/help pass với profile tạm.
-  - Snapshot `.pi` được tạo local-only ngay trước final build dưới `~/.local/state/prodesk-li/profile-snapshots/<snapshot-id>/`; directory `0700`, `profile.tar.gz` + `snapshot.json` `0600`. Receipt ghi ID, source `.pi`, file count và archive SHA-256; ID phải khớp build receipt và snapshot còn hợp lệ ngay trước first Li interactive.
+  - Snapshot `.pi` được tạo local-only ngay trước final build dưới `~/.local/state/prodesk-li/profile-snapshots/<snapshot-id>/`; dùng rsync checksum vào staging, file/link count khớp và dry-run cuối không còn delta rồi mới tar staging. Directory `0700`, `profile.tar.gz` + `snapshot.json` `0600`. Receipt ghi ID, source `.pi`, count và archive SHA-256; ID phải khớp build receipt và snapshot còn hợp lệ ngay trước first Li interactive.
   - Chỉ sau snapshot PASS mới cho phép user mở Li interactive với profile chung; chỉ báo PASS/file count/size/hash-match status, không in file names hoặc hashes nhạy cảm.
   - `pi --version` vẫn `0.84.2`; Pi `current` symlink không đổi; Li current trỏ đúng release mới; rollback Li không ảnh hưởng Pi.
 - Reproduce: `py -3.13 ..\python\quoc.py --toolkit-search "fixed ProDesk file transfer"` rồi theo đúng capability/lane đã được project policy duyệt; remote verification dùng `prodesk_pi`/fixed ProDesk tooling.
