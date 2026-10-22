@@ -246,6 +246,21 @@ export function packageProdeskLi({ outputDir = outputRoot } = {}) {
 		const archiveFilename = `li-runtime-linux-x64-${sourceCommit.slice(0, 10)}.tar.gz`;
 		const temporaryArchivePath = join(temporaryRoot, archiveFilename);
 		run("tar", ["-czf", archiveFilename, "li-runtime"], temporaryRoot);
+		// Round-trip guard: the archive must reproduce the exact tree the lock describes,
+		// otherwise the installer's tree verification would fail on ProDesk after transfer.
+		{
+			const roundTripRoot = join(temporaryRoot, "roundtrip");
+			mkdirSync(roundTripRoot);
+			run("tar", ["-xzf", archiveFilename], { cwd: roundTripRoot });
+			const roundTripManifest = createTreeManifest(join(roundTripRoot, "li-runtime"));
+			if (
+				roundTripManifest.fileCount !== treeManifest.fileCount ||
+				roundTripManifest.treeSha256 !== treeManifest.treeSha256
+			) {
+				fail(`Runtime archive round-trip mismatch: expected ${treeManifest.treeSha256} (${treeManifest.fileCount} files), got ${roundTripManifest.treeSha256} (${roundTripManifest.fileCount} files)`);
+			}
+			rmSync(roundTripRoot, { recursive: true, force: true });
+		}
 		const archiveSha256 = hashFile(temporaryArchivePath);
 		mkdirSync(output, { recursive: true });
 		outputCreated = true;
