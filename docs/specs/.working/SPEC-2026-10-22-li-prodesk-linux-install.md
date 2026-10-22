@@ -110,7 +110,7 @@ flowchart TD
   - Packer fail nếu source dirty, external import thiếu, archive/hash mismatch hoặc output ghi đè artifact có sẵn.
 - Reproduce: đặt `LI_PROFILE_SNAPSHOT_ID` bằng ID trong ProDesk snapshot receipt, rồi chạy `node scripts/build-li.mjs --offline && node scripts/package-prodesk-li.mjs --output packages/coding-agent/dist/prodesk-li-release`.
 - Verify: packer tự verify manifest/archive; `node --test scripts/package-prodesk-li.test.mjs`; `npm run check` pass.
-- Status: Unit tests PASS (2); Windows symlink case SKIP. Clean-source integration package build and Node/SHA receipt are pending a clean commit + ProDesk snapshot ID.
+- Status: PASS. Bundle v3 build từ clean commit `b0d59811f` với `LI_PROFILE_SNAPSHOT_ID=prodesk-li-pre-first-run-20261022-eb14ef88a-rsync`; packer tests PASS, `npm run check` PASS, round-trip lock↔archive xác nhận tay PASS; round-trip check đã được thêm vào packer (HEAD `0618a6c67`, packer-only, không đổi runtime tree).
 - Files:
   - `scripts/package-prodesk-li.mjs` — pattern: `scripts/build-li.mjs` và `scripts/build-coding-agent-bundle.mjs`.
   - `scripts/package-prodesk-li.test.mjs` — pattern: `scripts/*.test.mjs`.
@@ -124,7 +124,7 @@ flowchart TD
   - Giữ release rollback; lỗi trước promote không đổi Li `current`.
 - Reproduce: `node --test scripts/install-prodesk-li.test.mjs`
 - Verify: fixture test staging/rollback/conflict; `npm run check`; trên ProDesk chạy readiness trước apply, rồi kiểm checksum/version/current sau apply.
-- Status: Local fixture tests PASS (2); Linux owner-mode/symlink integration SKIP on Windows and must run on ProDesk in isolated temp HOME before live install.
+- Status: PASS. Fixture install/rollback/conflict 4/4 trên ProDesk Linux temp HOME sau hai fix: fixture receipt phải pretty-print, và installer tree-hash phải sort theo path (không phải full-string `path:digest`).
 - Files:
   - `scripts/install-prodesk-li.sh` — pattern: `../python/app_presets/home_server/pi-agent/install-prodesk-pi.sh`; không copy các Pi-specific constant/root.
   - `scripts/install-prodesk-li.test.mjs` — test POSIX installer bằng fixture/temp home.
@@ -140,6 +140,7 @@ flowchart TD
   - `pi --version` vẫn `0.84.2`; Pi `current` symlink không đổi; Li current trỏ đúng release mới; rollback Li không ảnh hưởng Pi.
 - Reproduce: `py -3.13 ..\python\quoc.py --toolkit-search "fixed ProDesk file transfer"` rồi theo đúng capability/lane đã được project policy duyệt; remote verification dùng `prodesk_pi`/fixed ProDesk tooling.
 - Verify: ProDesk fixture test PASS; receipt có `source_commit`, bundle SHA, Li version, Pi version/current unchanged, staged smoke PASS, snapshot PASS, rollback pointer test PASS.
+- Status: PASS (install + verify). Snapshot rsync PASS: `~/.local/state/prodesk-li/profile-snapshots/prodesk-li-pre-first-run-20261022-eb14ef88a-rsync/` (dir 0700, archive+receipt 0600, 5754 files, hash match). Bundle v3 transfer qua scp key-only `prodesk-home`, hash khớp lock. Fixture PASS → readiness PASS → install PASS: Li `1.3.0 (source b0d59811fe)`, `~/.local/prodesk-li/current` → release b0d59811fe, `~/.local/bin/li` tạo mới, Pi `0.84.2` + Pi current unchanged, snapshot hash vẫn match sau install. Còn lại: user mở Li interactive (User Test) rồi mới archive spec.
 - Files:
   - `docs/li-maintenance.md` — runtime path/rollback contract.
   - ProDesk release receipt nằm ngoài repo, không chứa credential/hash nội dung profile.
