@@ -251,7 +251,7 @@ export function packageProdeskLi({ outputDir = outputRoot } = {}) {
 		{
 			const roundTripRoot = join(temporaryRoot, "roundtrip");
 			mkdirSync(roundTripRoot);
-			run("tar", ["-xzf", archiveFilename], { cwd: roundTripRoot });
+			run("tar", ["-xzf", archiveFilename], roundTripRoot);
 			const roundTripManifest = createTreeManifest(join(roundTripRoot, "li-runtime"));
 			if (
 				roundTripManifest.fileCount !== treeManifest.fileCount ||
