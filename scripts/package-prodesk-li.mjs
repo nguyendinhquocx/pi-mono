@@ -244,11 +244,13 @@ export function packageProdeskLi({ outputDir = outputRoot } = {}) {
 		}
 		const verificationManifest = createTreeManifest(verificationRoot);
 		const archiveFilename = `li-runtime-linux-x64-${sourceCommit.slice(0, 10)}.tar.gz`;
+		const temporaryArchivePath = join(temporaryRoot, archiveFilename);
+		run("tar", ["-czf", archiveFilename, "li-runtime"], temporaryRoot);
+		const archiveSha256 = hashFile(temporaryArchivePath);
 		mkdirSync(output, { recursive: true });
 		outputCreated = true;
 		const archivePath = join(output, archiveFilename);
-		run("tar", ["-czf", archivePath, "-C", temporaryRoot, "li-runtime"], repoRoot);
-		const archiveSha256 = hashFile(archivePath);
+		copyFileSync(temporaryArchivePath, archivePath);
 		cpSync(verificationRoot, join(output, "verification"), { recursive: true, dereference: false, errorOnExist: true, force: false });
 		copyFileSync(node.path, join(output, node.filename));
 		if (hashFile(join(output, node.filename)) !== node.sha256) fail("Copied Node artifact failed SHA-256 verification");

@@ -432,7 +432,9 @@ if ! tar -xJf "$NODE_ARCHIVE" -C "$STAGING/node" --strip-components=1 2>/dev/nul
 	exit 1
 fi
 STAGED_NODE_BIN="$STAGING/node/bin/node"
-[ -x "$STAGED_NODE_BIN" ] || { echo "$PROG_NAME: staged Node executable is missing." >&2; exit 1; }
+[ -f "$STAGED_NODE_BIN" ] && [ ! -L "$STAGED_NODE_BIN" ] || { echo "$PROG_NAME: staged Node executable is missing or symlinked." >&2; exit 1; }
+chmod 0700 "$STAGED_NODE_BIN"
+[ -x "$STAGED_NODE_BIN" ] || { echo "$PROG_NAME: staged Node executable is not executable." >&2; exit 1; }
 STAGED_NODE_VERSION=$("$STAGED_NODE_BIN" --version 2>/dev/null || true)
 [ "$STAGED_NODE_VERSION" = "v$NODE_VERSION" ] || { echo "$PROG_NAME: staged Node version mismatch; Li current is unchanged." >&2; exit 1; }
 
@@ -441,7 +443,7 @@ if ! tar -xzf "$RUNTIME_ARCHIVE" -C "$STAGING" 2>/dev/null; then
 	exit 1
 fi
 STAGED_LI_ROOT="$STAGING/li-runtime"
-[ -x "$STAGED_LI_ROOT/bin/li" ] && [ -f "$STAGED_LI_ROOT/packages/coding-agent/package.json" ] &&
+[ -f "$STAGED_LI_ROOT/bin/li" ] && [ ! -L "$STAGED_LI_ROOT/bin/li" ] && [ -f "$STAGED_LI_ROOT/packages/coding-agent/package.json" ] &&
 	[ -f "$STAGED_LI_ROOT/packages/coding-agent/dist/bundle/cli.js" ] &&
 	[ -f "$STAGED_LI_ROOT/packages/coding-agent/dist/li-build-receipt.json" ] &&
 	[ -d "$STAGED_LI_ROOT/packages/coding-agent/node_modules/jiti" ] &&
@@ -455,6 +457,7 @@ STAGED_RECEIPT="$STAGED_LI_ROOT/packages/coding-agent/dist/li-build-receipt.json
 [ "$(read_json_string profileSnapshotId "$STAGED_RECEIPT")" = "$PROFILE_SNAPSHOT_ID" ] || { echo "$PROG_NAME: Li build receipt snapshot ID mismatch." >&2; exit 1; }
 
 verify_runtime_tree
+chmod 0700 "$STAGED_LI_ROOT/bin/li"
 mv "$STAGING/node" "$STAGED_LI_ROOT/node"
 STAGED_NODE_BIN="$STAGED_LI_ROOT/node/bin/node"
 [ -x "$STAGED_NODE_BIN" ] || { echo "$PROG_NAME: Li release Node executable is missing." >&2; exit 1; }

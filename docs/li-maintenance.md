@@ -75,19 +75,26 @@ set -eu
 snapshot_id='prodesk-li-pre-<UTC timestamp>'
 snapshot_root="$HOME/.local/state/prodesk-li/profile-snapshots"
 snapshot_dir="$snapshot_root/$snapshot_id"
+staging_dir="$snapshot_root/.staging-${snapshot_id}-$$"
 test -d "$HOME/.pi"
+test ! -L "$HOME/.pi"
 test ! -e "$snapshot_dir"
+test ! -e "$staging_dir"
+for path in "$HOME/.local" "$HOME/.local/state" "$HOME/.local/state/prodesk-li" "$snapshot_root"; do
+  test ! -L "$path"
+done
 umask 077
-mkdir -p "$snapshot_dir"
-chmod 0700 "$HOME/.local/state/prodesk-li" "$snapshot_root" "$snapshot_dir"
+mkdir -p "$snapshot_root"
+chmod 0700 "$HOME/.local/state/prodesk-li" "$snapshot_root"
+mkdir -m 0700 "$staging_dir"
 file_count=$(find "$HOME/.pi" -type f -printf . | wc -c)
-tar -czf "$snapshot_dir/profile.tar.gz" -C "$HOME" .pi
-tar -tzf "$snapshot_dir/profile.tar.gz" >/dev/null
+tar -czf "$staging_dir/profile.tar.gz" -C "$HOME" .pi
+tar -tzf "$staging_dir/profile.tar.gz" >/dev/null
 file_count_after=$(find "$HOME/.pi" -type f -printf . | wc -c)
 test "$file_count" = "$file_count_after"
-snapshot_sha=$(sha256sum "$snapshot_dir/profile.tar.gz" | awk '{print $1}')
-snapshot_size=$(stat -c '%s' "$snapshot_dir/profile.tar.gz")
-python3 - "$snapshot_dir/snapshot.json" "$snapshot_id" "$file_count" "$snapshot_sha" "$snapshot_size" <<'PY'
+snapshot_sha=$(sha256sum "$staging_dir/profile.tar.gz" | awk '{print $1}')
+snapshot_size=$(stat -c '%s' "$staging_dir/profile.tar.gz")
+python3 - "$staging_dir/snapshot.json" "$snapshot_id" "$file_count" "$snapshot_sha" "$snapshot_size" <<'PY'
 import json, sys
 from datetime import datetime, timezone
 path, snapshot_id, file_count, digest, size = sys.argv[1:]
@@ -95,7 +102,8 @@ with open(path, 'w', encoding='utf-8') as f:
     json.dump({'snapshot_id': snapshot_id, 'source_path': '.pi', 'file_count': file_count, 'archive_sha256': digest, 'archive_size_bytes': size, 'created_at': datetime.now(timezone.utc).isoformat()}, f, indent=2)
     f.write('\n')
 PY
-chmod 0600 "$snapshot_dir/profile.tar.gz" "$snapshot_dir/snapshot.json"
+chmod 0600 "$staging_dir/profile.tar.gz" "$staging_dir/snapshot.json"
+mv "$staging_dir" "$snapshot_dir"
 ```
 
 Snapshot directory `0700`; receipt ghi `snapshot_id`, `source_path: .pi`, file count, archive size và SHA-256. Chỉ báo PASS/file count/size/hash-match status; không in file names, archive hash hay nội dung profile ra chat/log. Đặt đúng ID vào `LI_PROFILE_SNAPSHOT_ID` khi build để receipt Li trỏ tới backup thật.

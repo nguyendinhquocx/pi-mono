@@ -250,6 +250,13 @@ test("installs Li side-by-side and rollback never changes Pi", (t) => {
 	assert.match(firstInstall.stdout, /install PASS/);
 	const firstCurrent = currentTarget(join(home, ".local", "prodesk-li", "current"));
 	assert.match(firstCurrent, /^releases\//);
+	const userLiCommand = join(home, ".local", "bin", "li");
+	assert.equal(currentTarget(userLiCommand), join(home, ".local", "prodesk-li", "bin", "li"));
+	const userLiVersion = runBashCommand(`${quoteShell(userLiCommand)} --version`, {
+		env: { ...process.env, HOME: toShellPath(home), PI_TEST_SYSTEM_NODE: toShellPath(process.execPath) },
+	});
+	assert.equal(userLiVersion.status, 0, userLiVersion.stderr);
+	assert.match(userLiVersion.stdout, /li 1\.3\.0 \(source a{10}\)/);
 	assert.equal(currentTarget(pi.piCurrent), "releases/pi0.84.2");
 	assert.equal(runBashCommand(`${quoteShell(pi.piWrapper)} --version`).stdout.trim(), "0.84.2");
 
