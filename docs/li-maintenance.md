@@ -12,8 +12,10 @@ Li đã build.
 |---|---|
 | Worktree Li (branch `li/stable`) | `D:\pcloud\workspace\code\pi-mono-li` |
 | Nhánh source Li | `li/stable` (local; không push nếu user chưa duyệt) |
-| Wrapper command | `bin/li.cmd` trong worktree |
-| User PATH entry | `D:\pcloud\workspace\code\pi-mono-li\bin` — không copy `li.cmd` ra chỗ khác vì `LI_ROOT` được tính từ thư mục wrapper |
+| Source launcher | `bin/li.cmd` (Windows) và `bin/li` (POSIX/Linux); `LI_ROOT` tính từ thư mục launcher |
+| Windows PATH entry | `D:\pcloud\workspace\code\pi-mono-li\bin` — không copy `li.cmd` ra chỗ khác |
+| ProDesk user-local install | `~/.local/prodesk-li/{releases,current,bin}`; stable `bin/li` trỏ theo Li `current` |
+| ProDesk user command | `~/.local/prodesk-li/bin/li`; `~/.local/bin/li` là symlink tùy chọn, không tự sửa shell profile |
 | Li CLI entry | `packages/coding-agent/dist/bundle/cli.js` (generated) |
 | Build receipt | `packages/coding-agent/dist/li-build-receipt.json` (generated) |
 | Profile dùng chung | `~/.pi/agent` (`configDir` giữ `.pi`; Pi và Li chia sẻ, gồm cả `tuiMode`) |
@@ -59,6 +61,69 @@ Thay ID bằng tên snapshot thực tế. Source bẩn (uncommitted) → build v
 vars trước khi chạy lệnh ngoài; gọi `li` từ shell sẽ thiết lập lại chúng qua wrapper. Runtime guard
 không nên vá Li lúc `session_start`; nếu nó vẫn báo `neutralized TERMINAL_COLOR_QUERY`, build
 receipt/patch receipt không khớp bundle đang chạy. Pi global dist vẫn được runtime guard xử lý riêng.
+
+## Cài Li side-by-side trên ProDesk Linux
+
+Pi ProDesk chạy release riêng tại `~/.local/prodesk-pi`; **không** dùng `pi_core_manager.py` hay `install-prodesk-pi.sh` để cài Li vì hai tool đó pin `pi` path/version. Li có root riêng `~/.local/prodesk-li`; `pi`, `~/.local/prodesk-pi/current`, services và `.pi` profile không bị thay thế.
+
+Release là bundle Linux x64 có Node 22.19.0 hash-pin từ `python/app_presets/home_server/pi-agent/artifacts/artifact-lock.json`, Li dist/assets và external runtime modules cần thiết (`jiti`, `@silvia-odwyer/photon-node`). Packer refuse source dirty, output ghi đè, hash mismatch hoặc thiếu build receipt.
+
+Trước build candidate, Pi ProDesk tạo snapshot private của toàn bộ `~/.pi` tại `~/.local/state/prodesk-li/profile-snapshots/<snapshot-id>/`:
+
+```
+set -eu
+snapshot_id='prodesk-li-pre-<UTC timestamp>'
+snapshot_root="$HOME/.local/state/prodesk-li/profile-snapshots"
+snapshot_dir="$snapshot_root/$snapshot_id"
+test -d "$HOME/.pi"
+test ! -e "$snapshot_dir"
+umask 077
+mkdir -p "$snapshot_dir"
+chmod 0700 "$HOME/.local/state/prodesk-li" "$snapshot_root" "$snapshot_dir"
+file_count=$(find "$HOME/.pi" -type f -printf . | wc -c)
+tar -czf "$snapshot_dir/profile.tar.gz" -C "$HOME" .pi
+tar -tzf "$snapshot_dir/profile.tar.gz" >/dev/null
+file_count_after=$(find "$HOME/.pi" -type f -printf . | wc -c)
+test "$file_count" = "$file_count_after"
+snapshot_sha=$(sha256sum "$snapshot_dir/profile.tar.gz" | awk '{print $1}')
+snapshot_size=$(stat -c '%s' "$snapshot_dir/profile.tar.gz")
+python3 - "$snapshot_dir/snapshot.json" "$snapshot_id" "$file_count" "$snapshot_sha" "$snapshot_size" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+path, snapshot_id, file_count, digest, size = sys.argv[1:]
+with open(path, 'w', encoding='utf-8') as f:
+    json.dump({'snapshot_id': snapshot_id, 'source_path': '.pi', 'file_count': file_count, 'archive_sha256': digest, 'archive_size_bytes': size, 'created_at': datetime.now(timezone.utc).isoformat()}, f, indent=2)
+    f.write('\n')
+PY
+chmod 0600 "$snapshot_dir/profile.tar.gz" "$snapshot_dir/snapshot.json"
+```
+
+Snapshot directory `0700`; receipt ghi `snapshot_id`, `source_path: .pi`, file count, archive size và SHA-256. Chỉ báo PASS/file count/size/hash-match status; không in file names, archive hash hay nội dung profile ra chat/log. Đặt đúng ID vào `LI_PROFILE_SNAPSHOT_ID` khi build để receipt Li trỏ tới backup thật.
+
+Laptop, từ repo Li sạch:
+
+```
+$env:LI_PROFILE_SNAPSHOT_ID = "<snapshot-id>"
+node scripts/build-li.mjs --offline
+node scripts/package-prodesk-li.mjs --output packages/coding-agent/dist/prodesk-li-release
+```
+
+Transfer cả output directory `prodesk-li-release` qua fixed laptop→ProDesk lane; nó chứa artifact lock, hai archive, installer và isolated verification fixture. Chạy `node --test verification/scripts/install-prodesk-li.test.mjs` trên ProDesk để test install/rollback trong temp HOME (không chạm production Pi/profile), rồi readiness và install user-local:
+
+```
+node --test <staged-bundle>/verification/scripts/install-prodesk-li.test.mjs
+bash <staged-bundle>/install-prodesk-li.sh --bundle-dir <staged-bundle> --check-readiness --yes
+bash <staged-bundle>/install-prodesk-li.sh --bundle-dir <staged-bundle> --yes
+~/.local/prodesk-li/bin/li --version
+```
+
+Installer verify snapshot receipt + SHA, Node/runtime archive, source commit, external imports và staged `--version`/`--help` với HOME tạm trước khi đổi Li `current` atomic. Nếu `~/.local/bin/li` chưa có, nó tạo symlink; PATH login không được chỉnh tự động, nên absolute path luôn là đường gọi chắc chắn. Rollback chỉ đổi Li pointer:
+
+```
+bash install-prodesk-li.sh --rollback --yes
+```
+
+Li vẫn dùng shared `~/.pi/agent`; chỉ mở interactive sau khi snapshot PASS. Không chạy Pi và Li đồng thời trên cùng session file.
 
 ## Quy trình xét update upstream (compare → candidate → promote)
 

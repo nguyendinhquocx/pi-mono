@@ -1,0 +1,92 @@
+#!/bin/sh
+# li - POSIX launcher for a Li source checkout or user-local Linux release.
+# The installed Pi runtime remains separate; Li keeps its intended shared profile.
+set -eu
+
+SCRIPT_PATH=$0
+while [ -L "$SCRIPT_PATH" ]; do
+	SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
+	LINK_TARGET=$(readlink -- "$SCRIPT_PATH")
+	case "$LINK_TARGET" in
+		/*) SCRIPT_PATH=$LINK_TARGET ;;
+		*) SCRIPT_PATH=$SCRIPT_DIR/$LINK_TARGET ;;
+	esac
+done
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
+LI_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+PI_PACKAGE_DIR=$LI_ROOT/packages/coding-agent
+PI_CORE_CLI_PATH=$PI_PACKAGE_DIR/dist/bundle/cli.js
+PI_OSC_GUARD_DIST=$PI_PACKAGE_DIR/dist
+BUILD_RECEIPT=$PI_PACKAGE_DIR/dist/li-build-receipt.json
+
+normalize_profile_path() {
+	profile_path=$1
+	case "$profile_path" in
+		/*) ;;
+		*) profile_path=$PWD/$profile_path ;;
+	esac
+	if [ -d "$profile_path" ]; then
+		CDPATH= cd -- "$profile_path" && pwd -P
+	else
+		printf '%s\n' "${profile_path%/}"
+	fi
+}
+
+check_profile_pair() {
+	li_value=$1
+	pi_value=$2
+	if [ -n "$li_value" ] && [ -n "$pi_value" ] &&
+		[ "$(normalize_profile_path "$li_value")" != "$(normalize_profile_path "$pi_value")" ]; then
+		printf '[li] %s and %s point to different profiles; refusing to start Li.\n' "$3" "$4" >&2
+		printf '  %s=%s\n  %s=%s\n' "$3" "$li_value" "$4" "$pi_value" >&2
+		printf '[li] Unset one variable or make both paths match.\n' >&2
+		exit 1
+	fi
+}
+
+check_profile_pair "${LI_CODING_AGENT_DIR:-}" "${PI_CODING_AGENT_DIR:-}" \
+	"LI_CODING_AGENT_DIR" "PI_CODING_AGENT_DIR"
+check_profile_pair "${LI_CODING_AGENT_SESSION_DIR:-}" "${PI_CODING_AGENT_SESSION_DIR:-}" \
+	"LI_CODING_AGENT_SESSION_DIR" "PI_CODING_AGENT_SESSION_DIR"
+
+if [ -z "${LI_CODING_AGENT_DIR:-}" ] && [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
+	LI_CODING_AGENT_DIR=$PI_CODING_AGENT_DIR
+	export LI_CODING_AGENT_DIR
+fi
+if [ -z "${LI_CODING_AGENT_SESSION_DIR:-}" ] && [ -n "${PI_CODING_AGENT_SESSION_DIR:-}" ]; then
+	LI_CODING_AGENT_SESSION_DIR=$PI_CODING_AGENT_SESSION_DIR
+	export LI_CODING_AGENT_SESSION_DIR
+fi
+
+export LI_ROOT
+export LI_RUNTIME=1
+export PI_PACKAGE_DIR
+export PI_CORE_CLI_PATH
+export PI_OSC_GUARD_DIST
+export PI_SKIP_VERSION_CHECK=1
+
+NODE_BIN=$LI_ROOT/node/bin/node
+if [ ! -x "$NODE_BIN" ]; then
+	NODE_BIN=$(command -v node 2>/dev/null || true)
+fi
+if [ -z "$NODE_BIN" ]; then
+	printf '[li] Node.js >=22.19 was not found. Install the pinned Li release or Node.js.\n' >&2
+	exit 1
+fi
+
+if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-v" ]; then
+	if [ ! -r "$BUILD_RECEIPT" ]; then
+		printf '[li] Li build receipt is missing or unreadable: %s\n' "$BUILD_RECEIPT" >&2
+		printf '[li] Build Li first: node scripts/build-li.mjs --offline\n' >&2
+		exit 1
+	fi
+	exec "$NODE_BIN" -e 'const fs = require("node:fs"); let receipt; try { receipt = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch (error) { console.error("[li] Li build receipt is unreadable: " + error.message); process.exit(1); } console.log("li " + (receipt.baseVersion || "?") + " (source " + (receipt.gitShortSha || "?") + ")");' "$BUILD_RECEIPT"
+fi
+
+if [ ! -f "$PI_CORE_CLI_PATH" ]; then
+	printf '[li] Li CLI build not found: %s\n' "$PI_CORE_CLI_PATH" >&2
+	printf '[li] Build Li first: node scripts/build-li.mjs --offline\n' >&2
+	exit 1
+fi
+
+exec "$NODE_BIN" "$PI_CORE_CLI_PATH" "$@"
