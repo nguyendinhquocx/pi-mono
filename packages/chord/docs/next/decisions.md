@@ -2063,7 +2063,7 @@ validation and copies the v2 kernel added around Delta.
   and TUI, decided point by point; the slice 10 components are its inside. Inputs from the owner: user management is
   part of it ("user management will also need to be a thing we support"), and app shapes without workers (server and
   clients only: "a chat app doesn't need workers").
-- **Plugins import each other by name (owner, 2026-10-31: "i like it"; changes 7c's cross-plugin rule):**
+- **Plugins import each other by name (owner, 2026-10-31: "i like it"; changes 7c's cross-plugin rule; **superseded** by "Contracts come from where the plugin's code came from", 2026-11-01):**
   `import { Notes } from "@app/notes/contract"` resolves to the discovered plugin named `@app/notes`, its file
   `contract.ts`, wherever its directory is (any root), copied into the importer's script as before (contracts and
   side-effect-free files only; they may import only host packages and files of their own plugin); a missing plugin is
@@ -2127,6 +2127,32 @@ validation and copies the v2 kernel added around Delta.
   cfworker 2,167, omptype 1,522), Chord checks at 0.95-1.3x TypeBox's compiled speed and the same with `new Function`
   blocked, 7.9 MB for 3,200 distinct schemas (cfworker 7.6, TypeBox 54.7), 8.5 KB gzip. Still open: switching Chord v2
   and pi-ai to it (`Type` out of pi-ai's main export), formats on by default in pi-ai.
+- **The schema switch (owner, 2026-10-31):** TypeBox leaves Chord (v1 too: "remove typebox wherever we can"),
+  pi-ai, pi-agent-core and pi-durable; extensions must not break ("absolutely 100%"), proven by a guard over our own
+  extensions, built-in tools and generated arguments (verdicts, coerced arguments, provider payloads and inferred
+  parameter types identical; owner: "just use ours", no npm corpus). **Coercion lives in pi-schema** as an opt-in,
+  the superset of TypeBox's `Value.Convert` rules and pi-ai's own (TypeBox's rule first where they conflict):
+  `compile(schema, { coerce: true })` adds `coerce(value)` (a copy, never mutating) and `parse(value)` (`{ ok, value }
+  | { ok, errors }`); pi-ai uses it for every tool, whatever built the schema (so plain-JSON MCP tools gain the
+  TypeBox rules). **Error texts are pi-schema's own** (no mapping to TypeBox's wording). Extensions keep `Type`,
+  `Static`, `TSchema` from the coding agent's bundled TypeBox (the pi-ai they see is compat plus those); an extension
+  author type-checking against the published pi-ai no longer finds them there (accepted: "fine"). **`format` is an
+  annotation in Chord** ("no format check": no format module in Chord's or Durable's entries; pi-ai still checks
+  formats on tool arguments). **Chord's envelope check costs +10 to +100 ns per message** from untrusted links
+  (pi-schema reads fields by name from a list; no eval): accepted ("negligible"), no hand-written check.
+- **Contracts come from where the plugin's code came from (owner, 2026-11-01: "ok"; plugin model point 1, primer
+  `docs/next/plugin-primer/`; supersedes "Plugins import each other by name"):** a plugin carries the contract it was
+  written against, never the running app's newest file. The problem: by name, a third-party plugin's next build copied
+  the provider's newest `contract.ts` (version 2), so its version-1 code claimed version 2, `accepts` was never used
+  and it computed wrong results silently. Rule: (A) plugins that change together, the app's own in its repository or a
+  user's in one root, import each other by relative path (`../notes/contract.ts`), copied into the importer's script
+  and listed in `copied`; a copied file may import only host packages and files of its own plugin; a relative path
+  leaving its root (into base code or another root) is a build error pointing to the API or an npm dependency. (B)
+  Plugins that do not change together take contracts as an npm dependency at a fixed version, bundled at the installed
+  version (decision "A plugin's npm dependencies are bundled"); the provider serves it through `accepts` or the
+  consumer waits "contract mismatch". Which package carries the app's contracts is point 5. The by-name lookup and the
+  `tsconfig` path aliases go; built in the plugin slice (examples 35-38, fixtures, design §21, the plugins README, the
+  guide's chapter "Plugins Using Plugins").
 - **A plugin's npm dependencies are bundled; external only by opt-in (owner, 2026-10-29: "explicit opt in + (a)"):**
   a plugin's `dependencies` are installed into its own `node_modules` (`npm install --ignore-scripts`) and bundled into
   each facet that imports them (host packages, its `peerDependencies`, stay external and are passed in). On Node a
