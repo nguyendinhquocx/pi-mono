@@ -3,6 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+    # The release commit is pushed together with the next commit, so a push to main never builds it; the tag run does,
+    # and preview-packages.yml releases its packages on pkg.earendil.com.
+    tags: ['v*.*.*']
   pull_request:
     branches: [main]
 
