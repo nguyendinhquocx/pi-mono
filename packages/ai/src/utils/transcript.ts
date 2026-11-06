@@ -1,4 +1,12 @@
-import type { Context, Message, SystemMessage, Tool, ToolReference, TranscriptContext } from "../types.ts";
+import type {
+	Context,
+	Message,
+	SystemMessage,
+	Tool,
+	ToolReference,
+	ToolSelectionSnapshot,
+	TranscriptContext,
+} from "../types.ts";
 import { contentText, getSystemMessageText } from "./text.ts";
 
 export type { TranscriptContext } from "../types.ts";
@@ -63,6 +71,39 @@ export function getCurrentTools(messages: TranscriptMessages): Tool[] {
 		for (const tool of message.toolsAdded ?? []) tools.set(tool.name, tool);
 	}
 	return [...tools.values()];
+}
+
+/** Latest tool-selection snapshot recorded on any system message, or undefined when none was recorded. */
+export function getLatestToolSelectionSnapshot(messages: TranscriptMessages): ToolSelectionSnapshot | undefined {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (!isSystemMessage(message)) continue;
+		if (message.toolSelectionSnapshot) return message.toolSelectionSnapshot;
+	}
+	return undefined;
+}
+
+/**
+ * Whether any system message carries a non-empty tool addition or removal. Empty array fields
+ * are ignored: older writers could omit them, so they are not evidence of tool history.
+ */
+export function hasToolStateDeltas(messages: TranscriptMessages): boolean {
+	for (const message of messages) {
+		if (!isSystemMessage(message)) continue;
+		if ((message.toolsAdded?.length ?? 0) > 0 || (message.toolsRemoved?.length ?? 0) > 0) return true;
+	}
+	return false;
+}
+
+/** Every tool name any transcript delta mentions, whether it was added or removed. */
+export function getTranscriptKnownToolNames(messages: TranscriptMessages): Set<string> {
+	const names = new Set<string>();
+	for (const message of messages) {
+		if (!isSystemMessage(message)) continue;
+		for (const tool of message.toolsAdded ?? []) names.add(tool.name);
+		for (const tool of message.toolsRemoved ?? []) names.add(tool.name);
+	}
+	return names;
 }
 
 /**

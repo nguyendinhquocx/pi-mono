@@ -1,10 +1,21 @@
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getModel } from "@earendil-works/pi-ai/compat";
+import {
+	fauxAssistantMessage,
+	getCurrentTools,
+	getModel,
+	registerFauxProvider,
+	type SystemMessage,
+	type ToolSelectionSnapshot,
+	type TranscriptContext,
+} from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createAgentSessionFromServices, createAgentSessionServices } from "../src/core/agent-session-services.ts";
+import { AuthStorage } from "../src/core/auth-storage.ts";
+import type { ExtensionUIContext } from "../src/core/extensions/types.ts";
+import { ModelRuntime } from "../src/core/model-runtime.ts";
 import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
 import { type CreateAgentSessionOptions, createAgentSession, type InlineExtension } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
@@ -343,10 +354,19 @@ describe("defaultTools setting", () => {
 			).session;
 		}
 
-		it("restores the loadout the transcript records", async () => {
-			// active_tool was deactivated during the session, inactive_tool activated.
+		it("restores the loadout the transcript records and adds new default tools", async () => {
+			// active_tool was deactivated during the session, inactive_tool activated. Default
+			// candidates the transcript never mentions (bash, edit, write, active_tool) migrate in.
 			const session = await resume(createRecordedSession(["read", "grep", "inactive_tool"]));
-			expect(session.getActiveToolNames().sort()).toEqual(["grep", "inactive_tool", "read"]);
+			expect(session.getActiveToolNames().sort()).toEqual([
+				"active_tool",
+				"bash",
+				"edit",
+				"grep",
+				"inactive_tool",
+				"read",
+				"write",
+			]);
 			session.dispose();
 		});
 
@@ -354,7 +374,7 @@ describe("defaultTools setting", () => {
 			const session = await resume(createRecordedSession(["read", "grep", "inactive_tool"]), {
 				excludeTools: ["inactive_tool"],
 			});
-			expect(session.getActiveToolNames().sort()).toEqual(["grep", "read"]);
+			expect(session.getActiveToolNames().sort()).toEqual(["active_tool", "bash", "edit", "grep", "read", "write"]);
 			session.dispose();
 		});
 
@@ -370,11 +390,18 @@ describe("defaultTools setting", () => {
 			builtinless.dispose();
 		});
 
-		it("applies +name and -name tool options to the recorded loadout", async () => {
+		it("applies +name and -name tool options to the migrated loadout", async () => {
 			const session = await resume(createRecordedSession(["read", "grep", "inactive_tool"]), {
 				tools: ["-grep", "+write"],
 			});
-			expect(session.getActiveToolNames().sort()).toEqual(["inactive_tool", "read", "write"]);
+			expect(session.getActiveToolNames().sort()).toEqual([
+				"active_tool",
+				"bash",
+				"edit",
+				"inactive_tool",
+				"read",
+				"write",
+			]);
 			session.dispose();
 		});
 
@@ -404,5 +431,577 @@ describe("defaultTools setting", () => {
 		).toEqual(["bash", "edit", "find", "grep", "ls", "powershell", "read", "write"]);
 		expect(session.getActiveToolNames()).toEqual(["ls"]);
 		session.dispose();
+	});
+});
+
+describe("tool selection snapshot resume", () => {
+	let tempDir: string;
+	let agentDir: string;
+
+	beforeEach(() => {
+		tempDir = join(tmpdir(), `pi-tool-snapshot-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		agentDir = join(tempDir, "agent");
+		mkdirSync(agentDir, { recursive: true });
+	});
+
+	afterEach(() => {
+		if (tempDir && existsSync(tempDir)) {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	function declaredTool(name: string) {
+		return { name, description: `${name} tool`, parameters: Type.Object({}) };
+	}
+
+	/** System message recorded on the transcript, read back from the session branch. */
+	function systemMessages(sessionManager: SessionManager): SystemMessage[] {
+		const messages: SystemMessage[] = [];
+		for (const entry of sessionManager.getBranch()) {
+			if (entry.type !== "message") continue;
+			const message = entry.message;
+			if (message.role === "system") messages.push(message);
+		}
+		return messages;
+	}
+
+	function recordedSnapshots(sessionManager: SessionManager): ToolSelectionSnapshot[] {
+		return systemMessages(sessionManager)
+			.map((message) => message.toolSelectionSnapshot)
+			.filter((snapshot): snapshot is ToolSelectionSnapshot => snapshot !== undefined);
+	}
+
+	function notices(sessionManager: SessionManager): Array<{ kind?: string; tools?: string[] }> {
+		return sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "custom" && entry.customType === "tool_selection_notice")
+			.map((entry) => {
+				const data = (entry as { data?: { kind?: string; tools?: string[] } }).data;
+				return { kind: data?.kind, tools: data?.tools };
+			});
+	}
+
+	const extensionToolExtension: InlineExtension = (pi) => {
+		pi.registerTool({
+			name: "active_tool",
+			label: "Active Tool",
+			description: "Extension tool registered active",
+			parameters: Type.Object({}),
+			execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+		});
+	};
+
+	interface PromptableOptions extends ToolOptions {
+		extensionFactories?: InlineExtension[];
+	}
+
+	/**
+	 * Resume (or start) a session whose provider is the faux provider, capturing every provider
+	 * context so tests can assert request-level tool declarations.
+	 */
+	async function createPromptableSession(sessionManager: SessionManager, options: PromptableOptions = {}) {
+		const faux = registerFauxProvider();
+		const capturedContexts: TranscriptContext[] = [];
+		faux.setResponses(
+			Array.from({ length: 8 }, () => (context: TranscriptContext) => {
+				capturedContexts.push(context);
+				return fauxAssistantMessage("ok");
+			}),
+		);
+		const authStorage = AuthStorage.inMemory();
+		await authStorage.modify(faux.getModel().provider, async () => ({ type: "api_key", key: "faux-key" }));
+		const modelRuntime = await ModelRuntime.create({
+			credentials: authStorage,
+			modelsPath: null,
+			allowModelNetwork: false,
+		});
+		const model = faux.getModel();
+		modelRuntime.registerProvider(model.provider, {
+			baseUrl: model.baseUrl,
+			api: model.api,
+			models: [
+				{
+					id: model.id,
+					name: model.name,
+					api: model.api,
+					reasoning: model.reasoning,
+					input: model.input,
+					cost: model.cost,
+					contextWindow: model.contextWindow,
+					maxTokens: model.maxTokens,
+					baseUrl: model.baseUrl,
+				},
+			],
+		});
+		const settingsManager = SettingsManager.inMemory();
+		const resourceLoader = new DefaultResourceLoader({
+			cwd: tempDir,
+			agentDir,
+			settingsManager,
+			extensionFactories: options.extensionFactories ?? [],
+		});
+		await resourceLoader.reload();
+		const { extensionFactories: _factories, ...toolOptions } = options;
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir,
+			model,
+			modelRuntime,
+			settingsManager,
+			sessionManager,
+			resourceLoader,
+			...toolOptions,
+		});
+		return { session, faux, capturedContexts };
+	}
+
+	it("records an explicit empty snapshot on a real first request and keeps it empty on reopen", async () => {
+		const sessionManager = SessionManager.inMemory(tempDir);
+		const { session, faux, capturedContexts } = await createPromptableSession(sessionManager, { noTools: "all" });
+		await session.prompt("hi");
+		expect(session.getActiveToolNames()).toEqual([]);
+		// The empty selection is recorded before the provider request.
+		expect(recordedSnapshots(sessionManager)).toEqual([{ version: 1, source: "explicit", selectedNames: [] }]);
+		// Snapshot metadata never reaches the provider payload.
+		expect(JSON.stringify(capturedContexts[0])).not.toContain("toolSelectionSnapshot");
+		session.dispose();
+
+		// Reopen without flags: the empty snapshot keeps the toolset empty.
+		const reopened = await createPromptableSession(sessionManager);
+		expect(reopened.session.getActiveToolNames()).toEqual([]);
+		await reopened.session.prompt("again");
+		// Idempotent: the reopen records no second snapshot event.
+		expect(recordedSnapshots(sessionManager)).toEqual([{ version: 1, source: "explicit", selectedNames: [] }]);
+		expect(getCurrentTools(reopened.capturedContexts[0].messages)).toEqual([]);
+		expect(JSON.stringify(reopened.capturedContexts[0])).not.toContain("toolSelectionSnapshot");
+		reopened.session.dispose();
+		faux.unregister();
+		reopened.faux.unregister();
+	});
+
+	it("restores unknown legacy state to current defaults with a notice", async () => {
+		const sessionManager = SessionManager.inMemory(tempDir);
+		// A legacy `noTools: all` session wrote a prompt but no tool event.
+		sessionManager.appendMessage({ role: "system", content: "legacy prompt", timestamp: 1 });
+		sessionManager.appendMessage({ role: "user", content: "hi", timestamp: 2 });
+		const { session, faux } = await createPromptableSession(sessionManager, {
+			extensionFactories: [extensionToolExtension],
+		});
+		expect(session.getActiveToolNames().sort()).toEqual(["active_tool", "bash", "edit", "read", "write"]);
+		expect(notices(sessionManager)).toEqual([
+			{ kind: "legacy_unknown", tools: ["read", "bash", "edit", "write", "active_tool"] },
+		]);
+		await session.prompt("hi");
+		expect(recordedSnapshots(sessionManager)).toEqual([
+			{ version: 1, source: "default", selectedNames: ["read", "bash", "edit", "write", "active_tool"] },
+		]);
+		session.dispose();
+		faux.unregister();
+	});
+
+	it("notifies the owner about an unknown legacy loadout before the first request", async () => {
+		const sessionManager = SessionManager.inMemory(tempDir);
+		sessionManager.appendMessage({ role: "system", content: "legacy prompt", timestamp: 1 });
+		const { session, faux } = await createPromptableSession(sessionManager);
+		const notifications: Array<{ message: string; type: string | undefined }> = [];
+		const uiContext = {
+			notify: (message: string, type?: string) => notifications.push({ message, type }),
+		} as unknown as ExtensionUIContext;
+		await session.bindExtensions({ uiContext });
+		expect(notifications).toEqual([
+			{
+				message: "Legacy tool selection is unknown: read, bash, edit, write",
+				type: "warning",
+			},
+		]);
+		await session.prompt("hi");
+		expect(faux.state.callCount).toBe(1);
+		session.dispose();
+		faux.unregister();
+	});
+
+	it("distinguishes migrated new defaults from unknown legacy selection", async () => {
+		const sessionManager = SessionManager.inMemory(tempDir);
+		sessionManager.appendMessage({
+			role: "system",
+			content: "",
+			toolsAdded: [declaredTool("read")],
+			timestamp: 1,
+		});
+		sessionManager.appendMessage({ role: "user", content: "hi", timestamp: 2 });
+		const { session, faux } = await createPromptableSession(sessionManager, {
+			extensionFactories: [extensionToolExtension],
+		});
+		expect(session.getActiveToolNames().sort()).toEqual(["active_tool", "bash", "edit", "read", "write"]);
+		expect(notices(sessionManager)).toEqual([
+			{ kind: "migration_added", tools: ["bash", "edit", "write", "active_tool"] },
+		]);
+		session.dispose();
+		faux.unregister();
+	});
+
+	it("keeps a legacy add-then-remove replay empty and still applies +name modifiers", async () => {
+		const buildTranscript = () => {
+			const sessionManager = SessionManager.inMemory(tempDir);
+			sessionManager.appendMessage({
+				role: "system",
+				content: "",
+				toolsAdded: [declaredTool("x_tool")],
+				timestamp: 1,
+			});
+			sessionManager.appendMessage({
+				role: "system",
+				content: "",
+				toolsRemoved: [{ name: "x_tool" }],
+				timestamp: 2,
+			});
+			sessionManager.appendMessage({ role: "user", content: "hi", timestamp: 3 });
+			return sessionManager;
+		};
+		const newToolExtension: InlineExtension = (pi) => {
+			pi.registerTool({
+				name: "new_tool",
+				label: "New Tool",
+				description: "Newly added default-active tool",
+				parameters: Type.Object({}),
+				execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+			});
+		};
+
+		const emptyManager = buildTranscript();
+		const empty = await createPromptableSession(emptyManager, {
+			extensionFactories: [newToolExtension],
+		});
+		// The recorded empty state stays empty: the new default tool is not merged in.
+		expect(empty.session.getActiveToolNames()).toEqual([]);
+		expect(notices(emptyManager)).toEqual([]);
+		empty.session.dispose();
+		empty.faux.unregister();
+
+		const modifiedManager = buildTranscript();
+		const modified = await createPromptableSession(modifiedManager, {
+			tools: ["+new_tool"],
+			extensionFactories: [newToolExtension],
+		});
+		expect(modified.session.getActiveToolNames()).toEqual(["new_tool"]);
+		modified.session.dispose();
+		modified.faux.unregister();
+	});
+
+	it("keeps a snapshot-backed empty selection empty while a deltaless empty one receives defaults", async () => {
+		const newToolExtension: InlineExtension = (pi) => {
+			pi.registerTool({
+				name: "new_tool",
+				label: "New Tool",
+				description: "Newly added default-active tool",
+				parameters: Type.Object({}),
+				execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+			});
+		};
+
+		// Snapshot empty + tool history replaying empty: stays empty.
+		const backed = SessionManager.inMemory(tempDir);
+		backed.appendMessage({
+			role: "system",
+			content: "",
+			toolsAdded: [declaredTool("x_tool")],
+			toolsRemoved: [{ name: "x_tool" }],
+			toolSelectionSnapshot: { version: 1, source: "default", selectedNames: [] },
+			timestamp: 1,
+		});
+		const empty = await createPromptableSession(backed, { extensionFactories: [newToolExtension] });
+		expect(empty.session.getActiveToolNames()).toEqual([]);
+		empty.session.dispose();
+		empty.faux.unregister();
+
+		// Snapshot empty without any delta: current default candidates apply.
+		const deltaless = SessionManager.inMemory(tempDir);
+		deltaless.appendMessage({
+			role: "system",
+			content: "",
+			toolSelectionSnapshot: { version: 1, source: "default", selectedNames: [] },
+			timestamp: 1,
+		});
+		const migrated = await createPromptableSession(deltaless, { extensionFactories: [newToolExtension] });
+		expect(migrated.session.getActiveToolNames().sort()).toEqual(["bash", "edit", "new_tool", "read", "write"]);
+		migrated.session.dispose();
+		migrated.faux.unregister();
+	});
+
+	it("keeps recorded removals off and merges default candidates the transcript never mentions", async () => {
+		const sessionManager = SessionManager.inMemory(tempDir);
+		sessionManager.appendMessage({
+			role: "system",
+			content: "",
+			toolsAdded: [declaredTool("read"), declaredTool("bash"), declaredTool("edit"), declaredTool("write")],
+			timestamp: 1,
+		});
+		sessionManager.appendMessage({
+			role: "system",
+			content: "",
+			toolsRemoved: [{ name: "bash" }],
+			toolSelectionSnapshot: { version: 1, source: "default", selectedNames: ["read", "edit", "write"] },
+			timestamp: 2,
+		});
+		sessionManager.appendMessage({ role: "user", content: "hi", timestamp: 3 });
+		const { session, faux } = await createPromptableSession(sessionManager, {
+			extensionFactories: [extensionToolExtension],
+		});
+		// bash was recorded removed and stays off; active_tool is a never-mentioned candidate.
+		expect(session.getActiveToolNames().sort()).toEqual(["active_tool", "edit", "read", "write"]);
+		session.dispose();
+		faux.unregister();
+	});
+
+	it("keeps an explicit snapshot exactly and never merges defaults into it", async () => {
+		const sessionManager = SessionManager.inMemory(tempDir);
+		sessionManager.appendMessage({
+			role: "system",
+			content: "",
+			toolSelectionSnapshot: { version: 1, source: "explicit", selectedNames: ["grep"] },
+			timestamp: 1,
+		});
+		const { session, faux } = await createPromptableSession(sessionManager, {
+			extensionFactories: [extensionToolExtension],
+		});
+		expect(session.getActiveToolNames()).toEqual(["grep"]);
+		session.dispose();
+		faux.unregister();
+	});
+
+	it("snapshots logical selection before excludeTools and allowlist vetoes", async () => {
+		const defaultManager = SessionManager.inMemory(tempDir);
+		const defaultSession = await createPromptableSession(defaultManager, { excludeTools: ["read"] });
+		expect(defaultSession.session.getActiveToolNames()).not.toContain("read");
+		await defaultSession.session.prompt("excluded default");
+		expect(recordedSnapshots(defaultManager)).toEqual([
+			{ version: 1, source: "default", selectedNames: ["read", "bash", "edit", "write"] },
+		]);
+		defaultSession.session.dispose();
+		defaultSession.faux.unregister();
+
+		const explicitManager = SessionManager.inMemory(tempDir);
+		const explicitSession = await createPromptableSession(explicitManager, {
+			tools: ["read"],
+			excludeTools: ["read"],
+		});
+		expect(explicitSession.session.getActiveToolNames()).not.toContain("read");
+		await explicitSession.session.prompt("excluded explicit tool");
+		expect(recordedSnapshots(explicitManager)).toEqual([{ version: 1, source: "explicit", selectedNames: ["read"] }]);
+		explicitSession.session.dispose();
+		explicitSession.faux.unregister();
+	});
+
+	it("restores a selected unavailable tool when it registers again but not an explicit disable", async () => {
+		const flakyExtension: InlineExtension = (pi) => {
+			pi.registerTool({
+				name: "flaky",
+				label: "Flaky Tool",
+				description: "Tool that may be unavailable",
+				parameters: Type.Object({}),
+				execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+			});
+		};
+
+		// Session one selects flaky (default-active extension tool) and records the snapshot.
+		const selected = SessionManager.inMemory(tempDir);
+		const first = await createPromptableSession(selected, { extensionFactories: [flakyExtension] });
+		await first.session.prompt("hi");
+		expect(recordedSnapshots(selected).at(-1)?.selectedNames).toContain("flaky");
+		first.session.dispose();
+		first.faux.unregister();
+
+		// Session two runs without flaky registered: unavailable, but the snapshot keeps the intent.
+		const unavailable = await createPromptableSession(selected);
+		await unavailable.session.prompt("next");
+		expect(unavailable.session.getActiveToolNames()).not.toContain("flaky");
+		expect(recordedSnapshots(selected).at(-1)?.selectedNames).toContain("flaky");
+		// The provider-visible replay no longer declares flaky while it is unavailable.
+		expect(getCurrentTools(unavailable.capturedContexts[0].messages).map((tool) => tool.name)).not.toContain("flaky");
+		unavailable.session.dispose();
+		unavailable.faux.unregister();
+
+		// Session three registers flaky again: the snapshot restores it.
+		const restored = await createPromptableSession(selected, { extensionFactories: [flakyExtension] });
+		expect(restored.session.getActiveToolNames()).toContain("flaky");
+		restored.session.dispose();
+		restored.faux.unregister();
+
+		// An explicit disable records a snapshot without flaky: re-registration does not restore it.
+		const disabled = SessionManager.inMemory(tempDir);
+		const disabler = await createPromptableSession(disabled, { extensionFactories: [flakyExtension] });
+		await disabler.session.prompt("hi");
+		disabler.session.setActiveToolsByName(["read", "bash", "edit", "write"]);
+		await disabler.session.prompt("again");
+		disabler.session.dispose();
+		disabler.faux.unregister();
+		expect(recordedSnapshots(disabled).at(-1)?.selectedNames).not.toContain("flaky");
+		const staysOff = await createPromptableSession(disabled, { extensionFactories: [flakyExtension] });
+		expect(staysOff.session.getActiveToolNames()).not.toContain("flaky");
+		staysOff.session.dispose();
+		staysOff.faux.unregister();
+	});
+
+	it("applies the restore decision to late registration", async () => {
+		const lateToolExtension: InlineExtension = (pi) => {
+			pi.on("session_start", () => {
+				pi.registerTool({
+					name: "late_tool",
+					label: "Late Tool",
+					description: "Registered after the restore decision",
+					parameters: Type.Object({}),
+					execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+				});
+			});
+		};
+
+		// A default selection with no history absorbs a late-registered default-active tool.
+		const openSelection = SessionManager.inMemory(tempDir);
+		openSelection.appendMessage({
+			role: "system",
+			content: "",
+			toolSelectionSnapshot: {
+				version: 1,
+				source: "default",
+				selectedNames: ["read", "bash", "edit", "write"],
+			},
+			timestamp: 1,
+		});
+		const absorbs = await createPromptableSession(openSelection, { extensionFactories: [lateToolExtension] });
+		await absorbs.session.bindExtensions({});
+		expect(absorbs.session.getActiveToolNames().sort()).toEqual(["bash", "edit", "late_tool", "read", "write"]);
+		await absorbs.session.prompt("hi");
+		expect(recordedSnapshots(openSelection).at(-1)?.selectedNames).toContain("late_tool");
+		absorbs.session.dispose();
+		absorbs.faux.unregister();
+
+		// A selection that records late_tool as removed keeps it off when it registers late.
+		const rejected = SessionManager.inMemory(tempDir);
+		rejected.appendMessage({
+			role: "system",
+			content: "",
+			toolsAdded: [declaredTool("late_tool"), declaredTool("read")],
+			timestamp: 1,
+		});
+		rejected.appendMessage({
+			role: "system",
+			content: "",
+			toolsRemoved: [{ name: "late_tool" }],
+			toolSelectionSnapshot: { version: 1, source: "default", selectedNames: ["read"] },
+			timestamp: 2,
+		});
+		const keepsOff = await createPromptableSession(rejected, { extensionFactories: [lateToolExtension] });
+		await keepsOff.session.bindExtensions({});
+		expect(keepsOff.session.getActiveToolNames().sort()).toEqual(["bash", "edit", "read", "write"]);
+		keepsOff.session.dispose();
+		keepsOff.faux.unregister();
+	});
+
+	it("keeps hidden prepareLoadout declarations selected but out of provider payloads", async () => {
+		const hiddenExtension: InlineExtension = (pi) => {
+			pi.registerTool({
+				name: "echo_tool",
+				label: "Echo Tool",
+				description: "Hidden from requests by prepareLoadout",
+				parameters: Type.Object({}),
+				execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+			});
+			pi.registerTool({
+				name: "runner",
+				label: "Runner",
+				description: "Runs tools",
+				parameters: Type.Object({}),
+				exposure: "model-only",
+				prepareLoadout: () => ({ hiddenDeclarations: ["echo_tool"] }),
+				execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+			});
+		};
+		const sessionManager = SessionManager.inMemory(tempDir);
+		const { session, faux, capturedContexts } = await createPromptableSession(sessionManager, {
+			extensionFactories: [hiddenExtension],
+		});
+		await session.prompt("hi");
+		// Selected active set keeps echo_tool; the provider-visible replay does not declare it.
+		expect(session.getActiveToolNames()).toContain("echo_tool");
+		expect(getCurrentTools(capturedContexts[0].messages).map((tool) => tool.name)).not.toContain("echo_tool");
+		// The snapshot selection keeps the intent despite the hidden projection.
+		expect(recordedSnapshots(sessionManager).at(-1)?.selectedNames).toContain("echo_tool");
+		session.dispose();
+		faux.unregister();
+
+		// Reopening restores the hidden-from-provider tool in the selected set.
+		const reopened = await createPromptableSession(sessionManager, { extensionFactories: [hiddenExtension] });
+		await reopened.session.bindExtensions({});
+		expect(reopened.session.getActiveToolNames()).toContain("echo_tool");
+		reopened.session.setActiveToolsByName(
+			reopened.session.getActiveToolNames().filter((name) => name !== "echo_tool"),
+		);
+		await reopened.session.prompt("disable hidden declaration");
+		reopened.session.dispose();
+		reopened.faux.unregister();
+
+		// The hidden declaration had no provider delta, but its old snapshot records that it was
+		// selected before being explicitly disabled. The empty new snapshot must not re-add it as
+		// a newly default-active candidate.
+		const disabled = await createPromptableSession(sessionManager, { extensionFactories: [hiddenExtension] });
+		expect(disabled.session.getActiveToolNames()).not.toContain("echo_tool");
+		disabled.session.dispose();
+		disabled.faux.unregister();
+	});
+
+	it("reports a legacy migration notice once across repeated resumes", async () => {
+		const sessionManager = SessionManager.inMemory(tempDir);
+		sessionManager.appendMessage({ role: "system", content: "legacy prompt", timestamp: 1 });
+		sessionManager.appendMessage({ role: "user", content: "hi", timestamp: 2 });
+		const first = await createPromptableSession(sessionManager, {
+			extensionFactories: [extensionToolExtension],
+		});
+		expect(notices(sessionManager)).toHaveLength(1);
+		first.session.dispose();
+		first.faux.unregister();
+
+		for (let index = 0; index < 2; index++) {
+			const repeat = await createPromptableSession(sessionManager, {
+				extensionFactories: [extensionToolExtension],
+			});
+			expect(repeat.session.getActiveToolNames().sort()).toEqual(["active_tool", "bash", "edit", "read", "write"]);
+			expect(notices(sessionManager)).toHaveLength(1);
+			repeat.session.dispose();
+			repeat.faux.unregister();
+		}
+	});
+
+	it("redeclares a changed custom tool definition on resume", async () => {
+		const makeSessionManager = () => {
+			const manager = SessionManager.inMemory(tempDir);
+			manager.appendMessage({ role: "system", content: "", toolsAdded: [declaredTool("sdk_tool")], timestamp: 1 });
+			manager.appendMessage({ role: "user", content: "hi", timestamp: 2 });
+			return manager;
+		};
+		const sdkTool = (description: string) => ({
+			name: "sdk_tool",
+			label: "SDK Tool",
+			description,
+			parameters: Type.Object({}),
+			execute: async () => ({ content: [{ type: "text" as const, text: "ok" }], details: {} }),
+		});
+		const first = await createPromptableSession(makeSessionManager(), {
+			customTools: [sdkTool("original description")],
+		});
+		await first.session.prompt("hi");
+		first.session.dispose();
+		first.faux.unregister();
+
+		const resumed = await createPromptableSession(makeSessionManager(), {
+			customTools: [sdkTool("changed description")],
+		});
+		await resumed.session.prompt("again");
+		// The replay declares the new definition; the transcript records the redefinition.
+		expect(getCurrentTools(resumed.capturedContexts[0].messages).map((tool) => tool.description)).toContain(
+			"changed description",
+		);
+		expect(resumed.session.getActiveToolNames()).toContain("sdk_tool");
+		resumed.session.dispose();
+		resumed.faux.unregister();
 	});
 });

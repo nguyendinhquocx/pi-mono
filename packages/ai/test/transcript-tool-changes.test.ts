@@ -1,7 +1,12 @@
 import { Type } from "typebox";
 import { describe, expect, test } from "vitest";
 import { getModel, streamSimple } from "../src/compat.ts";
-import type { Api, Context, Model, Tool } from "../src/types.ts";
+import type { Api, Context, Model, Tool, ToolSelectionSnapshot } from "../src/types.ts";
+import {
+	getLatestToolSelectionSnapshot,
+	getTranscriptKnownToolNames,
+	hasToolStateDeltas,
+} from "../src/utils/transcript.ts";
 
 class PayloadCaptured extends Error {}
 
@@ -403,5 +408,81 @@ describe("transcript system messages", () => {
 		expect(payload.tools?.map((value) => value.function?.name)).toEqual(["late_tool"]);
 		expect(payload.messages.map((message) => message.role)).toEqual(["system", "user"]);
 		expect(payload.messages[0]?.content).toBe("base prompt\n\nupdated guidance\n\n<rules>\nnew rules\n</rules>");
+	});
+});
+
+describe("tool selection snapshot replay", () => {
+	const snapshot: ToolSelectionSnapshot = { version: 1, source: "default", selectedNames: ["base_tool"] };
+	const emptySnapshot: ToolSelectionSnapshot = { version: 1, source: "explicit", selectedNames: [] };
+
+	const emptyTranscript: Array<{ role: string } & Record<string, unknown>> = [
+		{ role: "user", content: "hi", timestamp: 1 },
+	];
+
+	test("returns undefined when no snapshot was recorded", () => {
+		expect(getLatestToolSelectionSnapshot(context.messages)).toBeUndefined();
+		expect(getLatestToolSelectionSnapshot(emptyTranscript)).toBeUndefined();
+	});
+
+	test("replays the latest snapshot across system messages", () => {
+		const messages: Array<{ role: string } & Record<string, unknown>> = [
+			{ role: "system", content: "prompt", toolSelectionSnapshot: snapshot, timestamp: 0 },
+			{ role: "user", content: "hi", timestamp: 1 },
+			{ role: "system", content: "", toolSelectionSnapshot: emptySnapshot, timestamp: 2 },
+			{
+				role: "assistant",
+				content: [],
+				api: "test",
+				provider: "test",
+				model: "test",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop" as const,
+				timestamp: 3,
+			},
+		];
+		expect(getLatestToolSelectionSnapshot(messages)).toEqual(emptySnapshot);
+	});
+
+	test("ignores empty delta arrays as history evidence", () => {
+		const messages = [
+			{ role: "system", content: "prompt", toolsAdded: [], toolsRemoved: [], timestamp: 0 },
+			{ role: "user", content: "hi", timestamp: 1 },
+		];
+		expect(hasToolStateDeltas(messages)).toBe(false);
+		expect(getTranscriptKnownToolNames(messages).size).toBe(0);
+	});
+
+	test("collects added and removed names as transcript-known", () => {
+		const messages = [
+			{ role: "system", content: "prompt", toolsAdded: [baseTool], timestamp: 0 },
+			{ role: "system", content: "", toolsRemoved: [{ name: "gone_tool" }], timestamp: 1 },
+		];
+		expect(hasToolStateDeltas(messages)).toBe(true);
+		expect(getTranscriptKnownToolNames(messages)).toEqual(new Set(["base_tool", "gone_tool"]));
+	});
+
+	test("does not send snapshot metadata to providers", async () => {
+		const model: Model<"anthropic-messages"> = {
+			...modelBase,
+			id: "claude-sonnet-4-5",
+			name: "Claude Sonnet 4.5",
+			api: "anthropic-messages",
+			provider: "anthropic",
+		};
+		const payload = await capturePayload<Record<string, unknown>>(model, {
+			messages: [
+				{ role: "system", content: "base prompt", toolSelectionSnapshot: snapshot, timestamp: 0 },
+				{ role: "user", content: "hi", timestamp: 1 },
+			],
+		});
+		expect(JSON.stringify(payload)).not.toContain("toolSelectionSnapshot");
+		expect(JSON.stringify(payload)).not.toContain("base_tool");
 	});
 });

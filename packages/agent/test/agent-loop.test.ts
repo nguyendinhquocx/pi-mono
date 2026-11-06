@@ -3,6 +3,7 @@ import {
 	createAssistantMessageEventStream,
 	type Message,
 	type Model,
+	type SystemMessage,
 	type ToolResultMessage,
 	type UserMessage,
 } from "@earendil-works/pi-ai";
@@ -194,6 +195,76 @@ describe("agentLoop with AgentMessage", () => {
 		);
 
 		await stream.result();
+	});
+
+	// AgentSession records a tool-selection snapshot on the same system message that carries tool
+	// deltas; the loop must rewrite the tool fields through its spread copy without dropping the
+	// metadata it does not know about (regression: snapshot survives `declareToolChanges`).
+	it("preserves extra system message metadata when declaring tool changes", async () => {
+		const context: AgentContext = {
+			messages: [],
+			tools: [
+				{
+					name: "read",
+					description: "read tool",
+					parameters: Type.Object({}),
+					label: "read",
+					execute: async () => {
+						throw new Error("not executed");
+					},
+				},
+			],
+		};
+		const snapshot = { version: 1 as const, source: "default" as const, selectedNames: ["read"] };
+		const pendingSystem: AgentMessage = {
+			role: "system",
+			content: "",
+			toolSelectionSnapshot: snapshot,
+			timestamp: 1,
+		};
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[pendingSystem, createUserMessage("Hello")],
+			context,
+			config,
+			undefined,
+			(_model, providerContext) => {
+				const providerSystem = providerContext.messages.filter(
+					(message): message is SystemMessage => message.role === "system",
+				);
+				expect(providerSystem).toHaveLength(1);
+				expect(providerSystem[0].toolSelectionSnapshot).toEqual(snapshot);
+				expect(providerSystem[0].toolsAdded?.map((declared) => declared.name)).toEqual(["read"]);
+				const response = createAssistantMessageEventStream();
+				queueMicrotask(() => {
+					response.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessage([{ type: "text", text: "done" }]),
+					});
+				});
+				return response;
+			},
+		);
+
+		for await (const event of stream) {
+			events.push(event);
+		}
+		await stream.result();
+
+		// The loop declared the delta on the pending message and kept the snapshot metadata.
+		const declared = events.find(
+			(event): event is Extract<AgentEvent, { type: "message_end" }> =>
+				event.type === "message_end" && event.message.role === "system",
+		);
+		expect(declared).toBeDefined();
+		const systemMessage = declared!.message as SystemMessage;
+		expect(systemMessage.toolSelectionSnapshot).toEqual(snapshot);
+		expect(systemMessage.toolsAdded?.map((added) => added.name)).toEqual(["read"]);
 	});
 
 	it("should handle custom message types via convertToLlm", async () => {

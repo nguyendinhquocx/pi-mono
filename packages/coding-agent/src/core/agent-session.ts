@@ -31,7 +31,15 @@ import {
 	runToolCall,
 	type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import { contentText, getCurrentSystemMessage, retryDelayMs } from "@earendil-works/pi-ai";
+import {
+	contentText,
+	getCurrentSystemMessage,
+	getLatestToolSelectionSnapshot,
+	getTranscriptKnownToolNames,
+	hasToolStateDeltas,
+	retryDelayMs,
+	type ToolSelectionSnapshot,
+} from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
 	AuthResult,
@@ -249,6 +257,11 @@ function withoutDeletedHeaders(headers: ProviderHeaders | undefined): Record<str
 		: undefined;
 }
 
+/** Custom entry kind carrying the bounded tool-selection migration notice. */
+const TOOL_SELECTION_NOTICE_ENTRY = "tool_selection_notice";
+/** Maximum tool names listed in one migration notice. */
+const TOOL_SELECTION_NOTICE_MAX_NAMES = 32;
+
 export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
@@ -448,6 +461,20 @@ export class AgentSession {
 	private _pendingToolNames = new Set<string>();
 	private _usesDefaultTools: boolean;
 	private _defaultToolModifiers: string[];
+	/** Logical tool selection recorded before registry availability, allowlist, and exposure filters. */
+	private _selectedToolNames = new Set<string>();
+	/** Whether the selection base comes from the default set or an explicit replacement. */
+	private _toolSelectionSource: ToolSelectionSnapshot["source"] = "default";
+	/** Selection authority for late tool registration; undefined keeps registration-time defaults. */
+	private _lateActivationToolNames: ReadonlySet<string> | undefined;
+	/** Whether the restored selection may still absorb current default candidates at late registration. */
+	private _lateMergeDefaults = false;
+	/** Tool names the restored transcript already mentions; late registrations never re-add these. */
+	private _lateKnownToolNames: ReadonlySet<string> = new Set();
+	/** Default-active extension/SDK tool names, including registrations filtered from the active registry. */
+	private _registeredDefaultExtensionToolNames: ReadonlySet<string> = new Set();
+	/** Migration notices queued until a UI context is bound. */
+	private _pendingToolSelectionNotices: Array<{ message: string; type: "info" | "warning" }> = [];
 	/** Matches the `--tools` entries: tool names or patterns. */
 	private _allowedTools?: (name: string) => boolean;
 	/**
@@ -500,6 +527,19 @@ export class AgentSession {
 		this._initialActiveToolNames = config.initialActiveToolNames;
 		this._usesDefaultTools = config.usesDefaultTools ?? false;
 		this._defaultToolModifiers = config.defaultToolModifiers ?? [];
+		this._toolSelectionSource = this._usesDefaultTools ? "default" : "explicit";
+		if (this._usesDefaultTools) {
+			this._selectedToolNames = new Set(
+				applyToolModifiers(
+					this.settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES,
+					this._defaultToolModifiers,
+				),
+			);
+		} else if (config.allowedToolNames) {
+			// Exact explicit names may be unavailable at startup; keep them in the selection
+			// snapshot. Wildcard entries are expanded against registered names in the registry refresh.
+			this._selectedToolNames = new Set(config.allowedToolNames.filter((name) => !name.includes("*")));
+		}
 		if (config.allowedToolNames) {
 			this._allowedTools = createToolNameMatcher(config.allowedToolNames);
 			this._allowlistFiltersMcp =
@@ -517,6 +557,7 @@ export class AgentSession {
 		this._installAgentRequestProjection();
 		this._installAgentBoundaryHooks();
 		this._installHiddenDeclarationsProjection();
+		this._installSnapshotMetadataProjection();
 		this._installAgentForcedPromptProjection();
 
 		this._buildRuntime({
@@ -794,7 +835,11 @@ export class AgentSession {
 				const projection = this.sessionManager.buildSessionProjection();
 				const canonicalContext = {
 					...request.context,
-					messages: projection.messages,
+					messages: projection.messages.map((message) => {
+						if (message.role !== "system" || !message.toolSelectionSnapshot) return message;
+						const { toolSelectionSnapshot: _snapshot, ...rest } = message;
+						return rest as SystemMessage;
+					}),
 					// Messages declare the provider-visible loadout; context.tools keeps executable implementations.
 					tools: this.agent.state.tools.slice(),
 				};
@@ -914,18 +959,43 @@ export class AgentSession {
 				toolGuidelines: { ...this._baseSystemPromptOptions.toolGuidelines, ...runOptions.toolGuidelines },
 			});
 			const updateMessage = this._preparePromptAndToolLoadout(options, nextContext.messages);
+			const snapshotEvent = this._toolSelectionSnapshotEvent();
 			// Keep session.systemPrompt and ctx.getSystemPrompt() in step with what the provider sees.
 			this._runSystemPromptOptions = options;
 
+			const priorMessages = [...(previousSnapshot?.messages ?? [])];
+			let snapshotAttached = false;
+			if (snapshotEvent && !updateMessage) {
+				for (let index = priorMessages.length - 1; index >= 0; index--) {
+					const message = priorMessages[index];
+					if (message.role !== "system") continue;
+					priorMessages[index] = { ...message, toolSelectionSnapshot: snapshotEvent.toolSelectionSnapshot };
+					snapshotAttached = true;
+					break;
+				}
+			}
+			if (snapshotEvent && !snapshotAttached && !updateMessage) {
+				const insertIndex = priorMessages.findIndex((message) => message.role !== "system");
+				priorMessages.splice(insertIndex === -1 ? priorMessages.length : insertIndex, 0, snapshotEvent);
+			}
+			const preparedMessages = [
+				...priorMessages,
+				...(updateMessage
+					? [
+							{
+								...updateMessage,
+								...(snapshotEvent ? { toolSelectionSnapshot: snapshotEvent.toolSelectionSnapshot } : {}),
+							},
+						]
+					: []),
+			];
 			return {
 				...previousSnapshot,
 				context: {
 					...nextContext,
 					tools: this.agent.state.tools.slice(),
 				},
-				messages: updateMessage
-					? [...(previousSnapshot?.messages ?? []), updateMessage]
-					: previousSnapshot?.messages,
+				messages: preparedMessages.length > 0 ? preparedMessages : undefined,
 				model: this.agent.state.model,
 				thinkingLevel: this.agent.state.thinkingLevel,
 			};
@@ -1521,12 +1591,23 @@ export class AgentSession {
 	 * Changes take effect on the next agent turn.
 	 */
 	setActiveToolsByName(toolNames: string[]): void {
-		const previous = this.getActiveToolNames();
+		const previousActive = this.getActiveToolNames();
+		const preservesCurrentLoadout = previousActive.every((name) => toolNames.includes(name));
+		// Extensions often add one tool via getActiveTools() + [name]. Preserve selected-but-
+		// unavailable restore intent for that additive change; a replacement that drops any
+		// currently active tool replaces the old snapshot intent too.
+		const unavailableSelection = preservesCurrentLoadout
+			? [...this._selectedToolNames].filter((name) => !this._toolRegistry.has(name))
+			: [];
+		this._selectedToolNames = new Set([...toolNames, ...unavailableSelection]);
+		if (this._lateActivationToolNames) {
+			this._lateActivationToolNames = new Set(this._selectedToolNames);
+			this._lateMergeDefaults = false;
+		}
+		this._pendingToolNames = new Set(
+			[...toolNames, ...unavailableSelection].filter((name) => !this._toolRegistry.has(name)),
+		);
 		this._setActiveTools(toolNames);
-		// A loadout that deactivates a tool replaces the restored one, whose pending tools are dropped.
-		// One that only adds tools, like activating tool_search, keeps them.
-		const active = new Set(this.getActiveToolNames());
-		if (previous.some((name) => !active.has(name))) this._pendingToolNames.clear();
 	}
 
 	private _setActiveTools(toolNames: string[]): void {
@@ -1578,6 +1659,11 @@ export class AgentSession {
 	 * requests (see {@link _installHiddenDeclarationsProjection}).
 	 */
 	private _applyToolLoadout(toolNames: string[]): AgentTool[] {
+		// Internal refreshes and prompt preparation can only see the active, provider-declarable
+		// set. Keep the logical selection union so unavailable, excluded, or hidden selected names
+		// remain in the transcript snapshot. The public setActiveToolsByName() resets intent before
+		// reaching here when the owner/extension deliberately changes it.
+		this._selectedToolNames = new Set([...this._selectedToolNames, ...toolNames]);
 		const tools = [...new Set(toolNames)].flatMap((name) => {
 			const tool = this._toolRegistry.get(name);
 			return tool && this._getToolExposure(name) !== "hidden" && this._isActivatable(name) ? [tool] : [];
@@ -1789,6 +1875,25 @@ export class AgentSession {
 		};
 	}
 
+	/**
+	 * Strip the transcript-only `toolSelectionSnapshot` metadata from every request so providers
+	 * never receive it. Runs after the hidden-declarations and forced-prompt projections.
+	 */
+	private _installSnapshotMetadataProjection(): void {
+		const previousTransformContext = this.agent.transformContext;
+		this.agent.transformContext = async (messages, signal) => {
+			const transformed = previousTransformContext ? await previousTransformContext(messages, signal) : messages;
+			let mutated = false;
+			const projected = transformed.map((message) => {
+				if (message.role !== "system" || !message.toolSelectionSnapshot) return message;
+				mutated = true;
+				const { toolSelectionSnapshot: _snapshot, ...rest } = message;
+				return rest as SystemMessage;
+			});
+			return mutated ? projected : transformed;
+		};
+	}
+
 	private _installAgentForcedPromptProjection(): void {
 		const previousTransformContext = this.agent.transformContext;
 		this.agent.transformContext = async (messages, signal) => {
@@ -1807,21 +1912,176 @@ export class AgentSession {
 	}
 
 	/**
-	 * Restore the active tool loadout declared by the session transcript, if it declares one.
-	 * Tools reachable only from other tools are never declared, but they do not depend on the active
-	 * set, so the transcript's declarations are the whole loadout.
-	 * @param modifiers `+name`/`-name` entries applied to the restored loadout.
+	 * Restore the active tool loadout for a resumed session.
+	 *
+	 * Precedence: an explicit current replacement (`tools` allowlist/replacement or `noTools`) never
+	 * reaches this method — the session constructor applies it directly. Otherwise the latest
+	 * `toolSelectionSnapshot` is the recorded selection intent and wins over declaration deltas;
+	 * legacy transcripts without a snapshot replay the recorded deltas. A default-source selection
+	 * merges current default candidates the transcript has never mentioned, so a resumed session
+	 * gains newly added default-active tools; an explicit-source selection keeps its recorded names
+	 * exactly. A replayed empty selection stays empty, and a legacy transcript with no tool
+	 * history at all is unknown state restored to current defaults with a notice. Modifiers,
+	 * `excludeTools`, the allowlist, exposure, and registry availability apply after the base
+	 * selection.
+	 * @param modifiers `+name`/`-name` entries applied to the resolved loadout.
 	 */
 	private _restoreToolsFromTranscript(modifiers: readonly string[] = []): void {
 		this._pendingToolNames.clear();
-		const current = getCurrentSystemMessage(this.sessionManager.buildSessionContext().messages);
-		if (!current) return;
-		const names = applyToolModifiers(
-			(current.toolsAdded ?? []).map((tool) => tool.name),
-			modifiers,
+		const messages = this.sessionManager.buildSessionContext().messages;
+		const snapshot = getLatestToolSelectionSnapshot(messages);
+		const current = getCurrentSystemMessage(messages);
+		if (!snapshot && !current && messages.length === 0) return;
+		this._selectedToolNames = new Set();
+		const knownNames = getTranscriptKnownToolNames(messages);
+		const previouslySelectedNames = new Set(
+			messages.flatMap((message) =>
+				message.role === "system" ? (message.toolSelectionSnapshot?.selectedNames ?? []) : [],
+			),
 		);
+		const candidates = this._defaultCandidateNames().filter(
+			(name) => !knownNames.has(name) && !previouslySelectedNames.has(name),
+		);
+		const deltaHistory = hasToolStateDeltas(messages);
+
+		let baseNames: string[];
+		let mergedCandidates: string[] = [];
+		if (snapshot) {
+			this._toolSelectionSource = snapshot.source;
+			if (snapshot.source === "explicit") {
+				// Recorded explicit selection: keep the names exactly, never merge defaults.
+				this._lateMergeDefaults = false;
+				baseNames = [...snapshot.selectedNames];
+			} else if (snapshot.selectedNames.length > 0) {
+				this._lateMergeDefaults = true;
+				mergedCandidates = candidates;
+				baseNames = [...snapshot.selectedNames, ...candidates];
+			} else if (deltaHistory) {
+				// An empty default selection backed by tool history stays empty: the transcript
+				// records a real selection that ended empty, so never merge unknown candidates.
+				this._lateMergeDefaults = false;
+				baseNames = [];
+			} else {
+				// Without any delta the empty selection only marks default mode, so current
+				// defaults apply.
+				this._lateMergeDefaults = true;
+				mergedCandidates = candidates;
+				baseNames = candidates;
+			}
+		} else {
+			// Legacy transcript without a snapshot: replay the recorded provider deltas.
+			const replayed = (current?.toolsAdded ?? []).map((tool) => tool.name);
+			if (!deltaHistory) {
+				// No recorded removal or addition, including legacy `noTools: all` sessions that
+				// wrote no tool event: the legacy state is unknown, so use current defaults.
+				this._lateMergeDefaults = true;
+				baseNames = candidates;
+				this._appendToolSelectionNotice("legacy_unknown", baseNames);
+			} else if (replayed.length === 0) {
+				// The transcript records a real selection that ended empty: keep it empty.
+				this._lateMergeDefaults = false;
+				baseNames = [];
+			} else {
+				// Keep the recorded state and add current default candidates never mentioned.
+				this._lateMergeDefaults = true;
+				mergedCandidates = candidates;
+				baseNames = [...replayed, ...candidates];
+			}
+		}
+		if (mergedCandidates.length > 0) this._appendToolSelectionNotice("migration_added", mergedCandidates);
+		const names = applyToolModifiers(baseNames, modifiers);
+		this._lateActivationToolNames = new Set(names);
+		this._lateKnownToolNames = new Set([...knownNames, ...previouslySelectedNames]);
 		this._pendingToolNames = new Set(names.filter((name) => this._isAllowedTool(name)));
 		this._setActiveTools(names);
+	}
+
+	/**
+	 * Effective fresh-session default selection for migration: the `defaultTools` setting with
+	 * modifiers, plus every registered extension/custom tool that activates on registration.
+	 * Never the whole registry: `defaultActive:false` tools only become candidates through an
+	 * explicit setting entry.
+	 */
+	private _defaultCandidateNames(): string[] {
+		if (!this._usesDefaultTools) return [];
+		const settingNames = applyToolModifiers(
+			this.settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES,
+			this._defaultToolModifiers,
+		);
+		return [...new Set([...settingNames, ...this._registeredDefaultExtensionToolNames])];
+	}
+
+	/**
+	 * Record a bounded migration notice as a session custom entry so the owner can tell an
+	 * unknown legacy state and newly added default tools apart. Repeated resumes do not append
+	 * a notice twice for the same kind and tool list.
+	 */
+	private _appendToolSelectionNotice(kind: "legacy_unknown" | "migration_added", toolNames: string[]): void {
+		if (toolNames.length === 0) return;
+		const tools = toolNames.slice(0, TOOL_SELECTION_NOTICE_MAX_NAMES);
+		const alreadyRecorded = this.sessionManager.getBranch().some((entry) => {
+			if (entry.type !== "custom" || entry.customType !== TOOL_SELECTION_NOTICE_ENTRY) return false;
+			const data = entry.data as { kind?: string; tools?: string[] } | undefined;
+			return data?.kind === kind && JSON.stringify(data.tools ?? []) === JSON.stringify(tools);
+		});
+		if (alreadyRecorded) return;
+		const truncated = toolNames.length > tools.length;
+		const entryId = this.sessionManager.appendCustomEntry(TOOL_SELECTION_NOTICE_ENTRY, {
+			kind,
+			tools,
+			truncated,
+		});
+		const entry = this.sessionManager.getEntry(entryId);
+		if (entry) this._emit({ type: "entry_appended", entry });
+		const label = kind === "legacy_unknown" ? "Legacy tool selection is unknown" : "New default tools added";
+		const suffix = truncated ? ", and more" : "";
+		const message = `${label}: ${tools.join(", ")}${suffix}`;
+		this._pendingToolSelectionNotices.push({ message, type: kind === "legacy_unknown" ? "warning" : "info" });
+		this._flushToolSelectionNotices();
+	}
+
+	/**
+	 * The `toolSelectionSnapshot` system event for the current selection, or undefined when the
+	 * transcript already records it. Empty selections are recorded like any other.
+	 */
+	private _flushToolSelectionNotices(): void {
+		const uiContext = this._extensionUIContext;
+		if (!uiContext) return;
+		for (const notice of this._pendingToolSelectionNotices) uiContext.notify(notice.message, notice.type);
+		this._pendingToolSelectionNotices = [];
+	}
+
+	private _toolSelectionSnapshotEvent(): SystemMessage | undefined {
+		const desired: ToolSelectionSnapshot = {
+			version: 1,
+			source: this._toolSelectionSource,
+			selectedNames: [...this._selectedToolNames],
+		};
+		const recorded = getLatestToolSelectionSnapshot(this.sessionManager.buildSessionContext().messages);
+		if (
+			recorded &&
+			recorded.version === desired.version &&
+			recorded.source === desired.source &&
+			JSON.stringify([...recorded.selectedNames].sort()) === JSON.stringify([...desired.selectedNames].sort())
+		) {
+			return undefined;
+		}
+		return { role: "system", content: "", toolSelectionSnapshot: desired, timestamp: Date.now() };
+	}
+
+	/** Prepend a pending tool-selection snapshot event when the transcript does not record the current selection. */
+	private _injectToolSelectionSnapshot(messages: AgentMessage[]): void {
+		const event = this._toolSelectionSnapshotEvent();
+		if (!event) return;
+		// Reuse a pending system patch when possible: tool deltas and prompt section changes
+		// already share this event, so snapshot metadata should not add a redundant system turn.
+		for (let index = messages.length - 1; index >= 0; index--) {
+			const message = messages[index];
+			if (message.role !== "system") continue;
+			messages[index] = { ...message, toolSelectionSnapshot: event.toolSelectionSnapshot };
+			return;
+		}
+		messages.push(event);
 	}
 
 	// =========================================================================
@@ -1856,9 +2116,18 @@ export class AgentSession {
 		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
 		this._failedResponse = undefined;
 		this._recordSelection();
-		// The run records the loadout in the transcript; restored tools that did not register by now
-		// are dropped, so a tool that never registers does not stay pending.
+		// Deliver migration notices before the provider request when the UI has been bound.
+		this._flushToolSelectionNotices();
+		// Record the selection before the provider request, including when it is empty, so a
+		// resume restores the intent instead of guessing it from declaration deltas.
+		this._injectToolSelectionSnapshot(messages);
+		// The first provider request is the cutoff for same-session registration reconciliation;
+		// the snapshot still preserves unavailable selection intent for a later resume.
 		this._pendingToolNames.clear();
+		if (this._lateActivationToolNames) {
+			this._lateActivationToolNames = new Set();
+			this._lateMergeDefaults = false;
+		}
 		try {
 			await this.agent.prompt(messages);
 			while (!this._agentRunAbortRequested) {
@@ -3288,6 +3557,7 @@ export class AgentSession {
 	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
 		if (bindings.uiContext !== undefined) {
 			this._extensionUIContext = bindings.uiContext;
+			this._flushToolSelectionNotices();
 		}
 		if (bindings.mode !== undefined) {
 			this._extensionMode = bindings.mode;
@@ -3532,13 +3802,31 @@ export class AgentSession {
 		const allowedTools = this._allowedTools;
 
 		const registeredTools = this._extensionRunner.getAllRegisteredTools();
-		const allCustomTools = [
-			...registeredTools,
-			...this._customTools.map((definition) => ({
-				definition,
-				sourceInfo: createSyntheticSourceInfo(`<sdk:${definition.name}>`, { source: "sdk" }),
-			})),
-		].filter((tool) => this._isAllowedTool(tool.definition.name));
+		const customToolEntries = this._customTools.map((definition) => ({
+			definition,
+			sourceInfo: createSyntheticSourceInfo(`<sdk:${definition.name}>`, { source: "sdk" }),
+		}));
+		const allRegisteredTools = [...registeredTools, ...customToolEntries];
+		this._registeredDefaultExtensionToolNames = new Set(
+			allRegisteredTools
+				.filter(({ definition }) => {
+					const exposure = definition.exposure ?? "direct";
+					return definition.defaultActive !== false && (exposure === "direct" || exposure === "model-only");
+				})
+				.map(({ definition }) => definition.name),
+		);
+		for (const { definition } of allRegisteredTools) {
+			const isDefaultActive = this._registeredDefaultExtensionToolNames.has(definition.name);
+			const allowedByCurrentSelection = this._allowedTools?.(definition.name) ?? false;
+			const allowedByRestore =
+				this._lateActivationToolNames === undefined ||
+				this._lateActivationToolNames.has(definition.name) ||
+				(this._lateMergeDefaults && isDefaultActive && !this._lateKnownToolNames.has(definition.name));
+			if (allowedByRestore && ((isDefaultActive && !this._allowedTools) || allowedByCurrentSelection)) {
+				this._selectedToolNames.add(definition.name);
+			}
+		}
+		const allCustomTools = allRegisteredTools.filter((tool) => this._isAllowedTool(tool.definition.name));
 		const definitionRegistry = new Map<string, ToolDefinitionEntry>(
 			Array.from(this._baseToolDefinitions.entries())
 				.filter(([name]) => this._isAllowedTool(name))
@@ -3611,7 +3899,22 @@ export class AgentSession {
 			}
 		} else if (!options?.activeToolNames) {
 			for (const toolName of this._toolRegistry.keys()) {
-				if (!previousActivatedOnRegistration.has(toolName) && this._isActivatedOnRegistration(toolName)) {
+				if (previousActivatedOnRegistration.has(toolName)) continue;
+				if (this._lateActivationToolNames) {
+					// A restored selection is the authority: a late registration activates a selected
+					// or migrated name, or applies the restore's default-merge decision to a tool the
+					// transcript never mentions. Names the selection keeps off stay off.
+					if (this._lateActivationToolNames.has(toolName)) {
+						nextActiveToolNames.push(toolName);
+					} else if (
+						this._lateMergeDefaults &&
+						this._isActivatedOnRegistration(toolName) &&
+						!this._lateKnownToolNames.has(toolName)
+					) {
+						nextActiveToolNames.push(toolName);
+						this._appendToolSelectionNotice("migration_added", [toolName]);
+					}
+				} else if (this._isActivatedOnRegistration(toolName)) {
 					nextActiveToolNames.push(toolName);
 				}
 			}
@@ -3707,6 +4010,10 @@ export class AgentSession {
 		// Activate tools newly added to defaultTools. Removed ones stay active, and tools disabled
 		// during the session stay disabled unless the setting newly adds them.
 		const addedDefaultTools = getDefaultTools().filter((name) => !previousDefaultTools.has(name));
+		if (this._lateActivationToolNames && addedDefaultTools.length > 0) {
+			// Newly added default tools are part of the selection: a late registration activates them.
+			this._lateActivationToolNames = new Set([...this._lateActivationToolNames, ...addedDefaultTools]);
+		}
 		// Tools the new extensions register later, such as MCP tools, are pending until then.
 		for (const name of this.getActiveToolNames()) this._pendingToolNames.add(name);
 		this._buildRuntime({

@@ -558,6 +558,12 @@ export interface SystemMessage {
 	toolsAdded?: Tool[];
 	/** Tools that stop being available at this point. */
 	toolsRemoved?: ToolReference[];
+	/**
+	 * Transcript-only selection metadata recorded by the agent runtime before provider
+	 * requests. Stripped from provider requests; replay reads the latest snapshot to restore
+	 * the logical selection instead of inferring it from declaration deltas.
+	 */
+	toolSelectionSnapshot?: ToolSelectionSnapshot;
 	timestamp: number; // Unix timestamp in milliseconds
 }
 
@@ -760,6 +766,22 @@ export interface Tool<TParameters extends TSchema = TSchema> {
 
 export interface ToolReference {
 	name: string;
+}
+
+/**
+ * Logical tool selection recorded on a transcript system message so a resumed session can
+ * tell a deliberate selection apart from provider declaration deltas. `selectedNames` is
+ * recorded before registry availability, allowlist/exposure filters, and provider
+ * projection: it may reference unregistered tools and may be empty on purpose. Names only;
+ * it never carries declarations or provider payloads, and providers never receive it.
+ */
+export interface ToolSelectionSnapshot {
+	/** Snapshot schema version. */
+	version: 1;
+	/** `default`: the base selection comes from the effective default tool set. `explicit`: a plain `tools` replacement or `noTools` decided the base. */
+	source: "default" | "explicit";
+	/** Selected tool names in selection order; empty means an intentionally empty selection. */
+	selectedNames: string[];
 }
 
 /**
