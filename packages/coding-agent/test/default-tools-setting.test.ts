@@ -579,7 +579,7 @@ describe("tool selection snapshot resume", () => {
 		reopened.faux.unregister();
 	});
 
-	it("restores unknown legacy state to current defaults with a notice", async () => {
+	it("restores unknown legacy state to current defaults without a notice", async () => {
 		const sessionManager = SessionManager.inMemory(tempDir);
 		// A legacy `noTools: all` session wrote a prompt but no tool event.
 		sessionManager.appendMessage({ role: "system", content: "legacy prompt", timestamp: 1 });
@@ -588,9 +588,7 @@ describe("tool selection snapshot resume", () => {
 			extensionFactories: [extensionToolExtension],
 		});
 		expect(session.getActiveToolNames().sort()).toEqual(["active_tool", "bash", "edit", "read", "write"]);
-		expect(notices(sessionManager)).toEqual([
-			{ kind: "legacy_unknown", tools: ["read", "bash", "edit", "write", "active_tool"] },
-		]);
+		expect(notices(sessionManager)).toEqual([]);
 		await session.prompt("hi");
 		expect(recordedSnapshots(sessionManager)).toEqual([
 			{ version: 1, source: "default", selectedNames: ["read", "bash", "edit", "write", "active_tool"] },
@@ -599,7 +597,7 @@ describe("tool selection snapshot resume", () => {
 		faux.unregister();
 	});
 
-	it("notifies the owner about an unknown legacy loadout before the first request", async () => {
+	it("does not notify the owner about an unknown legacy loadout", async () => {
 		const sessionManager = SessionManager.inMemory(tempDir);
 		sessionManager.appendMessage({ role: "system", content: "legacy prompt", timestamp: 1 });
 		const { session, faux } = await createPromptableSession(sessionManager);
@@ -608,20 +606,16 @@ describe("tool selection snapshot resume", () => {
 			notify: (message: string, type?: string) => notifications.push({ message, type }),
 		} as unknown as ExtensionUIContext;
 		await session.bindExtensions({ uiContext });
-		expect(notifications).toEqual([
-			{
-				// Count-only UI line (r6 C6); the full name list lives in the session entry.
-				message: "Legacy tool selection is unknown: 4 tools — names recorded in the session entry",
-				type: "warning",
-			},
-		]);
+		expect(notifications).toEqual([]);
+		expect(notices(sessionManager)).toEqual([]);
 		await session.prompt("hi");
+		expect(notifications).toEqual([]);
 		expect(faux.state.callCount).toBe(1);
 		session.dispose();
 		faux.unregister();
 	});
 
-	it("distinguishes migrated new defaults from unknown legacy selection", async () => {
+	it("silently distinguishes migrated defaults from unknown legacy selection", async () => {
 		const sessionManager = SessionManager.inMemory(tempDir);
 		sessionManager.appendMessage({
 			role: "system",
@@ -634,9 +628,7 @@ describe("tool selection snapshot resume", () => {
 			extensionFactories: [extensionToolExtension],
 		});
 		expect(session.getActiveToolNames().sort()).toEqual(["active_tool", "bash", "edit", "read", "write"]);
-		expect(notices(sessionManager)).toEqual([
-			{ kind: "migration_added", tools: ["bash", "edit", "write", "active_tool"] },
-		]);
+		expect(notices(sessionManager)).toEqual([]);
 		session.dispose();
 		faux.unregister();
 	});
@@ -995,14 +987,14 @@ describe("tool selection snapshot resume", () => {
 		disabled.faux.unregister();
 	});
 
-	it("reports a legacy migration notice once across repeated resumes", async () => {
+	it("restores legacy defaults silently across repeated resumes", async () => {
 		const sessionManager = SessionManager.inMemory(tempDir);
 		sessionManager.appendMessage({ role: "system", content: "legacy prompt", timestamp: 1 });
 		sessionManager.appendMessage({ role: "user", content: "hi", timestamp: 2 });
 		const first = await createPromptableSession(sessionManager, {
 			extensionFactories: [extensionToolExtension],
 		});
-		expect(notices(sessionManager)).toHaveLength(1);
+		expect(notices(sessionManager)).toEqual([]);
 		first.session.dispose();
 		first.faux.unregister();
 
@@ -1011,7 +1003,7 @@ describe("tool selection snapshot resume", () => {
 				extensionFactories: [extensionToolExtension],
 			});
 			expect(repeat.session.getActiveToolNames().sort()).toEqual(["active_tool", "bash", "edit", "read", "write"]);
-			expect(notices(sessionManager)).toHaveLength(1);
+			expect(notices(sessionManager)).toEqual([]);
 			repeat.session.dispose();
 			repeat.faux.unregister();
 		}
@@ -1203,7 +1195,7 @@ describe("tool selection snapshot resume", () => {
 		faux.unregister();
 	});
 
-	it("notifies migration additions as a count with the entry carrying the names", async () => {
+	it("silently migrates defaults without notifying or appending a notice entry", async () => {
 		const sessionManager = SessionManager.inMemory(tempDir);
 		sessionManager.appendMessage({ role: "system", content: "legacy prompt", timestamp: 1 });
 		const { session, faux } = await createPromptableSession(sessionManager, {
@@ -1214,16 +1206,10 @@ describe("tool selection snapshot resume", () => {
 			notify: (message: string, type?: string) => notifications.push({ message, type }),
 		} as unknown as ExtensionUIContext;
 		await session.bindExtensions({ uiContext });
-		expect(notifications).toEqual([
-			{
-				message: "Legacy tool selection is unknown: 5 tools — names recorded in the session entry",
-				type: "warning",
-			},
-		]);
-		// The session entry still records the full name list for audit.
-		expect(notices(sessionManager)).toEqual([
-			{ kind: "legacy_unknown", tools: ["read", "bash", "edit", "write", "active_tool"] },
-		]);
+		await session.prompt("hi");
+		expect(session.getActiveToolNames().sort()).toEqual(["active_tool", "bash", "edit", "read", "write"]);
+		expect(notifications).toEqual([]);
+		expect(notices(sessionManager)).toEqual([]);
 		session.dispose();
 		faux.unregister();
 	});

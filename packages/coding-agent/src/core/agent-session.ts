@@ -285,11 +285,6 @@ function withoutDeletedHeaders(headers: ProviderHeaders | undefined): Record<str
 		: undefined;
 }
 
-/** Custom entry kind carrying the bounded tool-selection migration notice. */
-const TOOL_SELECTION_NOTICE_ENTRY = "tool_selection_notice";
-/** Maximum tool names listed in one migration notice. */
-const TOOL_SELECTION_NOTICE_MAX_NAMES = 32;
-
 export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
@@ -569,8 +564,6 @@ export class AgentSession {
 	private _lateRegistrationCutoff = false;
 	/** Default-active extension/SDK tool names, including registrations filtered from the active registry. */
 	private _registeredDefaultExtensionToolNames: ReadonlySet<string> = new Set();
-	/** Migration notices queued until a UI context is bound. */
-	private _pendingToolSelectionNotices: Array<{ message: string; type: "info" | "warning" }> = [];
 	/** Matches the `--tools` entries: tool names or patterns. */
 	private _allowedTools?: (name: string) => boolean;
 	/**
@@ -2074,7 +2067,6 @@ export class AgentSession {
 		const deltaHistory = hasToolStateDeltas(messages);
 
 		let baseNames: string[];
-		let mergedCandidates: string[] = [];
 		if (snapshot) {
 			this._toolSelectionSource = snapshot.source;
 			if (snapshot.source === "explicit") {
@@ -2083,7 +2075,6 @@ export class AgentSession {
 				baseNames = [...snapshot.selectedNames];
 			} else if (snapshot.selectedNames.length > 0) {
 				this._lateMergeDefaults = true;
-				mergedCandidates = candidates;
 				baseNames = [...snapshot.selectedNames, ...candidates];
 			} else if (deltaHistory) {
 				// An empty default selection backed by tool history stays empty: the transcript
@@ -2092,32 +2083,25 @@ export class AgentSession {
 				baseNames = [];
 			} else {
 				// Without any delta the empty selection only marks default mode, so current
-				// defaults apply.
+				// defaults apply silently.
 				this._lateMergeDefaults = true;
-				mergedCandidates = candidates;
 				baseNames = candidates;
 			}
 		} else {
-			// Legacy transcript without a snapshot: replay the recorded provider deltas.
+			// Legacy transcript without a snapshot: replay deltas when present; if there
+			// are none, keep the existing conservative default migration but do it silently.
 			const replayed = (current?.toolsAdded ?? []).map((tool) => tool.name);
 			if (!deltaHistory) {
-				// No recorded removal or addition, including legacy `noTools: all` sessions that
-				// wrote no tool event: the legacy state is unknown, so use current defaults.
 				this._lateMergeDefaults = true;
 				baseNames = candidates;
-				this._appendToolSelectionNotice("legacy_unknown", baseNames);
 			} else if (replayed.length === 0) {
-				// The transcript records a real selection that ended empty: keep it empty.
 				this._lateMergeDefaults = false;
 				baseNames = [];
 			} else {
-				// Keep the recorded state and add current default candidates never mentioned.
 				this._lateMergeDefaults = true;
-				mergedCandidates = candidates;
 				baseNames = [...replayed, ...candidates];
 			}
 		}
-		if (mergedCandidates.length > 0) this._appendToolSelectionNotice("migration_added", mergedCandidates);
 		const names = applyToolModifiers(baseNames, modifiers);
 		this._lateActivationToolNames = new Set(names);
 		this._lateKnownToolNames = new Set([...knownNames, ...previouslySelectedNames]);
@@ -2138,49 +2122,6 @@ export class AgentSession {
 			this._defaultToolModifiers,
 		);
 		return [...new Set([...settingNames, ...this._registeredDefaultExtensionToolNames])];
-	}
-
-	/**
-	 * Record a bounded migration notice as a session custom entry so the owner can tell an
-	 * unknown legacy state and newly added default tools apart. Repeated resumes do not append
-	 * a notice twice for the same kind and tool list.
-	 */
-	private _appendToolSelectionNotice(kind: "legacy_unknown" | "migration_added", toolNames: string[]): void {
-		if (toolNames.length === 0) return;
-		const tools = toolNames.slice(0, TOOL_SELECTION_NOTICE_MAX_NAMES);
-		const alreadyRecorded = this.sessionManager.getBranch().some((entry) => {
-			if (entry.type !== "custom" || entry.customType !== TOOL_SELECTION_NOTICE_ENTRY) return false;
-			const data = entry.data as { kind?: string; tools?: string[] } | undefined;
-			return data?.kind === kind && JSON.stringify(data.tools ?? []) === JSON.stringify(tools);
-		});
-		if (alreadyRecorded) return;
-		const truncated = toolNames.length > tools.length;
-		const entryId = this.sessionManager.appendCustomEntry(TOOL_SELECTION_NOTICE_ENTRY, {
-			kind,
-			tools,
-			truncated,
-		});
-		const entry = this.sessionManager.getEntry(entryId);
-		if (entry) this._emit({ type: "entry_appended", entry });
-		const label = kind === "legacy_unknown" ? "Legacy tool selection is unknown" : "New default tools added";
-		// Count-only UI line (SPEC-2026-11-06 r6 C6): the full name list lives in the
-		// tool_selection_notice entry above; enumerating 30+ names in the toast is
-		// noise for the owner.
-		const suffix = truncated ? " (list truncated)" : "";
-		const message = `${label}: ${toolNames.length} tools${suffix} — names recorded in the session entry`;
-		this._pendingToolSelectionNotices.push({ message, type: kind === "legacy_unknown" ? "warning" : "info" });
-		this._flushToolSelectionNotices();
-	}
-
-	/**
-	 * The `toolSelectionSnapshot` system event for the current selection, or undefined when the
-	 * transcript already records it. Empty selections are recorded like any other.
-	 */
-	private _flushToolSelectionNotices(): void {
-		const uiContext = this._extensionUIContext;
-		if (!uiContext) return;
-		for (const notice of this._pendingToolSelectionNotices) uiContext.notify(notice.message, notice.type);
-		this._pendingToolSelectionNotices = [];
 	}
 
 	private _toolSelectionSnapshotEvent(): SystemMessage | undefined {
@@ -2248,8 +2189,6 @@ export class AgentSession {
 		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
 		this._failedResponse = undefined;
 		this._recordSelection();
-		// Deliver migration notices before the provider request when the UI has been bound.
-		this._flushToolSelectionNotices();
 		// Record the selection before the provider request, including when it is empty, so a
 		// resume restores the intent instead of guessing it from declaration deltas.
 		this._injectToolSelectionSnapshot(messages);
@@ -4614,7 +4553,6 @@ export class AgentSession {
 	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
 		if (bindings.uiContext !== undefined) {
 			this._extensionUIContext = bindings.uiContext;
-			this._flushToolSelectionNotices();
 		}
 		if (bindings.mode !== undefined) {
 			this._extensionMode = bindings.mode;
@@ -4972,7 +4910,6 @@ export class AgentSession {
 						!this._lateKnownToolNames.has(toolName)
 					) {
 						nextActiveToolNames.push(toolName);
-						this._appendToolSelectionNotice("migration_added", [toolName]);
 					}
 				} else if (this._lateRegistrationCutoff) {
 					// Post-cutoff registration: the selection was already recorded by the first
