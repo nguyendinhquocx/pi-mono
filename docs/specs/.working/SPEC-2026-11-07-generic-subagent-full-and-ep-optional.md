@@ -81,12 +81,12 @@ supersedes: "SPEC-2026-11-06-li-resume-tool-loadout-and-ep-routing r6 (generic w
 ## Ordered Tasks
 
 ### T1 — Remove generic launch writer/EP gates (Python)
-- **Acceptance:** unbound generic read/write launches pass without Git identity, generic task binding, worktree, or no-active-EP preconditions; active EP does not block generic; generic never carries EP finish fields. Dedicated EP tests still require grant/run/task authority and retain `manualCompletion`/lease/baseline semantics.
-- **Verify:** focused `subagent-tab` route/launch tests, writer-lock tests updated for generic bypass, EP start/auth tests unchanged and passing; fake-spawn test verifies generic starts while same-project EP is active and no EP task state is mutated.
-- **Files:** `app_presets/pi/extensions/subagent-tab/index.ts`, `implement-launch-plan.ts`, generic launch tests; coordinate changes with session-trim's active WIP before editing.
+- **Acceptance:** unbound generic read/write launches pass without Git identity, generic task binding, worktree, or no-active-EP preconditions; active EP does not block generic; generic never carries EP finish fields. If caller omits `tools`, the child receives the normal full default toolset; `taskType`/prompt wording must not force a read-only allowlist. Dedicated EP tests still require grant/run/task authority and retain `manualCompletion`/lease/baseline semantics.
+- **Verify:** focused `subagent-tab` route/launch tests, writer-lock tests updated for generic bypass, EP start/auth tests unchanged and passing; fake-spawn test verifies generic starts while same-project EP is active and no EP task state is mutated. Tool description, promptGuidelines, and README state that generic is full/default and EP is optional.
+- **Files:** `app_presets/pi/extensions/subagent-tab/index.ts`, `implement-launch-plan.ts`, `README.md`, generic launch tests; coordinate changes with session-trim's active WIP before editing.
 
 ### T2 — Allow up to 10 parallel generic children (Python)
-- **Acceptance:** batch schema/runtime accept 10 tasks and `maxConcurrent: 10`; default ceilings allow that request; fake-spawn test sees all 10 generic writer attempts independently classified/reported; explicit smaller budget and failFast still work.
+- **Acceptance:** batch schema/runtime accept 10 tasks and `maxConcurrent: 10`; default ceilings allow that request without requiring a manifest or worktree; fake-spawn test sees all 10 generic writer attempts independently classified/reported; explicit smaller budget and failFast still work.
 - **Verify:** `batch-launch.test.ts`, schema validation tests and a bounded fake-runtime smoke; no real WezTerm pane is opened by tests.
 - **Files:** batch tool schema/validation/runtime and `batch-launch.test.ts`; coordinate with session-trim.
 
