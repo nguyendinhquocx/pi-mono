@@ -81,6 +81,11 @@ import type {
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeResult,
 	SessionBoundaryDraft,
+	SessionDataLeaseInspectionResult,
+	SessionDataLockReleaseResult,
+	SessionDataLockResult,
+	SessionDataReplaceResult,
+	SessionReloadResult,
 	SessionShutdownEvent,
 	ToolCallEvent,
 	ToolCallEventResult,
@@ -376,6 +381,38 @@ export class ExtensionRunner {
 	private isProjectTrustedFn: () => boolean = () => true;
 	private getSignalFn: () => AbortSignal | undefined = () => undefined;
 	private waitForIdleFn: () => Promise<void> = async () => {};
+	private inspectSessionDataLeaseFn: () => Promise<SessionDataLeaseInspectionResult> = async () => ({
+		status: "refused",
+		code: "unsupported_mode",
+		message: "session data lock API is unavailable in this mode",
+	});
+	private acquireSessionDataLockFn: () => Promise<SessionDataLockResult> = async () => ({
+		status: "refused",
+		code: "unsupported_mode",
+		message: "session data lock API is unavailable in this mode",
+	});
+	private releaseSessionDataLockFn: (lockId: string) => Promise<SessionDataLockReleaseResult> = async () => ({
+		status: "refused",
+		code: "unsupported_mode",
+		message: "session data lock API is unavailable in this mode",
+	});
+	private replaceSessionDataTranscriptFn: (options: {
+		candidatePath: string;
+		lockId: string;
+		backupName?: string;
+	}) => Promise<SessionDataReplaceResult> = async () => ({
+		status: "refused",
+		code: "unsupported_mode",
+		message: "guarded transcript replacement is unavailable in this mode",
+	});
+	private reloadSessionFromDiskFn: (options: {
+		expectedFingerprint: string;
+		lockId: string;
+	}) => Promise<SessionReloadResult> = async () => ({
+		status: "refused",
+		code: "unsupported_mode",
+		message: "session refresh API is unavailable in this mode",
+	});
 	private abortFn: () => void = () => {};
 	private hasPendingMessagesFn: () => boolean = () => false;
 	private getContextUsageFn: () => ContextUsage | undefined = () => undefined;
@@ -553,6 +590,41 @@ export class ExtensionRunner {
 	bindCommandContext(actions?: ExtensionCommandContextActions): void {
 		if (actions) {
 			this.waitForIdleFn = actions.waitForIdle;
+			this.inspectSessionDataLeaseFn =
+				actions.inspectSessionDataLease ??
+				(async () => ({
+					status: "refused",
+					code: "unsupported_mode",
+					message: "session data lock API is unavailable in this mode",
+				}));
+			this.acquireSessionDataLockFn =
+				actions.acquireSessionDataLock ??
+				(async () => ({
+					status: "refused",
+					code: "unsupported_mode",
+					message: "session data lock API is unavailable in this mode",
+				}));
+			this.releaseSessionDataLockFn =
+				actions.releaseSessionDataLock ??
+				(async () => ({
+					status: "refused",
+					code: "unsupported_mode",
+					message: "session data lock API is unavailable in this mode",
+				}));
+			this.replaceSessionDataTranscriptFn =
+				actions.replaceSessionDataTranscript ??
+				(async () => ({
+					status: "refused",
+					code: "unsupported_mode",
+					message: "guarded transcript replacement is unavailable in this mode",
+				}));
+			this.reloadSessionFromDiskFn =
+				actions.reloadSessionFromDisk ??
+				(async () => ({
+					status: "refused",
+					code: "unsupported_mode",
+					message: "session refresh API is unavailable in this mode",
+				}));
 			this.newSessionHandler = actions.newSession;
 			this.forkHandler = actions.fork;
 			this.navigateTreeHandler = actions.navigateTree;
@@ -562,6 +634,31 @@ export class ExtensionRunner {
 		}
 
 		this.waitForIdleFn = async () => {};
+		this.inspectSessionDataLeaseFn = async () => ({
+			status: "refused",
+			code: "unsupported_mode",
+			message: "session data lock API is unavailable in this mode",
+		});
+		this.acquireSessionDataLockFn = async () => ({
+			status: "refused",
+			code: "unsupported_mode",
+			message: "session data lock API is unavailable in this mode",
+		});
+		this.releaseSessionDataLockFn = async () => ({
+			status: "refused",
+			code: "unsupported_mode",
+			message: "session data lock API is unavailable in this mode",
+		});
+		this.replaceSessionDataTranscriptFn = async () => ({
+			status: "refused",
+			code: "unsupported_mode",
+			message: "guarded transcript replacement is unavailable in this mode",
+		});
+		this.reloadSessionFromDiskFn = async () => ({
+			status: "refused",
+			code: "unsupported_mode",
+			message: "session refresh API is unavailable in this mode",
+		});
 		this.newSessionHandler = async () => ({ cancelled: false });
 		this.forkHandler = async () => ({ cancelled: false });
 		this.navigateTreeHandler = async () => ({ cancelled: false });
@@ -1009,6 +1106,26 @@ export class ExtensionRunner {
 		context.waitForIdle = () => {
 			this.assertActive();
 			return this.waitForIdleFn();
+		};
+		context.inspectSessionDataLease = () => {
+			this.assertActive();
+			return this.inspectSessionDataLeaseFn();
+		};
+		context.acquireSessionDataLock = () => {
+			this.assertActive();
+			return this.acquireSessionDataLockFn();
+		};
+		context.releaseSessionDataLock = (lockId) => {
+			this.assertActive();
+			return this.releaseSessionDataLockFn(lockId);
+		};
+		context.replaceSessionDataTranscript = (options) => {
+			this.assertActive();
+			return this.replaceSessionDataTranscriptFn(options);
+		};
+		context.reloadSessionFromDisk = (options) => {
+			this.assertActive();
+			return this.reloadSessionFromDiskFn(options);
 		};
 		context.newSession = (options) => {
 			this.assertActive();

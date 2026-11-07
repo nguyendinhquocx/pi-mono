@@ -398,12 +398,78 @@ export interface ExtensionToolContext extends ExtensionContext {
  * Extended context for command handlers.
  * Includes session control methods only safe in user-initiated commands.
  */
+export type SessionDataRefusalCode =
+	| "unsupported_mode"
+	| "not_persisted"
+	| "not_idle"
+	| "pending_work"
+	| "lease_missing"
+	| "lease_conflict"
+	| "lock_missing"
+	| "write_guard_unavailable"
+	| "writer_conflict"
+	| "registry_invalid"
+	| "recovery_blocked"
+	| "promotion_required"
+	| "identity_changed"
+	| "fingerprint_mismatch"
+	| "invalid_transcript"
+	| "projection_mismatch"
+	| "session_data_locked"
+	| "io_error"
+	| "commit_error";
+
+export type SessionDataLeaseInspectionResult =
+	| { status: "ready"; sessionId: string; leaseId: string; protocolVersion: number }
+	| { status: "refused"; code: SessionDataRefusalCode; message: string };
+
+export type SessionDataLockResult =
+	| { status: "acquired"; lockId: string; sessionId: string }
+	| { status: "refused"; code: SessionDataRefusalCode; message: string };
+
+export type SessionDataLockReleaseResult =
+	| { status: "released"; lockId: string }
+	| { status: "refused"; code: SessionDataRefusalCode; message: string };
+
+export type SessionDataReplaceResult =
+	| { status: "replaced"; lockId: string; fingerprint: string }
+	| { status: "refused"; code: SessionDataRefusalCode; message: string; observedFingerprint?: string };
+
+export type SessionReloadResult =
+	| { status: "reloaded"; sessionId: string; fingerprint: string; entryCount: number }
+	| {
+			status: "refused";
+			code: SessionDataRefusalCode;
+			message: string;
+			observedFingerprint?: string;
+	  }
+	| { status: "failed"; code: "io_error" | "commit_error"; message: string };
+
 export interface ExtensionCommandContext extends ExtensionContext {
 	/** Get the current base system-prompt construction options. */
 	getSystemPromptOptions(): BuildSystemPromptOptions;
 
 	/** Wait for the agent to finish streaming */
 	waitForIdle(): Promise<void>;
+
+	/** Read-only pre-preview inspection of the current session's lease and trim gate. */
+	inspectSessionDataLease(): Promise<SessionDataLeaseInspectionResult>;
+
+	/** Acquire the in-process admission gate, registry claim, and OS transcript guard. */
+	acquireSessionDataLock(): Promise<SessionDataLockResult>;
+
+	/** Release a lock after refresh/rollback completes. */
+	releaseSessionDataLock(lockId: string): Promise<SessionDataLockReleaseResult>;
+
+	/** Atomically replace the transcript through the held OS guard and re-lock the published path. */
+	replaceSessionDataTranscript(options: {
+		candidatePath: string;
+		lockId: string;
+		backupName?: string;
+	}): Promise<SessionDataReplaceResult>;
+
+	/** Refresh transcript projection in place without restarting extension/runtime state. */
+	reloadSessionFromDisk(options: { expectedFingerprint: string; lockId: string }): Promise<SessionReloadResult>;
 
 	/** Start a new session, optionally with initialization. */
 	newSession(options?: {
@@ -2238,6 +2304,15 @@ export interface ExtensionContextActions {
  */
 export interface ExtensionCommandContextActions {
 	waitForIdle: () => Promise<void>;
+	inspectSessionDataLease?: () => Promise<SessionDataLeaseInspectionResult>;
+	acquireSessionDataLock?: () => Promise<SessionDataLockResult>;
+	releaseSessionDataLock?: (lockId: string) => Promise<SessionDataLockReleaseResult>;
+	replaceSessionDataTranscript?: (options: {
+		candidatePath: string;
+		lockId: string;
+		backupName?: string;
+	}) => Promise<SessionDataReplaceResult>;
+	reloadSessionFromDisk?: (options: { expectedFingerprint: string; lockId: string }) => Promise<SessionReloadResult>;
 	newSession: (options?: {
 		parentSession?: string;
 		setup?: (sessionManager: SessionManager) => Promise<void>;

@@ -72,8 +72,14 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		return { id, type: "response", command, success: true, data } as RpcResponse;
 	};
 
-	const error = (id: string | undefined, command: string, message: string): RpcResponse => {
-		return { id, type: "response", command, success: false, error: message };
+	const error = (id: string | undefined, command: string, message: string, code?: string): RpcResponse => {
+		return { id, type: "response", command, success: false, error: message, ...(code ? { code } : {}) };
+	};
+
+	const errorCode = (errorValue: unknown): string | undefined => {
+		if (typeof errorValue !== "object" || errorValue === null || !("code" in errorValue)) return undefined;
+		const code = (errorValue as { code?: unknown }).code;
+		return typeof code === "string" ? code : undefined;
 	};
 
 	// Pending extension UI requests waiting for response
@@ -321,6 +327,11 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			mode: "rpc",
 			commandContextActions: {
 				waitForIdle: () => session.waitForIdle(),
+				inspectSessionDataLease: () => session.inspectSessionDataLease(),
+				acquireSessionDataLock: () => session.acquireSessionDataLock(),
+				releaseSessionDataLock: (lockId) => session.releaseSessionDataLock(lockId),
+				replaceSessionDataTranscript: (options) => session.replaceSessionDataTranscript(options),
+				reloadSessionFromDisk: (options) => session.reloadSessionFromDisk(options),
 				newSession: async (options) => runtimeHost.newSession(options),
 				fork: async (entryId, forkOptions) => {
 					const result = await runtimeHost.fork(entryId, forkOptions);
@@ -407,7 +418,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					})
 					.catch((e) => {
 						if (!preflightSucceeded) {
-							output(error(id, "prompt", e.message));
+							output(error(id, "prompt", e.message, errorCode(e)));
 						}
 					});
 				return undefined;
@@ -793,6 +804,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					command.id,
 					command.type,
 					commandError instanceof Error ? commandError.message : String(commandError),
+					errorCode(commandError),
 				),
 			);
 			await waitForRawStdoutBackpressure();

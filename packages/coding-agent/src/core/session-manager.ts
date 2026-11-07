@@ -38,7 +38,9 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.ts";
+import { parseJsonStrict } from "./session-open-lease.ts";
 export const CURRENT_SESSION_VERSION = 3;
+const VALID_THINKING_LEVELS: ReadonlySet<string> = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 /** Every entry type this build can parse and persist. Anything else fails closed. */
 export const KNOWN_SESSION_ENTRY_TYPES: ReadonlySet<string> = new Set([
@@ -60,6 +62,36 @@ export const KNOWN_SESSION_ENTRY_TYPES: ReadonlySet<string> = new Set([
  * build supports). The file must stay byte-identical: a runtime that cannot
  * understand the format must not repair, migrate, or rewrite it.
  */
+/**
+ * Strict transcript parse refusal. Carries a stable reason string so reload
+ * refusals can quote it instead of crashing or silently skipping lines.
+ */
+export class SessionTranscriptParseError extends Error {
+	readonly reason: string;
+	readonly line?: number;
+
+	constructor(reason: string, line?: number) {
+		super(
+			line === undefined
+				? `Invalid session transcript: ${reason}`
+				: `Invalid session transcript (line ${line}): ${reason}`,
+		);
+		this.name = "SessionTranscriptParseError";
+		this.reason = reason;
+		this.line = line;
+	}
+}
+
+/** Raised when a mutation is refused because a session-data lock gates writes. */
+export class SessionWriteGatedError extends Error {
+	readonly code = "session_data_locked" as const;
+
+	constructor(message = "session data lock is held; transcript writes are refused") {
+		super(message);
+		this.name = "SessionWriteGatedError";
+	}
+}
+
 export class UnsupportedSessionVersionError extends Error {
 	constructor(version: number, filePath: string, appName: string) {
 		super(
@@ -433,6 +465,463 @@ export function parseSessionEntries(content: string): FileEntry[] {
 	}
 
 	return entries;
+}
+
+// ===========================================================================
+// Strict transcript parsing + staged in-place reload (session-trim spec)
+// ===========================================================================
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isFiniteNumber(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value);
+}
+
+function isUsageLike(value: unknown): boolean {
+	if (!isPlainObject(value)) return false;
+	for (const key of ["input", "output", "cacheRead", "cacheWrite"]) {
+		if (!isFiniteNumber(value[key])) return false;
+	}
+	if (value.totalTokens !== undefined && !isFiniteNumber(value.totalTokens)) return false;
+	if (value.cost !== undefined) {
+		if (!isPlainObject(value.cost)) return false;
+		for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"]) {
+			if (value.cost[key] !== undefined && !isFiniteNumber(value.cost[key])) return false;
+		}
+	}
+	return true;
+}
+
+function isMessageContent(value: unknown): boolean {
+	if (typeof value === "string") return true;
+	if (!Array.isArray(value)) return false;
+	return value.every((block) => {
+		if (!isPlainObject(block) || typeof block.type !== "string") return false;
+		if (block.type === "text") return typeof block.text === "string";
+		if (block.type === "image") return typeof block.data === "string" && typeof block.mimeType === "string";
+		if (block.type === "toolCall") {
+			return typeof block.id === "string" && typeof block.name === "string" && isPlainObject(block.arguments);
+		}
+		if (block.type === "thinking" || block.type === "redactedThinking")
+			return typeof block.thinking === "string" || typeof block.data === "string";
+		return false;
+	});
+}
+
+function validateStrictEntryFields(entry: Record<string, unknown>, line: number, version: number): void {
+	const type = entry.type as string;
+	if (version >= 2 && (typeof entry.id !== "string" || entry.id.length === 0)) {
+		throw new SessionTranscriptParseError(`${type} entry is missing a string id`, line);
+	}
+	if (entry.id !== undefined && (typeof entry.id !== "string" || entry.id.length === 0)) {
+		throw new SessionTranscriptParseError(`${type} entry id must be a non-empty string`, line);
+	}
+	if (version >= 2 && entry.parentId !== null && typeof entry.parentId !== "string") {
+		throw new SessionTranscriptParseError(`${type} entry parentId must be null or a string`, line);
+	}
+	if (entry.parentId !== undefined && entry.parentId !== null && typeof entry.parentId !== "string") {
+		throw new SessionTranscriptParseError(`${type} entry parentId must be null or a string`, line);
+	}
+	if (typeof entry.timestamp !== "string") {
+		throw new SessionTranscriptParseError(`${type} entry is missing a string timestamp`, line);
+	}
+
+	switch (type) {
+		case "message": {
+			const message = entry.message;
+			if (!isPlainObject(message) || typeof message.role !== "string") {
+				throw new SessionTranscriptParseError("message entry needs an object message with a role", line);
+			}
+			if (!isFiniteNumber(message.timestamp)) {
+				throw new SessionTranscriptParseError("message needs a numeric timestamp", line);
+			}
+			if (message.usage !== undefined && !isUsageLike(message.usage)) {
+				throw new SessionTranscriptParseError("message usage must be a usage object", line);
+			}
+			switch (message.role) {
+				case "user":
+					if (!isMessageContent(message.content)) {
+						throw new SessionTranscriptParseError(
+							"user message content must be a string or valid content-block array",
+							line,
+						);
+					}
+					break;
+				case "assistant":
+					if (
+						typeof message.api !== "string" ||
+						typeof message.provider !== "string" ||
+						typeof message.model !== "string" ||
+						!Array.isArray(message.content) ||
+						!isMessageContent(message.content) ||
+						!["stop", "length", "toolUse", "error", "aborted"].includes(String(message.stopReason))
+					) {
+						throw new SessionTranscriptParseError(
+							"assistant message has an invalid model, content, or stopReason",
+							line,
+						);
+					}
+					break;
+				case "toolResult":
+					if (
+						typeof message.toolCallId !== "string" ||
+						typeof message.toolName !== "string" ||
+						!Array.isArray(message.content) ||
+						!isMessageContent(message.content) ||
+						typeof message.isError !== "boolean"
+					) {
+						throw new SessionTranscriptParseError("toolResult message has invalid required fields", line);
+					}
+					break;
+				case "system":
+					if (typeof message.content !== "string") {
+						throw new SessionTranscriptParseError("system message content must be a string", line);
+					}
+					break;
+				case "custom":
+				case "hookMessage":
+					if (
+						typeof message.customType !== "string" ||
+						!isMessageContent(message.content) ||
+						typeof message.display !== "boolean"
+					) {
+						throw new SessionTranscriptParseError("custom/hook message has invalid required fields", line);
+					}
+					break;
+				case "bashExecution":
+					if (
+						typeof message.command !== "string" ||
+						typeof message.output !== "string" ||
+						(message.exitCode !== undefined && !isFiniteNumber(message.exitCode)) ||
+						typeof message.cancelled !== "boolean" ||
+						typeof message.truncated !== "boolean"
+					) {
+						throw new SessionTranscriptParseError("bashExecution message has invalid required fields", line);
+					}
+					break;
+				default:
+					throw new SessionTranscriptParseError(`unknown message role "${message.role}"`, line);
+			}
+			break;
+		}
+		case "thinking_level_change":
+			if (typeof entry.thinkingLevel !== "string" || !VALID_THINKING_LEVELS.has(entry.thinkingLevel)) {
+				throw new SessionTranscriptParseError("thinking_level_change has an unknown thinkingLevel", line);
+			}
+			break;
+		case "model_change":
+			if (typeof entry.provider !== "string" || typeof entry.modelId !== "string") {
+				throw new SessionTranscriptParseError("model_change needs string provider and modelId", line);
+			}
+			break;
+		case "usage": {
+			if (typeof entry.kind !== "string" || typeof entry.provider !== "string" || typeof entry.model !== "string") {
+				throw new SessionTranscriptParseError("usage entry needs string kind/provider/model", line);
+			}
+			if (!isUsageLike(entry.usage)) {
+				throw new SessionTranscriptParseError("usage entry needs a usage object", line);
+			}
+			break;
+		}
+		case "compaction": {
+			if (version === 1) {
+				if (
+					(entry.firstKeptEntryIndex !== undefined && !Number.isInteger(entry.firstKeptEntryIndex)) ||
+					(entry.firstKeptEntryId !== undefined && typeof entry.firstKeptEntryId !== "string")
+				) {
+					throw new SessionTranscriptParseError("legacy compaction kept-entry reference is invalid", line);
+				}
+			} else if (typeof entry.firstKeptEntryId !== "string") {
+				throw new SessionTranscriptParseError("compaction needs a string firstKeptEntryId", line);
+			}
+			if (entry.fromHook !== undefined && typeof entry.fromHook !== "boolean") {
+				throw new SessionTranscriptParseError("compaction fromHook must be a boolean", line);
+			}
+			if (entry.usage !== undefined && !isUsageLike(entry.usage)) {
+				throw new SessionTranscriptParseError("compaction usage must be a usage object", line);
+			}
+			if (typeof entry.summary !== "string") {
+				throw new SessionTranscriptParseError("compaction needs a string summary", line);
+			}
+			if (typeof entry.tokensBefore !== "number") {
+				throw new SessionTranscriptParseError("compaction needs a numeric tokensBefore", line);
+			}
+			break;
+		}
+		case "branch_summary":
+			if (entry.fromHook !== undefined && typeof entry.fromHook !== "boolean") {
+				throw new SessionTranscriptParseError("branch_summary fromHook must be a boolean", line);
+			}
+			if (entry.usage !== undefined && !isUsageLike(entry.usage)) {
+				throw new SessionTranscriptParseError("branch_summary usage must be a usage object", line);
+			}
+			if (typeof entry.fromId !== "string" || typeof entry.summary !== "string") {
+				throw new SessionTranscriptParseError("branch_summary needs string fromId and summary", line);
+			}
+			break;
+		case "custom":
+			if (typeof entry.customType !== "string") {
+				throw new SessionTranscriptParseError("custom entry needs a string customType", line);
+			}
+			break;
+		case "label":
+			if (typeof entry.targetId !== "string") {
+				throw new SessionTranscriptParseError("label entry needs a string targetId", line);
+			}
+			break;
+		case "session_info":
+			if (entry.name !== undefined && typeof entry.name !== "string") {
+				throw new SessionTranscriptParseError("session_info name must be a string", line);
+			}
+			break;
+		case "custom_message": {
+			if (typeof entry.customType !== "string") {
+				throw new SessionTranscriptParseError("custom_message needs a string customType", line);
+			}
+			const content = entry.content;
+			if (typeof content !== "string" && !Array.isArray(content)) {
+				throw new SessionTranscriptParseError("custom_message content must be a string or array", line);
+			}
+			if (typeof entry.display !== "boolean") {
+				throw new SessionTranscriptParseError("custom_message needs a boolean display", line);
+			}
+			break;
+		}
+		case "context_edit": {
+			if (typeof entry.targetId !== "string") {
+				throw new SessionTranscriptParseError("context_edit needs a string targetId", line);
+			}
+			const replacement = entry.replacement;
+			if (replacement !== null && (!isPlainObject(replacement) || !isMessageContent(replacement.content))) {
+				throw new SessionTranscriptParseError(
+					"context_edit replacement must be null or contain valid content",
+					line,
+				);
+			}
+			break;
+		}
+		default:
+			throw new SessionTranscriptParseError(`unknown entry type "${type}"`, line);
+	}
+}
+
+function validateStrictHeader(header: Record<string, unknown>): SessionHeader {
+	if (header.type !== "session") {
+		throw new SessionTranscriptParseError('first line must be a "session" header');
+	}
+	if (header.id === undefined) {
+		throw new SessionTranscriptParseError("session header is missing an id");
+	}
+	if (typeof header.id !== "string") {
+		throw new SessionTranscriptParseError("session header id must be a string");
+	}
+	if (header.version !== undefined) {
+		if (typeof header.version !== "number" || !Number.isInteger(header.version)) {
+			throw new SessionTranscriptParseError("session header version must be an integer");
+		}
+		if (header.version < 1 || header.version > CURRENT_SESSION_VERSION) {
+			throw new SessionTranscriptParseError(`unsupported session version ${header.version}`);
+		}
+	}
+	if (typeof header.timestamp !== "string") {
+		throw new SessionTranscriptParseError("session header is missing a string timestamp");
+	}
+	if (typeof header.cwd !== "string") {
+		throw new SessionTranscriptParseError("session header is missing a string cwd");
+	}
+	if (header.parentSession !== undefined && typeof header.parentSession !== "string") {
+		throw new SessionTranscriptParseError("session header parentSession must be a string");
+	}
+	return header as unknown as SessionHeader;
+}
+
+/**
+ * Parse every entry from raw transcript bytes, refusing instead of repairing.
+ *
+ * Unlike {@link loadEntriesFromFile} (skips malformed lines, repairs the
+ * trailing newline) and {@link SessionManager['_loadEntries']} (may migrate and
+ * rewrite the file), this parser refuses: unknown entry types, unknown
+ * versions, malformed JSON, duplicate ids, invalid `parentId` shapes, and
+ * active-path gaps/cycles/forward edges all fail with a typed reason.
+ */
+export function parseSessionTranscriptStrict(raw: string): { header: SessionHeader; entries: SessionEntry[] } {
+	const withoutTrailingNewline = raw.endsWith("\n") ? raw.slice(0, -1) : raw;
+	const lines = withoutTrailingNewline.split("\n");
+	if (lines.length === 0 || (lines.length === 1 && lines[0]!.trim() === "")) {
+		throw new SessionTranscriptParseError("transcript is empty");
+	}
+
+	const headerRecord = parseStrictLine(lines[0]!, 1);
+	const header = validateStrictHeader(headerRecord);
+	const version = header.version ?? 1;
+
+	const entries: SessionEntry[] = [];
+	const idsByLine: string[] = [];
+	const seenIds = new Set<string>();
+	let previousLegacyId: string | null = null;
+	for (let i = 1; i < lines.length; i++) {
+		const line = lines[i]!;
+		if (line.trim() === "") {
+			throw new SessionTranscriptParseError("blank line inside transcript", i + 1);
+		}
+		const record = parseStrictLine(line, i + 1);
+		if (!isPlainObject(record) || typeof record.type !== "string") {
+			throw new SessionTranscriptParseError("entry is missing a string type", i + 1);
+		}
+		if (!KNOWN_SESSION_ENTRY_TYPES.has(record.type)) {
+			throw new SessionTranscriptParseError(`unknown entry type "${record.type}"`, i + 1);
+		}
+		validateStrictEntryFields(record, i + 1, version);
+		if (version === 1) {
+			if (record.id === undefined) record.id = `legacy-${i}`;
+			if (record.parentId === undefined) record.parentId = previousLegacyId;
+			if (record.type === "compaction") {
+				if (record.firstKeptEntryId === undefined) {
+					const keptIndex = record.firstKeptEntryIndex;
+					const target = typeof keptIndex === "number" ? [headerRecord, ...entries][keptIndex] : undefined;
+					record.firstKeptEntryId =
+						target && target.type !== "session" && typeof target.id === "string" ? target.id : record.id;
+				}
+				delete record.firstKeptEntryIndex;
+			}
+			if (record.type === "message" && isPlainObject(record.message) && record.message.role === "hookMessage") {
+				record.message.role = "custom";
+			}
+		}
+		const id = record.id as string;
+		if (seenIds.has(id)) {
+			throw new SessionTranscriptParseError(`duplicate entry id "${id}"`, i + 1);
+		}
+		seenIds.add(id);
+		idsByLine.push(id);
+		entries.push(record as unknown as SessionEntry);
+		previousLegacyId = id;
+	}
+	validateStrictPathResolution(header, entries, idsByLine);
+	return { header, entries };
+}
+
+function parseStrictLine(line: string, lineNo: number): Record<string, unknown> {
+	let parsed: unknown;
+	try {
+		parsed = parseJsonStrict(line);
+	} catch (error) {
+		throw new SessionTranscriptParseError(
+			`malformed JSON: ${error instanceof Error ? error.message : String(error)}`,
+			lineNo,
+		);
+	}
+	if (!isPlainObject(parsed)) {
+		throw new SessionTranscriptParseError("line is not a JSON object", lineNo);
+	}
+	return parsed;
+}
+
+/**
+ * Active-path validation: walk from the file leaf up by parentId. Every parent
+ * must resolve, no cycles, and every parent must appear before its child in
+ * the file (no forward edges). Dangling refs are allowed only off the active
+ * path (retained off-branch state).
+ */
+function validateStrictPathResolution(header: SessionHeader, entries: SessionEntry[], idsByLine: string[]): void {
+	if (entries.length === 0) return;
+	const indexById = new Map<string, number>();
+	for (const [index, id] of idsByLine.entries()) {
+		indexById.set(id, index);
+	}
+	const entryById = new Map<string, SessionEntry>();
+	for (const entry of entries) entryById.set(entry.id, entry);
+	for (const [index, entry] of entries.entries()) {
+		if (entry.parentId === null) continue;
+		const parentIndex = indexById.get(entry.parentId);
+		if (parentIndex !== undefined && parentIndex >= index) {
+			throw new SessionTranscriptParseError(`entry "${entry.id}" has a forward edge to parent "${entry.parentId}"`);
+		}
+	}
+
+	let leaf = entries[entries.length - 1]!;
+	const visited = new Set<string>([leaf.id]);
+	while (true) {
+		const parentId = leaf.parentId;
+		if (parentId === null || parentId === undefined) break;
+		const parentIndex = indexById.get(parentId);
+		if (parentIndex === undefined) {
+			throw new SessionTranscriptParseError(
+				`active path is broken: entry "${leaf.id}" references missing parent "${parentId}"`,
+			);
+		}
+		if (parentIndex >= indexById.get(leaf.id)!) {
+			throw new SessionTranscriptParseError(
+				`active path has a forward edge: parent "${parentId}" appears after child "${leaf.id}"`,
+			);
+		}
+		if (visited.has(parentId)) {
+			throw new SessionTranscriptParseError(`active path has a cycle at "${parentId}"`);
+		}
+		visited.add(parentId);
+		leaf = entryById.get(parentId)!;
+	}
+	for (const entry of entries) {
+		if (entry.type !== "compaction" || !visited.has(entry.id) || entry.firstKeptEntryId === entry.id) continue;
+		const boundaryIndex = indexById.get(entry.id)!;
+		const keptIndex = indexById.get(entry.firstKeptEntryId);
+		if (keptIndex === undefined || keptIndex >= boundaryIndex || !visited.has(entry.firstKeptEntryId)) {
+			throw new SessionTranscriptParseError(
+				`active compaction "${entry.id}" has an invalid firstKeptEntryId "${entry.firstKeptEntryId}"`,
+			);
+		}
+	}
+	if (typeof header.id !== "string" || header.id.length === 0) {
+		throw new SessionTranscriptParseError("session header id is empty");
+	}
+}
+
+/** Staged in-place reload: parsed entries plus prebuilt indices, not yet committed. */
+export interface StagedSessionReload {
+	header: SessionHeader;
+	entries: FileEntry[];
+	byId: Map<string, SessionEntry>;
+	labelsById: Map<string, string>;
+	labelTimestampsById: Map<string, string>;
+	leafId: string | null;
+	sessionId: string;
+	entryCount: number;
+	/** Raw source bytes the stage was parsed from (for provenance checks). */
+	raw: string;
+}
+
+/** Build a reload stage from strict-parsed entries without touching live state. */
+export function buildStagedReload(header: SessionHeader, entries: SessionEntry[], raw: string): StagedSessionReload {
+	const byId = new Map<string, SessionEntry>();
+	const labelsById = new Map<string, string>();
+	const labelTimestampsById = new Map<string, string>();
+	let leafId: string | null = null;
+	for (const entry of entries) {
+		byId.set(entry.id, entry);
+		leafId = entry.id;
+		if (entry.type === "label") {
+			if (entry.label) {
+				labelsById.set(entry.targetId, entry.label);
+				labelTimestampsById.set(entry.targetId, entry.timestamp);
+			} else {
+				labelsById.delete(entry.targetId);
+				labelTimestampsById.delete(entry.targetId);
+			}
+		}
+	}
+	return {
+		header,
+		entries: [header, ...entries],
+		byId,
+		labelsById,
+		labelTimestampsById,
+		leafId,
+		sessionId: header.id,
+		entryCount: entries.length,
+		raw,
+	};
 }
 
 export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEntry | null {
@@ -1066,6 +1555,8 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
+	/** In-process admission gate installed synchronously by AgentSession locks. */
+	private writeGate: (() => string | undefined) | undefined;
 
 	private constructor(
 		cwd: string,
@@ -1093,6 +1584,7 @@ export class SessionManager {
 
 	/** Switch to a different session file (used for resume and branching) */
 	setSessionFile(sessionFile: string): void {
+		this.#refuseIfGated();
 		this._setSessionFile(sessionFile);
 	}
 
@@ -1125,6 +1617,7 @@ export class SessionManager {
 	}
 
 	newSession(options?: NewSessionOptions): string | undefined {
+		this.#refuseIfGated();
 		if (options?.id !== undefined) {
 			assertValidSessionId(options.id);
 		}
@@ -1192,6 +1685,7 @@ export class SessionManager {
 	}
 
 	private _rewriteFile(): void {
+		this.#refuseIfGated();
 		if (!this.persist || !this.sessionFile) return;
 		const fd = openSync(this.sessionFile, "w");
 		try {
@@ -1240,6 +1734,7 @@ export class SessionManager {
 	}
 
 	_persist(entry: SessionEntry): void {
+		this.#refuseIfGated();
 		if (!this.persist || !this.sessionFile) return;
 
 		if (!this.flushed) {
@@ -1259,6 +1754,7 @@ export class SessionManager {
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
+		this.#refuseIfGated();
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
@@ -1504,6 +2000,68 @@ export class SessionManager {
 	}
 
 	/**
+	 * Install or clear an in-process write gate. Set synchronously before any
+	 * await/native guard acquisition so persistence and all append paths fail
+	 * closed throughout the mutation transaction.
+	 */
+	setWriteGate(gate: (() => string | undefined) | undefined): void {
+		this.writeGate = gate;
+	}
+
+	/** Check whether the current write gate refuses new mutations. */
+	checkWriteGate(): string | undefined {
+		return this.writeGate?.();
+	}
+
+	#refuseIfGated(): void {
+		const reason = this.writeGate?.();
+		if (reason !== undefined) throw new SessionWriteGatedError(reason);
+	}
+
+	/** Strictly parse candidate bytes and build staged indices without side effects. */
+	stageReload(raw: string): StagedSessionReload {
+		const { header, entries } = parseSessionTranscriptStrict(raw);
+		if ((header.version ?? 1) !== CURRENT_SESSION_VERSION) {
+			throw new SessionTranscriptParseError(
+				`in-place reload requires a v${CURRENT_SESSION_VERSION} transcript; legacy versions must be migrated before runtime start`,
+			);
+		}
+		return buildStagedReload(header, entries, raw);
+	}
+
+	/**
+	 * Commit a staged session synchronously, restoring a full snapshot if any
+	 * assignment fails. The session file path and persisted identity stay put.
+	 */
+	commitStagedReload(stage: StagedSessionReload): void {
+		const snapshotEntries = this.fileEntries;
+		const snapshotById = this.byId;
+		const snapshotLabels = this.labelsById;
+		const snapshotLabelTimestamps = this.labelTimestampsById;
+		const snapshotLeafId = this.leafId;
+		const snapshotSessionId = this.sessionId;
+		const snapshotFlushed = this.flushed;
+		try {
+			this.fileEntries = stage.entries;
+			this.byId = stage.byId;
+			this.labelsById = stage.labelsById;
+			this.labelTimestampsById = stage.labelTimestampsById;
+			this.leafId = stage.leafId;
+			this.sessionId = stage.sessionId;
+			this.flushed = true;
+		} catch (error) {
+			this.fileEntries = snapshotEntries;
+			this.byId = snapshotById;
+			this.labelsById = snapshotLabels;
+			this.labelTimestampsById = snapshotLabelTimestamps;
+			this.leafId = snapshotLeafId;
+			this.sessionId = snapshotSessionId;
+			this.flushed = snapshotFlushed;
+			throw error;
+		}
+	}
+
+	/**
 	 * Set or clear a label on an entry.
 	 * Labels are user-defined markers for bookmarking/navigation.
 	 * Pass undefined or empty string to clear the label.
@@ -1647,6 +2205,7 @@ export class SessionManager {
 	 * are not modified or deleted.
 	 */
 	branch(branchFromId: string): void {
+		this.#refuseIfGated();
 		if (!this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
@@ -1659,6 +2218,7 @@ export class SessionManager {
 	 * Use this when navigating to re-edit the first user message.
 	 */
 	resetLeaf(): void {
+		this.#refuseIfGated();
 		this.leafId = null;
 	}
 
@@ -1674,6 +2234,7 @@ export class SessionManager {
 		fromHook?: boolean,
 		usage?: Usage,
 	): string {
+		this.#refuseIfGated();
 		if (branchFromId !== null && !this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
@@ -1700,6 +2261,7 @@ export class SessionManager {
 	 * Returns the new session file path, or undefined if not persisting.
 	 */
 	createBranchedSession(leafId: string): string | undefined {
+		this.#refuseIfGated();
 		const previousSessionFile = this.sessionFile;
 		const path = this.getBranch(leafId);
 		if (path.length === 0) {

@@ -13,8 +13,9 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
-import { readFileSync } from "node:fs";
-import { basename, dirname } from "node:path";
+import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import {
 	type AfterToolCallContext,
 	type AfterToolCallResult,
@@ -55,9 +56,11 @@ import {
 	resetApiProviders,
 	streamSimple,
 } from "@earendil-works/pi-ai/compat";
+import { APP_NAME, getPackageDir, PACKAGE_NAME, VERSION } from "../config.ts";
 import { getThemeByName, theme } from "../modes/interactive/theme/theme.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { processImage } from "../utils/image-process.ts";
+import { resolvePath } from "../utils/paths.ts";
 import { sleep } from "../utils/sleep.ts";
 import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
@@ -99,6 +102,12 @@ import {
 	type SessionBeforeTreeResult,
 	type SessionBoundaryDraft,
 	type SessionCompactFailedEvent,
+	type SessionDataLeaseInspectionResult,
+	type SessionDataLockReleaseResult,
+	type SessionDataLockResult,
+	type SessionDataRefusalCode,
+	type SessionDataReplaceResult,
+	type SessionReloadResult,
 	type SessionStartEvent,
 	type ShutdownHandler,
 	type ToolDefinition,
@@ -123,13 +132,24 @@ import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.t
 import { exportSessionToJsonl } from "./session-export.ts";
 import {
 	type BranchSummaryEntry,
+	buildSessionProjection,
+	buildStagedReload,
 	type CompactionEntry,
 	type ContextEditEntry,
 	getLatestCompactionEntry,
 	type SessionEntry,
 	SessionManager,
 	type SessionProjection,
+	type StagedSessionReload,
 } from "./session-manager.ts";
+import {
+	canonicalTranscriptIdentity,
+	fileFingerprint,
+	type LeaseClaimRecord,
+	type LeaseRecord,
+	parseJsonStrict,
+	SessionOpenLeaseRegistry,
+} from "./session-open-lease.ts";
 import {
 	applyToolModifiers,
 	type CacheWarmingMode,
@@ -148,6 +168,7 @@ import {
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
+import { TranscriptWriteGuard } from "./transcript-write-guard.ts";
 import { addUsageToTotals, combineUsage, createUsageTotals } from "./usage-totals.ts";
 import {
 	findLatestResponse,
@@ -209,6 +230,7 @@ export type AgentSessionEvent =
 	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
 	| { type: "entry_appended"; entry: SessionEntry }
 	| { type: "session_info_changed"; name: string | undefined }
+	| { type: "session_data_reloaded"; sessionId: string; fingerprint: string; entryCount: number }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
 	| {
 			type: "compaction_end";
@@ -297,6 +319,8 @@ export interface AgentSessionConfig {
 	extensionRunnerRef?: { current?: ExtensionRunner };
 	/** Session start event metadata emitted when extensions bind to this runtime. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Effective agent directory for the session-open lease registry. */
+	agentDir?: string;
 }
 
 export interface ExtensionBindings {
@@ -364,12 +388,82 @@ interface ToolDefinitionEntry {
 	sourceInfo: SourceInfo;
 }
 
+/** Typed synchronous refusal for prompt/queue calls while an in-place trim lock is held. */
+export class SessionDataLockedError extends Error {
+	readonly code = "session_data_locked" as const;
+
+	constructor() {
+		super("Session data is locked for an in-place refresh. Retry after the operation completes.");
+		this.name = "SessionDataLockedError";
+	}
+}
+
+interface HeldSessionDataLock {
+	lockId: string;
+	pathHash: string;
+	guard: TranscriptWriteGuard;
+}
+
 function estimateMessagesTokens(messages: AgentMessage[]): number {
 	let tokens = 0;
 	for (const message of messages) {
 		tokens += estimateTokens(message);
 	}
 	return tokens;
+}
+
+const HELD_GUARD_LOCKED = "byte-range locks deny reads through every handle except the helper's own";
+
+/**
+ * Snapshot the guarded transcript through the helper's locked handle and
+ * return its fingerprint. Reads through plain Node handles fail with EBUSY
+ * while a full-range exclusive lock is held, so guarded verification flows
+ * must read via the guard itself (same process/handle as the lock owner).
+ */
+async function fingerprintThroughGuard(
+	guard: TranscriptWriteGuard,
+	snapshotPath: string,
+): Promise<{ ok: true; fingerprint: string } | { ok: false; code: SessionDataRefusalCode; message: string }> {
+	const snapshot = await guard.snapshotTo(snapshotPath);
+	if (!snapshot.ok) {
+		return {
+			ok: false,
+			code: snapshot.code === "writer_conflict" ? "writer_conflict" : "write_guard_unavailable",
+			message: snapshot.message,
+		};
+	}
+	const fingerprint = fileFingerprint(snapshotPath);
+	if (!fingerprint) return { ok: false, code: "io_error", message: HELD_GUARD_LOCKED };
+	return { ok: true, fingerprint };
+}
+
+function decodeSessionBytesStrict(raw: Buffer): string {
+	return new TextDecoder("utf-8", { fatal: true }).decode(raw);
+}
+
+/** Artifact identity from the clean Li build receipt; missing/dirty receipts fail closed. */
+function getRuntimeBuildHash(): string {
+	try {
+		const receiptPath = join(getPackageDir(), "dist", "li-build-receipt.json");
+		if (!existsSync(receiptPath)) return "unavailable";
+		const receipt = parseJsonStrict(readFileSync(receiptPath, "utf8"));
+		if (typeof receipt !== "object" || receipt === null || Array.isArray(receipt)) return "unavailable";
+		const record = receipt as Record<string, unknown>;
+		if (
+			record.packageName !== PACKAGE_NAME ||
+			record.baseVersion !== VERSION ||
+			record.gitDirty !== false ||
+			record.gitDirtyPathCount !== 0 ||
+			record.artifactAlgorithm !== "sha256" ||
+			typeof record.artifactHash !== "string" ||
+			!/^[a-f0-9]{64}$/.test(record.artifactHash)
+		) {
+			return "unavailable";
+		}
+		return record.artifactHash;
+	} catch {
+		return "unavailable";
+	}
 }
 
 // ============================================================================
@@ -424,7 +518,7 @@ export class AgentSession {
 	// Extension system
 	private _extensionRunner!: ExtensionRunner;
 	private _turnIndex = 0;
-	private readonly _entryIdsByMessage = new WeakMap<object, string>();
+	private _entryIdsByMessage = new WeakMap<object, string>();
 	private readonly _boundaryDispatchedMessages = new WeakSet<object>();
 	private _lastAssistantMessage: AssistantMessage | undefined;
 	private _lastAssistantToolResults: AgentMessage[] = [];
@@ -482,16 +576,36 @@ export class AgentSession {
 	private _baseSystemPromptOptions!: NormalizedBuildSystemPromptOptions;
 	/** Prompt options after before_agent_start mutations for the active run. */
 	private _runSystemPromptOptions?: NormalizedBuildSystemPromptOptions;
+	private _agentDir: string;
+	private _leaseRegistry: SessionOpenLeaseRegistry | undefined;
+	private _sessionOpenLease: LeaseRecord | undefined;
+	private _sessionAccessGuard: TranscriptWriteGuard | undefined;
+	private _sessionAccessUnguarded = true;
+	private _sessionAccessFailure: string | undefined;
+	private _heldSessionDataLock: HeldSessionDataLock | undefined;
+	private _sessionDataAdmissionLocked = false;
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
+		this.sessionManager.setWriteGate(() =>
+			this._sessionDataAdmissionLocked
+				? "session_data_locked: in-place session refresh owns transcript writes"
+				: undefined,
+		);
+		this._installAgentSessionDataAdmissionGuards();
 		this.settingsManager = config.settingsManager;
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
+		this._agentDir = config.agentDir ?? "";
 		this._modelRuntime = config.modelRuntime;
+		if (this._agentDir) {
+			const buildHash = getRuntimeBuildHash();
+			this._leaseRegistry = SessionOpenLeaseRegistry.open(this._agentDir, { runtime: APP_NAME, buildHash });
+			this._acquireSessionOpenLeaseIfNeeded();
+		}
 		this._cacheWarmer = config.cacheWarmer;
 		if (this._cacheWarmer) {
 			this._cacheWarmer.onWarmed = (entry) => this._emit({ type: "entry_appended", entry });
@@ -1167,6 +1281,8 @@ export class AgentSession {
 			}
 			if (entryId) this._entryIdsByMessage.set(event.message, entryId);
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
+			this._acquireSessionOpenLeaseIfNeeded();
+			await this._ensureSessionAccessGuard();
 
 			if (event.message.role === "assistant") {
 				const assistantMsg = event.message as AssistantMessage;
@@ -1408,6 +1524,7 @@ export class AgentSession {
 		this._extensionRunner.invalidate(
 			"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
 		);
+		void this.releaseSessionDataAccess();
 		this._disconnectFromAgent();
 		this._eventListeners = [];
 		if (this._cacheWarmer) {
@@ -1463,6 +1580,11 @@ export class AgentSession {
 	/** Whether the session is currently processing an agent run or post-run continuation. */
 	get isStreaming(): boolean {
 		return this._isAgentRunActive;
+	}
+
+	/** Whether an in-place session refresh currently blocks input and transcript writes. */
+	get isSessionDataLocked(): boolean {
+		return this._sessionDataAdmissionLocked;
 	}
 
 	/** Whether the session has no active agent run, compaction, branch summary, retry, or queued continuation. */
@@ -1521,6 +1643,7 @@ export class AgentSession {
 	 * Changes take effect on the next agent turn.
 	 */
 	setActiveToolsByName(toolNames: string[]): void {
+		this._throwIfSessionDataLocked();
 		const previous = this.getActiveToolNames();
 		this._setActiveTools(toolNames);
 		// A loadout that deactivates a tool replaces the restored one, whose pending tools are dropped.
@@ -2056,6 +2179,8 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		this._throwIfSessionDataLocked();
+		await this._ensureSessionAccessGuard();
 		if (this._isEmittingAgentSettled) {
 			this._deferredSettledActions.push(async () => await this.prompt(text, options));
 			return;
@@ -2243,6 +2368,7 @@ export class AgentSession {
 		images?: ImageContent[],
 		options?: { source?: InputSource },
 	): Promise<QueuedInputDisposition> {
+		this._throwIfSessionDataLocked();
 		return this._queueUserInput(text, images, "steer", options?.source ?? "interactive");
 	}
 
@@ -2259,6 +2385,7 @@ export class AgentSession {
 		images?: ImageContent[],
 		options?: { source?: InputSource },
 	): Promise<QueuedInputDisposition> {
+		this._throwIfSessionDataLocked();
 		return this._queueUserInput(text, images, "followUp", options?.source ?? "interactive");
 	}
 
@@ -2324,6 +2451,7 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
+		this._throwIfSessionDataLocked();
 		const appMessage = {
 			role: "custom" as const,
 			customType: message.customType,
@@ -2430,6 +2558,7 @@ export class AgentSession {
 	 * @returns Object with steering and followUp arrays
 	 */
 	clearQueue(): { steering: string[]; followUp: string[] } {
+		this._throwIfSessionDataLocked();
 		const steering = [...this._steeringMessages];
 		const followUp = [...this._followUpMessages];
 		this._steeringMessages = [];
@@ -2505,6 +2634,7 @@ export class AgentSession {
 	 * @throws Error if no auth is configured for the model
 	 */
 	async setModel(model: Model<any>, options: ModelMutationOptions = {}): Promise<void> {
+		this._throwIfSessionDataLocked();
 		if (!(await this._modelRuntime.checkAuth(model.provider))) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
@@ -2550,6 +2680,7 @@ export class AgentSession {
 		direction: "forward" | "backward" = "forward",
 		options: ModelMutationOptions = {},
 	): Promise<ModelCycleResult | undefined> {
+		this._throwIfSessionDataLocked();
 		if (this._scopedModels.length > 0) {
 			return this._cycleScopedModel(direction, options);
 		}
@@ -2640,6 +2771,7 @@ export class AgentSession {
 	 * Persists the requested level to global defaults only when options.persist is true.
 	 */
 	setThinkingLevel(level: ThinkingLevel, options: ModelMutationOptions = {}): void {
+		this._throwIfSessionDataLocked();
 		const availableLevels = this.getAvailableThinkingLevels();
 		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
 
@@ -2728,6 +2860,7 @@ export class AgentSession {
 	 * Saves to settings.
 	 */
 	setSteeringMode(mode: "all" | "one-at-a-time"): void {
+		this._throwIfSessionDataLocked();
 		this.agent.steeringMode = mode;
 		this.settingsManager.setSteeringMode(mode);
 	}
@@ -2737,6 +2870,7 @@ export class AgentSession {
 	 * Saves to settings.
 	 */
 	setFollowUpMode(mode: "all" | "one-at-a-time"): void {
+		this._throwIfSessionDataLocked();
 		this.agent.followUpMode = mode;
 		this.settingsManager.setFollowUpMode(mode);
 	}
@@ -2792,6 +2926,7 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
+		this._throwIfSessionDataLocked();
 		await this.abort();
 		this._compactionAbortController = new AbortController();
 		this._emit({ type: "compaction_start", reason: "manual" });
@@ -3285,6 +3420,736 @@ export class AgentSession {
 		return this.settingsManager.getCompactionEnabled();
 	}
 
+	private _installAgentSessionDataAdmissionGuards(): void {
+		const thisSession = this;
+		const originalPrompt = this.agent.prompt.bind(this.agent);
+		function guardedPrompt(message: AgentMessage | AgentMessage[]): Promise<void>;
+		function guardedPrompt(input: string, images?: ImageContent[]): Promise<void>;
+		async function guardedPrompt(
+			input: string | AgentMessage | AgentMessage[],
+			images?: ImageContent[],
+		): Promise<void> {
+			thisSession._throwIfSessionDataLocked();
+			if (typeof input === "string") await originalPrompt(input, images);
+			else await originalPrompt(input);
+		}
+		this.agent.prompt = guardedPrompt;
+		const originalContinue = this.agent.continue.bind(this.agent);
+		this.agent.continue = async () => {
+			this._throwIfSessionDataLocked();
+			await originalContinue();
+		};
+		const originalSteer = this.agent.steer.bind(this.agent);
+		this.agent.steer = (message) => {
+			this._throwIfSessionDataLocked();
+			originalSteer(message);
+		};
+		const originalFollowUp = this.agent.followUp.bind(this.agent);
+		this.agent.followUp = (message) => {
+			this._throwIfSessionDataLocked();
+			originalFollowUp(message);
+		};
+		const originalClearSteeringQueue = this.agent.clearSteeringQueue.bind(this.agent);
+		this.agent.clearSteeringQueue = () => {
+			this._throwIfSessionDataLocked();
+			originalClearSteeringQueue();
+		};
+		const originalClearFollowUpQueue = this.agent.clearFollowUpQueue.bind(this.agent);
+		this.agent.clearFollowUpQueue = () => {
+			this._throwIfSessionDataLocked();
+			originalClearFollowUpQueue();
+		};
+		const originalClearAllQueues = this.agent.clearAllQueues.bind(this.agent);
+		this.agent.clearAllQueues = () => {
+			this._throwIfSessionDataLocked();
+			originalClearAllQueues();
+		};
+		const originalReset = this.agent.reset.bind(this.agent);
+		this.agent.reset = () => {
+			this._throwIfSessionDataLocked();
+			originalReset();
+		};
+	}
+
+	private _acquireSessionOpenLeaseIfNeeded(): void {
+		const registry = this._leaseRegistry;
+		const sessionFile = this.sessionManager.getSessionFile();
+		if (
+			!registry ||
+			!registry.available ||
+			!this.sessionManager.isPersisted() ||
+			!sessionFile ||
+			!existsSync(sessionFile)
+		) {
+			return;
+		}
+		if (this._sessionOpenLease?.session_id === this.sessionManager.getSessionId()) return;
+		const acquired = registry.acquireLease({
+			sessionId: this.sessionManager.getSessionId(),
+			transcriptPath: sessionFile,
+		});
+		if (!acquired.ok) {
+			this._sessionAccessUnguarded = true;
+			this._sessionAccessFailure = acquired.message;
+			return;
+		}
+		this._sessionOpenLease = acquired.value;
+		this._sessionAccessUnguarded = true;
+	}
+
+	private _hasPendingSessionWork(): boolean {
+		return (
+			this._steeringMessages.length > 0 ||
+			this._followUpMessages.length > 0 ||
+			this._pendingNextTurnMessages.length > 0 ||
+			this._pendingCustomMessages.length > 0 ||
+			this._pendingBashMessages.length > 0 ||
+			this._deferredSettledActions.length > 0 ||
+			this.agent.hasQueuedMessages() ||
+			this._retryAbortController !== undefined ||
+			this._failedResponse !== undefined
+		);
+	}
+
+	private _throwIfSessionDataLocked(): void {
+		if (this._sessionDataAdmissionLocked) throw new SessionDataLockedError();
+	}
+
+	private _markSessionAccessUnguarded(message: string): void {
+		this._sessionAccessUnguarded = true;
+		if (this._sessionAccessFailure === message) return;
+		this._sessionAccessFailure = message;
+		this._extensionRunner?.emitError({
+			extensionPath: "<session-guard>",
+			event: "session_access_guard",
+			error: `Session is running unguarded; in-place trim is disabled: ${message}`,
+		});
+	}
+
+	private async _ensureSessionAccessGuard(): Promise<void> {
+		const sessionFile = this.sessionManager.getSessionFile();
+		if (!this.sessionManager.isPersisted() || !sessionFile || !existsSync(sessionFile)) return;
+		if (this._sessionAccessGuard?.isHeld) return;
+		this._acquireSessionOpenLeaseIfNeeded();
+		const registry = this._leaseRegistry;
+		if (!registry || !registry.available) {
+			this._markSessionAccessUnguarded(registry?.degradationReason ?? "session-open lease registry unavailable");
+			return;
+		}
+		const { pathHash } = canonicalTranscriptIdentity(sessionFile);
+		if (!this._sessionOpenLease) {
+			const claim = registry.readClaim(pathHash);
+			if (
+				claim.ok &&
+				claim.value &&
+				registry.processInventory.isProcessAlive(claim.value.owner_pid, claim.value.owner_start_utc)
+			) {
+				throw new SessionDataLockedError();
+			}
+			this._markSessionAccessUnguarded(claim.ok ? "session-open lease could not be acquired" : claim.message);
+			return;
+		}
+
+		const existingClaim = registry.readClaim(pathHash);
+		if (!existingClaim.ok) {
+			this._markSessionAccessUnguarded(existingClaim.message);
+			return;
+		}
+		if (existingClaim.value) {
+			const claim = existingClaim.value;
+			if (registry.processInventory.isProcessAlive(claim.owner_pid, claim.owner_start_utc)) {
+				throw new SessionDataLockedError();
+			}
+			const recovered = registry.recoverStaleClaim({
+				pathHash,
+				transcriptPath: sessionFile,
+				verifier: (raw) => {
+					try {
+						this.sessionManager.stageReload(decodeSessionBytesStrict(raw));
+						return true;
+					} catch {
+						return false;
+					}
+				},
+			});
+			if (!recovered.ok) throw new Error(`Session recovery blocked: ${recovered.message}`);
+			if (recovered.value.action === "blocked") {
+				throw new Error(`Session recovery blocked: ${recovered.value.reason}`);
+			}
+			if (recovered.value.action === "restore_candidate") {
+				const restored = await registry.guardedRestore({
+					transcriptPath: sessionFile,
+					backupPath: recovered.value.backupPath,
+					pathHash,
+					expectedCurrentFingerprint: recovered.value.expectedCurrentFingerprint,
+				});
+				if (!restored.ok) throw new Error(`Session recovery restore failed: ${restored.message}`);
+				const raw = decodeSessionBytesStrict(readFileSync(sessionFile));
+				const stage = this.sessionManager.stageReload(raw);
+				this.sessionManager.commitStagedReload(stage);
+				this._refreshFinalizedContext();
+				registry.clearClaim(pathHash);
+			}
+		}
+
+		const acquired = await TranscriptWriteGuard.acquire(sessionFile, { mode: "shared" });
+		if (!acquired.ok) {
+			if (acquired.code === "writer_conflict") throw new SessionDataLockedError();
+			this._markSessionAccessUnguarded(acquired.message);
+			return;
+		}
+		this._sessionAccessGuard = acquired.guard;
+		this._sessionAccessUnguarded = false;
+		this._sessionAccessFailure = undefined;
+	}
+
+	private _sessionDataRefused(code: SessionDataRefusalCode, message: string): SessionDataLeaseInspectionResult {
+		return { status: "refused", code, message };
+	}
+
+	/** Read-only pre-preview check for persisted identity, idleness, lease and promotion gates. */
+	async inspectSessionDataLease(): Promise<SessionDataLeaseInspectionResult> {
+		return this._inspectSessionDataLease(false);
+	}
+
+	private async _inspectSessionDataLease(allowAdmissionLocked: boolean): Promise<SessionDataLeaseInspectionResult> {
+		if (this._extensionMode !== "tui") {
+			return this._sessionDataRefused("unsupported_mode", "session trim is available only in interactive mode");
+		}
+		const sessionFile = this.sessionManager.getSessionFile();
+		if (!this.sessionManager.isPersisted() || !sessionFile || !existsSync(sessionFile)) {
+			return this._sessionDataRefused("not_persisted", "current session is not persisted to a transcript file");
+		}
+		if (this._sessionDataAdmissionLocked && !allowAdmissionLocked) {
+			return this._sessionDataRefused("session_data_locked", "session data lock is already held");
+		}
+		if (!this.isIdle || this._isEmittingAgentSettled || this.isRetrying) {
+			return this._sessionDataRefused("not_idle", "agent run, compaction, retry, or continuation is active");
+		}
+		if (this._hasPendingSessionWork()) {
+			return this._sessionDataRefused("pending_work", "session has pending queue, continuation, or custom work");
+		}
+		if (
+			!this._sessionAccessGuard?.isHeld ||
+			!(await this._sessionAccessGuard.verifyHeld()) ||
+			this._sessionAccessUnguarded
+		) {
+			return this._sessionDataRefused(
+				"write_guard_unavailable",
+				this._sessionAccessFailure ?? "session is unguarded; trim requires a held SessionAccessGuard",
+			);
+		}
+		const registry = this._leaseRegistry;
+		if (!registry || !registry.available) {
+			return this._sessionDataRefused(
+				"registry_invalid",
+				registry?.degradationReason ?? "lease registry unavailable",
+			);
+		}
+		const promotion = registry.checkPromotionGate();
+		if (!promotion.ok) {
+			return this._sessionDataRefused("promotion_required", promotion.message);
+		}
+		const identity = canonicalTranscriptIdentity(sessionFile);
+		const lease = registry.inspectLeaseUniqueness({
+			sessionId: this.sessionManager.getSessionId(),
+			transcriptPath: sessionFile,
+		});
+		if (!lease.ok) {
+			return this._sessionDataRefused(
+				lease.code === "lease_conflict" ? "lease_conflict" : "lease_missing",
+				lease.message,
+			);
+		}
+		if (
+			this._sessionOpenLease?.lease_id !== lease.value.leaseId ||
+			this._sessionOpenLease.path_hash !== identity.pathHash
+		) {
+			return this._sessionDataRefused(
+				"identity_changed",
+				"current session lease does not match the canonical transcript identity",
+			);
+		}
+		const claim = registry.readClaim(identity.pathHash);
+		if (!claim.ok) return this._sessionDataRefused("registry_invalid", claim.message);
+		if (claim.value) {
+			return this._sessionDataRefused(
+				"recovery_blocked",
+				`mutation claim exists at phase ${claim.value.phase}; resolve stale-claim recovery before preview`,
+			);
+		}
+		return {
+			status: "ready",
+			sessionId: this.sessionManager.getSessionId(),
+			leaseId: lease.value.leaseId,
+			protocolVersion: 1,
+		};
+	}
+
+	/**
+	 * Synchronously closes in-process admission before the first await, then
+	 * claims and upgrades the session's OS access guard. No prompt or append can
+	 * slip through while native lock acquisition is pending.
+	 */
+	async acquireSessionDataLock(): Promise<SessionDataLockResult> {
+		if (this._sessionDataAdmissionLocked) {
+			return { status: "refused", code: "session_data_locked", message: "session data lock is already held" };
+		}
+		this._sessionDataAdmissionLocked = true;
+		this.sessionManager.setWriteGate(() =>
+			this._sessionDataAdmissionLocked
+				? "session_data_locked: in-place session refresh owns transcript writes"
+				: undefined,
+		);
+		const unlockGate = () => {
+			this._sessionDataAdmissionLocked = false;
+			this.sessionManager.setWriteGate(undefined);
+		};
+		const inspected = await this._inspectSessionDataLease(true);
+		if (inspected.status !== "ready") {
+			unlockGate();
+			return { status: "refused", code: inspected.code, message: inspected.message };
+		}
+		const sessionFile = this.sessionManager.getSessionFile();
+		const registry = this._leaseRegistry;
+		const accessGuard = this._sessionAccessGuard;
+		if (!sessionFile || !registry || !accessGuard) {
+			unlockGate();
+			return { status: "refused", code: "write_guard_unavailable", message: "session access guard is unavailable" };
+		}
+		const identity = canonicalTranscriptIdentity(sessionFile);
+		const fingerprint = fileFingerprint(sessionFile);
+		if (!fingerprint) {
+			unlockGate();
+			return { status: "refused", code: "io_error", message: "cannot fingerprint current transcript" };
+		}
+		const lockId = randomUUID();
+		const processStart = registry.processInventory.getProcessStartUtc(process.pid) ?? "UNKNOWN";
+		const claim: LeaseClaimRecord = {
+			lock_id: lockId,
+			path_hash: identity.pathHash,
+			session_id: this.sessionManager.getSessionId(),
+			purpose: "in_place_session_refresh",
+			owner_pid: process.pid,
+			owner_start_utc: processStart,
+			owner_runtime: registry.runtime,
+			owner_build_hash: registry.buildHash,
+			phase: "acquired",
+			operation_id: randomUUID(),
+			original_fingerprint: fingerprint,
+		};
+		const promotion = registry.checkPromotionGate();
+		if (!promotion.ok) {
+			unlockGate();
+			return { status: "refused", code: "promotion_required", message: promotion.message };
+		}
+		const claimResult = registry.createClaim(claim);
+		if (!claimResult.ok) {
+			unlockGate();
+			return {
+				status: "refused",
+				code: claimResult.code === "writer_conflict" ? "writer_conflict" : "registry_invalid",
+				message: claimResult.message,
+			};
+		}
+		const promotionAfterClaim = registry.checkPromotionGate();
+		if (!promotionAfterClaim.ok) {
+			registry.clearClaim(identity.pathHash, lockId);
+			unlockGate();
+			return { status: "refused", code: "promotion_required", message: promotionAfterClaim.message };
+		}
+		const upgraded = await accessGuard.upgrade();
+		if (!upgraded.ok) {
+			registry.clearClaim(identity.pathHash, lockId);
+			unlockGate();
+			return {
+				status: "refused",
+				code: upgraded.code === "writer_conflict" ? "writer_conflict" : "write_guard_unavailable",
+				message: upgraded.message,
+			};
+		}
+		const guardRecord = registry.publishGuardRecord(identity.pathHash, accessGuard.guardId);
+		if (!guardRecord.ok) {
+			await accessGuard.downgrade();
+			registry.clearClaim(identity.pathHash, lockId);
+			unlockGate();
+			return { status: "refused", code: "registry_invalid", message: guardRecord.message };
+		}
+		this._heldSessionDataLock = { lockId, pathHash: identity.pathHash, guard: accessGuard };
+		return { status: "acquired", lockId, sessionId: this.sessionManager.getSessionId() };
+	}
+
+	/** Release the mutation claim and downgrade the OS guard, always clearing the in-process gate. */
+	async releaseSessionDataLock(lockId: string): Promise<SessionDataLockReleaseResult> {
+		if (this._extensionMode !== "tui") {
+			return {
+				status: "refused",
+				code: "unsupported_mode",
+				message: "session data lock API is available only in interactive mode",
+			};
+		}
+		const held = this._heldSessionDataLock;
+		if (!held || held.lockId !== lockId) {
+			return {
+				status: "refused",
+				code: "lock_missing",
+				message: "session data lock token is missing or does not match",
+			};
+		}
+		let failure: { code: "registry_invalid" | "write_guard_unavailable"; message: string } | undefined;
+		try {
+			const downgraded = await held.guard.downgrade();
+			if (!downgraded.ok) {
+				failure = { code: "write_guard_unavailable", message: downgraded.message };
+				await held.guard.release();
+				this._sessionAccessGuard = undefined;
+				this._sessionAccessUnguarded = true;
+			}
+		} finally {
+			const registry = this._leaseRegistry;
+			if (registry) {
+				const clearedGuard = registry.clearGuardRecord(held.pathHash, held.guard.guardId);
+				const clearedClaim = registry.clearClaim(held.pathHash, held.lockId);
+				if ((!clearedGuard.ok || !clearedClaim.ok) && !failure) {
+					failure = {
+						code: "registry_invalid",
+						message: !clearedGuard.ok
+							? clearedGuard.message
+							: !clearedClaim.ok
+								? clearedClaim.message
+								: "registry cleanup failed",
+					};
+				}
+			}
+			this._heldSessionDataLock = undefined;
+			this._sessionDataAdmissionLocked = false;
+			this.sessionManager.setWriteGate(undefined);
+		}
+		return failure
+			? { status: "refused", code: failure.code, message: failure.message }
+			: { status: "released", lockId };
+	}
+
+	private _snapshotPath(label: string): string {
+		const sessionFile = this.sessionManager.getSessionFile();
+		const directory = sessionFile ? dirname(sessionFile) : this._cwd;
+		return join(directory, `.${basename(sessionFile ?? "session")}.${label}-${randomUUID()}.tmp`);
+	}
+
+	/**
+	 * Publish a candidate through the held OS guard with a guarded in-place
+	 * rewrite: the helper keeps the exclusive Stream and `LockFileEx` range
+	 * held for the whole op — the target handle is never closed or renamed, so
+	 * exclusion is continuous with no path-handle gap. This is the only
+	 * supported publish/rollback seam for `/trim`.
+	 */
+	async replaceSessionDataTranscript(options: {
+		candidatePath: string;
+		lockId: string;
+		backupName?: string;
+	}): Promise<SessionDataReplaceResult> {
+		const refuse = (
+			code: SessionDataRefusalCode,
+			message: string,
+			observedFingerprint?: string,
+		): SessionDataReplaceResult => ({
+			status: "refused",
+			code,
+			message,
+			...(observedFingerprint ? { observedFingerprint } : {}),
+		});
+		if (this._extensionMode !== "tui")
+			return refuse("unsupported_mode", "guarded transcript replacement is interactive-only");
+		const held = this._heldSessionDataLock;
+		if (!held || held.lockId !== options.lockId || !this._sessionDataAdmissionLocked) {
+			return refuse("lock_missing", "session data lock token is missing or does not match");
+		}
+		const sessionFile = this.sessionManager.getSessionFile();
+		const registry = this._leaseRegistry;
+		if (!sessionFile || !registry || !registry.available) {
+			return refuse("registry_invalid", registry?.degradationReason ?? "session file or lease registry unavailable");
+		}
+		const identity = canonicalTranscriptIdentity(sessionFile);
+		if (
+			identity.pathHash !== held.pathHash ||
+			canonicalTranscriptIdentity(held.guard.path).pathHash !== held.pathHash
+		) {
+			return refuse("identity_changed", "held guard identity does not match the current session path");
+		}
+		const promotion = registry.checkPromotionGate();
+		if (!promotion.ok) return refuse("promotion_required", promotion.message);
+		if (!(await held.guard.verifyHeld()))
+			return refuse("write_guard_unavailable", "exclusive transcript guard is not held");
+		const claim = registry.readClaim(held.pathHash);
+		if (!claim.ok) return refuse("registry_invalid", claim.message);
+		if (
+			!claim.value ||
+			claim.value.lock_id !== held.lockId ||
+			claim.value.session_id !== this.sessionManager.getSessionId()
+		) {
+			return refuse("lock_missing", "mutation claim does not match the session lock and id");
+		}
+		const currentSnapshot = this._snapshotPath("pre-replace");
+		try {
+			const current = await fingerprintThroughGuard(held.guard, currentSnapshot);
+			if (!current.ok) return refuse(current.code, current.message);
+			const currentFingerprint = current.fingerprint;
+			if (
+				currentFingerprint !== claim.value.original_fingerprint &&
+				currentFingerprint !== claim.value.candidate_fingerprint
+			) {
+				return refuse(
+					"fingerprint_mismatch",
+					"current transcript matches neither original nor owned candidate",
+					currentFingerprint,
+				);
+			}
+			const candidateFingerprint = fileFingerprint(options.candidatePath);
+			if (!candidateFingerprint) return refuse("io_error", "candidate transcript is unreadable");
+			const backupName = options.backupName;
+			if (
+				backupName !== undefined &&
+				(basename(backupName) !== backupName || backupName === "." || backupName === "..")
+			) {
+				return refuse("registry_invalid", "backupName must be a basename without path separators");
+			}
+			const candidateReady = registry.updateOwnedClaim(held.pathHash, held.lockId, held.guard.guardId, {
+				phase: "candidate_ready",
+				candidate_fingerprint: candidateFingerprint,
+				...(backupName ? { backup_name: backupName } : {}),
+			});
+			if (!candidateReady.ok) return refuse("registry_invalid", candidateReady.message);
+			const replacement = await held.guard.rewrite(options.candidatePath);
+			if (!replacement.ok) {
+				return refuse(
+					replacement.code === "writer_conflict" ? "writer_conflict" : "write_guard_unavailable",
+					replacement.message,
+				);
+			}
+			const published = await fingerprintThroughGuard(held.guard, currentSnapshot);
+			if (!published.ok) {
+				registry.updateOwnedClaim(held.pathHash, held.lockId, held.guard.guardId, { phase: "blocked" });
+				return refuse(published.code, published.message);
+			}
+			if (published.fingerprint !== candidateFingerprint) {
+				registry.updateOwnedClaim(held.pathHash, held.lockId, held.guard.guardId, { phase: "blocked" });
+				return refuse(
+					"fingerprint_mismatch",
+					"published transcript hash differs from the candidate",
+					published.fingerprint,
+				);
+			}
+			const replaced = registry.updateOwnedClaim(held.pathHash, held.lockId, held.guard.guardId, {
+				phase: "replaced",
+			});
+			if (!replaced.ok) return refuse("registry_invalid", replaced.message, published.fingerprint);
+			return { status: "replaced", lockId: held.lockId, fingerprint: candidateFingerprint };
+		} finally {
+			rmSync(currentSnapshot, { force: true });
+		}
+	}
+
+	/**
+	 * Strictly stage and commit refreshed transcript bytes in-place. All
+	 * identity, fingerprint, idle, lease, OS guard and projection parity checks
+	 * happen before commit; the runtime/extension/Agent/SessionManager objects
+	 * remain the same and no lifecycle event is emitted.
+	 */
+	async reloadSessionFromDisk(options: { expectedFingerprint: string; lockId: string }): Promise<SessionReloadResult> {
+		const refuse = (
+			code: SessionDataRefusalCode,
+			message: string,
+			observedFingerprint?: string,
+		): SessionReloadResult => ({
+			status: "refused",
+			code,
+			message,
+			...(observedFingerprint ? { observedFingerprint } : {}),
+		});
+		if (this._extensionMode !== "tui")
+			return refuse("unsupported_mode", "in-place refresh is available only in interactive mode");
+		const held = this._heldSessionDataLock;
+		if (!held || held.lockId !== options.lockId)
+			return refuse("lock_missing", "session data lock token is missing or does not match");
+		const sessionFile = this.sessionManager.getSessionFile();
+		if (!sessionFile || !this.sessionManager.isPersisted())
+			return refuse("not_persisted", "current session is not persisted");
+		if (!this._sessionDataAdmissionLocked || this._hasPendingSessionWork() || !this.isIdle) {
+			return refuse("pending_work", "session is no longer idle or has pending work");
+		}
+		if (
+			canonicalTranscriptIdentity(held.guard.path).identity !== canonicalTranscriptIdentity(sessionFile).identity ||
+			!(await held.guard.verifyHeld())
+		) {
+			return refuse("write_guard_unavailable", "exclusive transcript guard is no longer held");
+		}
+		// Byte-range locks deny reads through plain Node handles, so every read of
+		// the guarded transcript flows through the helper (snapshot + hash).
+		const snapshotPath = this._snapshotPath("reload");
+		try {
+			const observed = await fingerprintThroughGuard(held.guard, snapshotPath);
+			if (!observed.ok) return refuse(observed.code, observed.message);
+			const observedFingerprint = observed.fingerprint;
+			if (observedFingerprint !== options.expectedFingerprint) {
+				return refuse(
+					"fingerprint_mismatch",
+					"transcript hash differs from the expected candidate",
+					observedFingerprint,
+				);
+			}
+			const replacedJournal = this._leaseRegistry?.updateOwnedClaim(held.pathHash, held.lockId, held.guard.guardId, {
+				phase: "replaced",
+				candidate_fingerprint: observedFingerprint,
+			});
+			if (!replacedJournal?.ok) {
+				return refuse("registry_invalid", replacedJournal?.message ?? "claim registry is unavailable");
+			}
+			let stage: StagedSessionReload;
+			try {
+				const rawBytes = readFileSync(snapshotPath);
+				stage = this.sessionManager.stageReload(decodeSessionBytesStrict(rawBytes));
+			} catch (error) {
+				return refuse(
+					"invalid_transcript",
+					error instanceof Error ? error.message : String(error),
+					observedFingerprint,
+				);
+			}
+			if (stage.sessionId !== this.sessionManager.getSessionId()) {
+				return refuse(
+					"identity_changed",
+					"candidate transcript session id does not match current runtime",
+					observedFingerprint,
+				);
+			}
+			if (resolvePath(stage.header.cwd) !== this.sessionManager.getCwd()) {
+				return refuse(
+					"identity_changed",
+					"candidate transcript cwd does not match current runtime",
+					observedFingerprint,
+				);
+			}
+			const registry = this._leaseRegistry;
+			if (!registry || !registry.available)
+				return refuse("registry_invalid", registry?.degradationReason ?? "lease registry unavailable");
+			const promotion = registry.checkPromotionGate();
+			if (!promotion.ok) return refuse("promotion_required", promotion.message);
+			const uniqueLease = registry.inspectLeaseUniqueness({
+				sessionId: stage.sessionId,
+				transcriptPath: sessionFile,
+			});
+			if (!uniqueLease.ok)
+				return refuse(
+					uniqueLease.code === "lease_conflict" ? "lease_conflict" : "lease_missing",
+					uniqueLease.message,
+				);
+			if (uniqueLease.value.leaseId !== this._sessionOpenLease?.lease_id)
+				return refuse("identity_changed", "current lease changed during refresh");
+
+			const candidateProjection = buildSessionProjection(
+				stage.entries.filter((entry): entry is SessionEntry => entry.type !== "session"),
+				stage.leafId,
+				stage.byId,
+			);
+			if (candidateProjection.thinkingLevel !== this.thinkingLevel) {
+				return refuse("projection_mismatch", "candidate thinking level does not match the active runtime");
+			}
+			const activeModel = this.model;
+			// Agent's DEFAULT_MODEL is the unselected sentinel `unknown/unknown`; it
+			// has no transcript selection, so normalize it to the projection's absence.
+			const activeModelSelection =
+				activeModel && !(activeModel.provider === "unknown" && activeModel.id === "unknown")
+					? { provider: activeModel.provider, modelId: activeModel.id }
+					: null;
+			if (
+				candidateProjection.model?.provider !== activeModelSelection?.provider ||
+				candidateProjection.model?.modelId !== activeModelSelection?.modelId
+			) {
+				return refuse("projection_mismatch", "candidate model selection does not match the active runtime");
+			}
+			const candidateToolNames = (getCurrentSystemMessage(candidateProjection.messages)?.toolsAdded ?? [])
+				.map((tool) => tool.name)
+				.sort();
+			const runtimeToolNames = this.getActiveToolNames().slice().sort();
+			if (
+				candidateToolNames.length !== runtimeToolNames.length ||
+				candidateToolNames.some((name, index) => name !== runtimeToolNames[index])
+			) {
+				return refuse("projection_mismatch", "candidate tool loadout does not match the active runtime");
+			}
+
+			if (!(await held.guard.verifyHeld()))
+				return refuse("write_guard_unavailable", "exclusive transcript guard was lost before commit");
+			const finalSnapshotPath = this._snapshotPath("pre-commit");
+			let finalSnapshot: Awaited<ReturnType<typeof fingerprintThroughGuard>>;
+			try {
+				finalSnapshot = await fingerprintThroughGuard(held.guard, finalSnapshotPath);
+			} finally {
+				rmSync(finalSnapshotPath, { force: true });
+			}
+			if (!finalSnapshot.ok) return refuse(finalSnapshot.code, finalSnapshot.message);
+			if (finalSnapshot.fingerprint !== observedFingerprint) {
+				return refuse("fingerprint_mismatch", "transcript changed after strict staging", finalSnapshot.fingerprint);
+			}
+			const verifiedJournal = registry.updateOwnedClaim(held.pathHash, held.lockId, held.guard.guardId, {
+				phase: "verified",
+			});
+			if (!verifiedJournal.ok) return refuse("registry_invalid", verifiedJournal.message);
+			const previousHeader = this.sessionManager.getHeader();
+			if (!previousHeader) return refuse("identity_changed", "current session header is missing");
+			const previousStage = buildStagedReload(previousHeader, this.sessionManager.getEntries(), "");
+			const previousMessages = this.agent.state.messages;
+			const previousEntryIds = this._entryIdsByMessage;
+			try {
+				// Synchronous commit block: no await between stage swap and projection swap.
+				this.sessionManager.commitStagedReload(stage);
+				this._entryIdsByMessage = new WeakMap<object, string>();
+				for (const entry of candidateProjection.entries) {
+					for (const message of entry.messages) this._entryIdsByMessage.set(message, entry.sourceEntry.id);
+				}
+				this.agent.state.messages = candidateProjection.messages;
+			} catch (error) {
+				try {
+					this.sessionManager.commitStagedReload(previousStage);
+					this.agent.state.messages = previousMessages;
+					this._entryIdsByMessage = previousEntryIds;
+				} catch {
+					// The live fields were already snapshotted inside SessionManager; a
+					// second restore attempt is best effort if an injected setter throws.
+				}
+				return {
+					status: "failed",
+					code: "commit_error",
+					message: error instanceof Error ? error.message : String(error),
+				};
+			}
+			this._emit({
+				type: "session_data_reloaded",
+				sessionId: stage.sessionId,
+				fingerprint: observedFingerprint,
+				entryCount: stage.entryCount,
+			});
+			return {
+				status: "reloaded",
+				sessionId: stage.sessionId,
+				fingerprint: observedFingerprint,
+				entryCount: stage.entryCount,
+			};
+		} finally {
+			rmSync(snapshotPath, { force: true });
+		}
+	}
+
+	async releaseSessionDataAccess(): Promise<void> {
+		if (this._heldSessionDataLock) await this.releaseSessionDataLock(this._heldSessionDataLock.lockId);
+		const guard = this._sessionAccessGuard;
+		this._sessionAccessGuard = undefined;
+		if (guard) await guard.release();
+		const lease = this._sessionOpenLease;
+		this._sessionOpenLease = undefined;
+		if (lease) this._leaseRegistry?.releaseLease(lease.lease_id);
+	}
+
 	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
 		if (bindings.uiContext !== undefined) {
 			this._extensionUIContext = bindings.uiContext;
@@ -3306,6 +4171,7 @@ export class AgentSession {
 		}
 
 		this._applyExtensionBindings(this._extensionRunner);
+		await this._ensureSessionAccessGuard();
 		await this._extensionRunner.emit(this._sessionStartEvent);
 		this._extensionRunner.reportUnhandledMcpServers();
 		await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
@@ -3688,6 +4554,7 @@ export class AgentSession {
 	}
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
+		this._throwIfSessionDataLocked();
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();
 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
@@ -3873,6 +4740,7 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; id?: string; operations?: BashOperations },
 	): Promise<BashResult> {
+		this._throwIfSessionDataLocked();
 		const abortController = new AbortController();
 		this._bashAbortControllers.add(abortController);
 
@@ -3907,6 +4775,7 @@ export class AgentSession {
 	 * Used by executeBash and by extensions that handle bash execution themselves.
 	 */
 	recordBashResult(command: string, result: BashResult, options?: { excludeFromContext?: boolean }): void {
+		this._throwIfSessionDataLocked();
 		const bashMessage: BashExecutionMessage = {
 			role: "bashExecution",
 			command,
@@ -3970,6 +4839,7 @@ export class AgentSession {
 	 * Set a display name for the current session.
 	 */
 	setSessionName(name: string): void {
+		this._throwIfSessionDataLocked();
 		this.sessionManager.appendSessionInfo(name);
 		const event = { type: "session_info_changed", name: this.sessionManager.getSessionName() } as const;
 		this._emit(event);
@@ -3995,6 +4865,7 @@ export class AgentSession {
 		targetId: string,
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
+		this._throwIfSessionDataLocked();
 		if (this.isStreaming) {
 			throw new Error("Wait for the current response to finish before navigating the session tree.");
 		}
