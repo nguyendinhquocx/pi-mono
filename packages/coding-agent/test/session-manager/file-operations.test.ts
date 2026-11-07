@@ -15,7 +15,12 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { APP_NAME } from "../../src/config.ts";
-import { findMostRecentSession, loadEntriesFromFile, SessionManager } from "../../src/core/session-manager.ts";
+import {
+	findMostRecentSession,
+	loadEntriesFromFile,
+	parseSessionTranscriptStrict,
+	SessionManager,
+} from "../../src/core/session-manager.ts";
 import { assistantMsg, readSessionFileRoles, userMsg } from "../utilities.ts";
 
 const HEADER_SCAN_LIMIT_BYTES = 1024 * 1024;
@@ -158,6 +163,140 @@ describe("loadEntriesFromFile", () => {
 				expect(sessionManager.getCwd()).toBe(cwdOverride ?? storedCwd);
 			}
 		}
+	});
+
+	// Fix A1: when the discovery scan limit is exceeded, the full-load fallback
+	// must not repair the transcript during open — the newline repair stays
+	// deferred like every other open path.
+	it("defers the newline repair when the discovery scan limit is exceeded (open leaves bytes untouched)", () => {
+		const file = join(tempDir, "scan-limit-repair.jsonl");
+		// A single valid header line longer than the discovery scan limit forces
+		// the full-load fallback path (all lines stay strictly parseable).
+		const header = {
+			type: "session",
+			version: 3,
+			id: "a".repeat(HEADER_SCAN_LIMIT_BYTES + 1),
+			timestamp: "2026-01-01T00:00:00.000Z",
+			cwd: tempDir,
+		};
+		const body = `${JSON.stringify(header)}\n${JSON.stringify({
+			type: "message",
+			id: "aa110001",
+			parentId: null,
+			timestamp: "2026-01-01T00:00:01.000Z",
+			message: { role: "user", content: "hi", timestamp: 1 },
+		})}`;
+		writeFileSync(file, body);
+
+		const sm = SessionManager.open(file, tempDir);
+		// Open must not repair the missing trailing newline: bytes stay identical.
+		expect(readFileSync(file, "utf8")).toBe(body);
+		expect(sm.hasDeferredStartupRepairs()).toBe(true);
+		sm.applyDeferredStartupRepairs();
+		expect(readFileSync(file, "utf8")).toBe(`${body}\n`);
+		expect(sm.hasDeferredStartupRepairs()).toBe(false);
+		expect(() => parseSessionTranscriptStrict(readFileSync(file, "utf8"))).not.toThrow();
+	});
+
+	// Fix A2: a pending newline repair folded into the first append after a
+	// migration rewrite must not produce a blank line the strict parser refuses.
+	it("folds a pending newline repair into the append without creating a blank line", () => {
+		const file = join(tempDir, "fold-blank-line.jsonl");
+		const legacy = `${JSON.stringify({
+			type: "session",
+			id: "fold-legacy",
+			timestamp: "2026-01-01T00:00:00.000Z",
+			cwd: tempDir,
+		})}\n${JSON.stringify({
+			type: "message",
+			id: "aa110002",
+			parentId: null,
+			timestamp: "2026-01-01T00:00:01.000Z",
+			message: { role: "user", content: "legacy", timestamp: 1 },
+		})}`;
+		writeFileSync(file, legacy);
+
+		const sm = SessionManager.open(file, tempDir);
+		expect(sm.hasDeferredStartupRepairs()).toBe(true);
+		// Append without applyDeferredStartupRepairs: the migration rewrite runs
+		// first and already includes the appended entry, so nothing else may be
+		// appended — no blank line, no duplicate id.
+		sm.appendMessage(userMsg("next"));
+		const raw = readFileSync(file, "utf8");
+		expect(raw).not.toContain("\n\n");
+		expect(() => parseSessionTranscriptStrict(raw)).not.toThrow();
+		expect(raw.endsWith("\n")).toBe(true);
+	});
+
+	// Fix A2 (pure newline fold): without a migration, a pending newline repair
+	// is folded into the first append chunk so the previously unterminated last
+	// line gets closed instead of glued to the new entry.
+	it("folds a pure newline repair into the append without a migration rewrite", () => {
+		const file = join(tempDir, "fold-newline-only.jsonl");
+		const body = `${JSON.stringify({
+			type: "session",
+			version: 3,
+			id: "fold-newline",
+			timestamp: "2026-01-01T00:00:00.000Z",
+			cwd: tempDir,
+		})}\n${JSON.stringify({
+			type: "message",
+			id: "aa110003",
+			parentId: null,
+			timestamp: "2026-01-01T00:00:01.000Z",
+			message: { role: "user", content: "first", timestamp: 1 },
+		})}`;
+		writeFileSync(file, body);
+
+		const sm = SessionManager.open(file, tempDir);
+		expect(sm.hasDeferredStartupRepairs()).toBe(true);
+		sm.appendMessage(userMsg("second"));
+		const raw = readFileSync(file, "utf8");
+		expect(raw.startsWith(`${body}\n`)).toBe(true);
+		expect(raw).not.toContain("\n\n");
+		expect(() => parseSessionTranscriptStrict(raw)).not.toThrow();
+	});
+
+	// Fix A2: createBranchedSession rewrites the branched file, which subsumes
+	// any pending newline repair — the flag must not stay stale for the next
+	// append on the branched file.
+	it("clears a pending newline repair when a branched session is rewritten", () => {
+		const file = join(tempDir, "branch-flags.jsonl");
+		const legacyHeader = JSON.stringify({
+			type: "session",
+			id: "branch-legacy",
+			timestamp: "2026-01-01T00:00:00.000Z",
+			cwd: tempDir,
+		});
+		const m1 = JSON.stringify({
+			type: "message",
+			id: "aa110004",
+			parentId: null,
+			timestamp: "2026-01-01T00:00:01.000Z",
+			message: { role: "user", content: "one", timestamp: 1 },
+		});
+		const m2 = JSON.stringify({
+			type: "message",
+			id: "aa110005",
+			parentId: "aa110004",
+			timestamp: "2026-01-01T00:00:02.000Z",
+			message: { role: "user", content: "two", timestamp: 2 },
+		});
+		writeFileSync(file, `${legacyHeader}\n${m1}\n${m2}`); // no trailing newline
+
+		const sm = SessionManager.open(file, tempDir);
+		expect(sm.hasDeferredStartupRepairs()).toBe(true);
+		// The legacy migration regenerates entry ids: branch from the ACTUAL leaf
+		// id exposed by the opened manager, not the pre-migration fixture id.
+		const loadedEntries = sm.getEntries();
+		const leafId = loadedEntries[loadedEntries.length - 1]!.id;
+		const branchedPath = sm.createBranchedSession(leafId);
+		expect(branchedPath).toBeTruthy();
+		sm.appendMessage(userMsg("three"));
+		const raw = readFileSync(branchedPath!, "utf8");
+		expect(raw).not.toContain("\n\n");
+		expect(() => parseSessionTranscriptStrict(raw)).not.toThrow();
+		expect(raw.endsWith("\n")).toBe(true);
 	});
 
 	it("opens session files larger than Node's max string length", () => {

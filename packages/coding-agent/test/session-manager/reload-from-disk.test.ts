@@ -105,4 +105,80 @@ describe("SessionManager strict staged reload", () => {
 		expect(manager.getEntries()).toEqual(before);
 		expect(manager.getLeafId()).toBe(previousLeaf);
 	});
+
+	// Fix 7: the strict parser accepts the full StopReason set and validates
+	// the deferred handle shape (packages/ai StopReason/DeferredHandle).
+
+	function assistantEntry(id: string, parentId: string | null, message: Record<string, unknown>) {
+		return { type: "message", id, parentId, timestamp: "2026-01-01T00:00:03.000Z", message };
+	}
+
+	function validAssistantMessage(stopReason: string, extra: Record<string, unknown> = {}) {
+		return {
+			role: "assistant",
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-test",
+			content: [{ type: "text", text: "partial" }],
+			stopReason,
+			timestamp: 3,
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 },
+			...extra,
+		};
+	}
+
+	it("accepts assistant stopReason pending and deferred with a valid handle", () => {
+		const pending = jsonl(header, entry("u1", null), assistantEntry("a1", "u1", validAssistantMessage("pending")));
+		const parsedPending = parseSessionTranscriptStrict(pending);
+		expect(parsedPending.entries).toHaveLength(2);
+
+		const deferredHandle = {
+			provider: "anthropic",
+			modelId: "claude-test",
+			api: "anthropic-messages",
+			id: "resp_123",
+			expiresAt: 1893456000000,
+			pollAfterMs: 5000,
+			data: { key: "value" },
+		};
+		const deferred = jsonl(
+			header,
+			entry("u1", null),
+			assistantEntry("a2", "u1", validAssistantMessage("deferred", { deferred: deferredHandle })),
+		);
+		const parsedDeferred = parseSessionTranscriptStrict(deferred);
+		expect(parsedDeferred.entries).toHaveLength(2);
+	});
+
+	it("refuses a deferred assistant message whose handle shape is invalid", () => {
+		const base = { provider: "anthropic", modelId: "claude-test", api: "anthropic-messages", id: "resp_123" };
+		const invalidHandles = [
+			undefined,
+			"not-an-object",
+			{ ...base, provider: "" },
+			{ ...base, id: 42 },
+			{ provider: "anthropic", modelId: "claude-test", api: "anthropic-messages" },
+			{ ...base, expiresAt: "soon" },
+			{ ...base, pollAfterMs: Number.NaN },
+		];
+		for (const [index, deferred] of invalidHandles.entries()) {
+			const transcript = jsonl(
+				header,
+				entry("u1", null),
+				assistantEntry(`a-${index}`, "u1", validAssistantMessage("deferred", { deferred })),
+			);
+			expect(() => parseSessionTranscriptStrict(transcript)).toThrow(
+				/assistant message has an invalid model, content, or stopReason/,
+			);
+		}
+		// An unknown stopReason is still refused.
+		const unknownStop = jsonl(
+			header,
+			entry("u1", null),
+			assistantEntry("a-x", "u1", validAssistantMessage("squashed")),
+		);
+		expect(() => parseSessionTranscriptStrict(unknownStop)).toThrow(
+			/assistant message has an invalid model, content, or stopReason/,
+		);
+	});
 });

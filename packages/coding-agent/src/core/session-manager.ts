@@ -510,6 +510,22 @@ function isMessageContent(value: unknown): boolean {
 	});
 }
 
+/**
+ * Shape check for a serialized `DeferredHandle` (packages/ai/src/types.ts):
+ * provider/modelId/api/id non-empty strings plus optional finite-number
+ * timers (`expiresAt`, `pollAfterMs`); `data` is already JSON by construction.
+ */
+function isValidDeferredHandle(value: unknown): boolean {
+	if (!isPlainObject(value)) return false;
+	for (const key of ["provider", "modelId", "api", "id"]) {
+		if (typeof value[key] !== "string" || (value[key] as string).length === 0) return false;
+	}
+	for (const key of ["expiresAt", "pollAfterMs"]) {
+		if (value[key] !== undefined && !isFiniteNumber(value[key])) return false;
+	}
+	return true;
+}
+
 function validateStrictEntryFields(entry: Record<string, unknown>, line: number, version: number): void {
 	const type = entry.type as string;
 	if (version >= 2 && (typeof entry.id !== "string" || entry.id.length === 0)) {
@@ -549,14 +565,18 @@ function validateStrictEntryFields(entry: Record<string, unknown>, line: number,
 						);
 					}
 					break;
-				case "assistant":
+				case "assistant": {
+					// StopReason mirrors packages/ai: "pending" (in-flight) and
+					// "deferred" (background poll handle) are valid persisted states.
+					const stopReason = String(message.stopReason);
 					if (
 						typeof message.api !== "string" ||
 						typeof message.provider !== "string" ||
 						typeof message.model !== "string" ||
 						!Array.isArray(message.content) ||
 						!isMessageContent(message.content) ||
-						!["stop", "length", "toolUse", "error", "aborted"].includes(String(message.stopReason))
+						!["pending", "stop", "length", "toolUse", "error", "aborted", "deferred"].includes(stopReason) ||
+						(stopReason === "deferred" && !isValidDeferredHandle(message.deferred))
 					) {
 						throw new SessionTranscriptParseError(
 							"assistant message has an invalid model, content, or stopReason",
@@ -564,6 +584,7 @@ function validateStrictEntryFields(entry: Record<string, unknown>, line: number,
 						);
 					}
 					break;
+				}
 				case "toolResult":
 					if (
 						typeof message.toolCallId !== "string" ||
@@ -1178,10 +1199,22 @@ function parseSessionEntryLine(line: string): FileEntry | null {
 	}
 }
 
-/** Exported for testing */
-export function loadEntriesFromFile(filePath: string): FileEntry[] {
+export interface ReadSessionEntriesResult {
+	entries: FileEntry[];
+	/** True when the file's last line lacks the terminating newline. */
+	needsTrailingNewlineRepair: boolean;
+}
+
+/**
+ * Read and validate session entries without writing anything. Repairing the
+ * trailing newline is a transcript mutation, so callers decide when (and
+ * whether) to apply it — the live open path defers it until a session access
+ * guard is held; {@link loadEntriesFromFile} applies it immediately for
+ * non-live callers (branch/copy) that own their target files.
+ */
+export function readSessionEntries(filePath: string): ReadSessionEntriesResult {
 	const resolvedFilePath = normalizePath(filePath);
-	if (!existsSync(resolvedFilePath)) return [];
+	if (!existsSync(resolvedFilePath)) return { entries: [], needsTrailingNewlineRepair: false };
 
 	const entries: FileEntry[] = [];
 	let pending = "";
@@ -1213,18 +1246,25 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 		closeSync(fd);
 	}
 
-	// Validate session header before repairing the file.
-	if (entries.length === 0) return entries;
+	// Validate session header before reporting a repair.
+	if (entries.length === 0) return { entries, needsTrailingNewlineRepair: false };
 	const header = entries[0];
 	if (header.type !== "session" || typeof (header as { id?: unknown }).id !== "string") {
-		return [];
+		return { entries: [], needsTrailingNewlineRepair: false };
 	}
 
 	// Fail closed on unknown formats BEFORE any repair/write. A session from a
 	// newer runtime must stay byte-identical (bytes and mtime) after refusal.
 	validateSessionFileEntries(entries, resolvedFilePath);
 
-	if (pending) appendFileSync(resolvedFilePath, "\n");
+	return { entries, needsTrailingNewlineRepair: pending.length > 0 };
+}
+
+/** Exported for testing */
+export function loadEntriesFromFile(filePath: string): FileEntry[] {
+	const resolvedFilePath = normalizePath(filePath);
+	const { entries, needsTrailingNewlineRepair } = readSessionEntries(resolvedFilePath);
+	if (needsTrailingNewlineRepair) appendFileSync(resolvedFilePath, "\n");
 	return entries;
 }
 
@@ -1557,6 +1597,17 @@ export class SessionManager {
 	private leafId: string | null = null;
 	/** In-process admission gate installed synchronously by AgentSession locks. */
 	private writeGate: (() => string | undefined) | undefined;
+	/**
+	 * Startup repairs (trailing-newline append, legacy migration rewrite) that
+	 * were detected while loading the transcript but NOT yet written. Opening a
+	 * session must never mutate transcript bytes: the writes are deferred until
+	 * the caller's session access guard has been acquired (or the guard outcome
+	 * is a typed refusal, in which case the bytes stay unchanged).
+	 */
+	private deferredStartupRepair: { trailingNewline: boolean; migrationRewrite: boolean } = {
+		trailingNewline: false,
+		migrationRewrite: false,
+	};
 
 	private constructor(
 		cwd: string,
@@ -1565,6 +1616,7 @@ export class SessionManager {
 		persist: boolean,
 		newSessionOptions?: NewSessionOptions,
 		preloadedFileEntries?: FileEntry[],
+		preloadedNeedsTrailingNewlineRepair?: boolean,
 	) {
 		this.cwd = resolvePath(cwd);
 		this.sessionDir = normalizePath(sessionDir);
@@ -1574,7 +1626,7 @@ export class SessionManager {
 		}
 
 		if (sessionFile) {
-			this._setSessionFile(sessionFile, preloadedFileEntries);
+			this._setSessionFile(sessionFile, preloadedFileEntries, preloadedNeedsTrailingNewlineRepair);
 		} else if (preloadedFileEntries?.length) {
 			this._loadEntries(preloadedFileEntries, newSessionOptions);
 		} else {
@@ -1588,10 +1640,56 @@ export class SessionManager {
 		this._setSessionFile(sessionFile);
 	}
 
-	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
+	/** True when a startup newline repair and/or migration rewrite is still pending. */
+	hasDeferredStartupRepairs(): boolean {
+		return this.deferredStartupRepair.trailingNewline || this.deferredStartupRepair.migrationRewrite;
+	}
+
+	/**
+	 * Apply startup repairs (trailing-newline append, legacy migration rewrite)
+	 * that were deferred at open time. Called by AgentSession once the session
+	 * access guard outcome is final: under the guard on success, in degraded
+	 * (unguarded) mode where normal appends are already unguarded, and never on
+	 * blocked paths — a blocked open must leave the transcript bytes unchanged.
+	 */
+	applyDeferredStartupRepairs(): void {
+		if (!this.deferredStartupRepair.trailingNewline && !this.deferredStartupRepair.migrationRewrite) return;
+		if (!this.persist || !this.sessionFile) {
+			this.deferredStartupRepair.trailingNewline = false;
+			this.deferredStartupRepair.migrationRewrite = false;
+			return;
+		}
+		if (this.deferredStartupRepair.trailingNewline) {
+			this.#refuseIfGated();
+			appendFileSync(this.sessionFile, "\n");
+			this.deferredStartupRepair.trailingNewline = false;
+		}
+		if (this.deferredStartupRepair.migrationRewrite) {
+			this._rewriteFile();
+			this.deferredStartupRepair.migrationRewrite = false;
+		}
+	}
+
+	private _setSessionFile(
+		sessionFile: string,
+		preloadedFileEntries?: FileEntry[],
+		preloadedNeedsTrailingNewlineRepair?: boolean,
+	): void {
 		this.sessionFile = resolvePath(sessionFile);
 		if (existsSync(this.sessionFile)) {
-			const entries = preloadedFileEntries ?? loadEntriesFromFile(this.sessionFile);
+			// Opening a transcript must not write to it: the newline repair and
+			// migration rewrite are deferred (see applyDeferredStartupRepairs) so a
+			// blocked open leaves the bytes exactly as loaded.
+			const { entries, needsTrailingNewlineRepair } = preloadedFileEntries
+				? {
+						entries: preloadedFileEntries,
+						// Static open preloads via readSessionEntries; the flag carries the
+						// observed pending newline repair so it stays deferred like every
+						// other open path instead of being silently dropped.
+						needsTrailingNewlineRepair: preloadedNeedsTrailingNewlineRepair ?? false,
+					}
+				: readSessionEntries(this.sessionFile);
+			this.deferredStartupRepair.trailingNewline = needsTrailingNewlineRepair;
 
 			// If file was empty, initialize it with a valid session header. If it was
 			// non-empty but did not parse as a pi session, fail without modifying it.
@@ -1600,6 +1698,7 @@ export class SessionManager {
 				if (statSync(explicitPath).size > 0) {
 					throw new Error(`Session file is not a valid ${APP_NAME} session: ${explicitPath}`);
 				}
+				this.deferredStartupRepair.trailingNewline = false;
 				this.newSession();
 				this.sessionFile = explicitPath;
 				this._rewriteFile();
@@ -1653,7 +1752,9 @@ export class SessionManager {
 			this.sessionId = header.id;
 
 			if (migrateToCurrentVersion(this.fileEntries)) {
-				this._rewriteFile();
+				// Deferred: the transcript is rewritten only when the session access
+				// guard outcome allows writes (see applyDeferredStartupRepairs).
+				this.deferredStartupRepair.migrationRewrite = true;
 			}
 		} else {
 			this.newSession(options);
@@ -1695,6 +1796,11 @@ export class SessionManager {
 		} finally {
 			closeSync(fd);
 		}
+		// A full rewrite always ends with a trailing newline, which subsumes any
+		// pending newline repair. Keeping the flag pending here would fold a
+		// leading "\n" into the next append and produce a blank line that the
+		// strict transcript parser refuses (Fix A2).
+		this.deferredStartupRepair.trailingNewline = false;
 	}
 
 	isPersisted(): boolean {
@@ -1747,9 +1853,26 @@ export class SessionManager {
 			} finally {
 				closeSync(fd);
 			}
+			this.deferredStartupRepair.trailingNewline = false;
+			this.deferredStartupRepair.migrationRewrite = false;
 			this.flushed = true;
 		} else {
-			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			// A deferred startup migration means the in-memory tree is newer than
+			// the on-disk bytes: persist the full migrated tree. The rewrite already
+			// includes `entry` (the tree was updated before persist) and always ends
+			// with a trailing newline, so nothing else may be appended — folding a
+			// prefix here would duplicate the entry or create a blank line the
+			// strict transcript parser refuses (Fix A2).
+			if (this.deferredStartupRepair.migrationRewrite) {
+				this._rewriteFile();
+				this.deferredStartupRepair.migrationRewrite = false;
+				return;
+			}
+			// A pending newline repair without a migration: fold the newline into
+			// the first append chunk so the transcript never ends mid-line.
+			const newlinePrefix = this.deferredStartupRepair.trailingNewline ? "\n" : "";
+			this.deferredStartupRepair.trailingNewline = false;
+			appendFileSync(this.sessionFile, `${newlinePrefix}${JSON.stringify(entry)}\n`);
 		}
 	}
 
@@ -2049,6 +2172,10 @@ export class SessionManager {
 			this.leafId = stage.leafId;
 			this.sessionId = stage.sessionId;
 			this.flushed = true;
+			// The committed bytes come from an external verified transcript at the
+			// current version; any pending startup repairs are already superseded.
+			this.deferredStartupRepair.trailingNewline = false;
+			this.deferredStartupRepair.migrationRewrite = false;
 		} catch (error) {
 			this.fileEntries = snapshotEntries;
 			this.byId = snapshotById;
@@ -2399,6 +2526,7 @@ export class SessionManager {
 		const resolvedPath = resolvePath(path);
 		let header: SessionHeader | null = null;
 		let preloadedFileEntries: FileEntry[] | undefined;
+		let preloadedNeedsTrailingNewlineRepair: boolean | undefined;
 		if (cwdOverride === undefined && existsSync(resolvedPath)) {
 			try {
 				header = readSessionHeader(resolvedPath);
@@ -2406,7 +2534,12 @@ export class SessionManager {
 				if (!(error instanceof SessionHeaderScanLimitError)) throw error;
 				// The bounded scan is only a discovery optimization. A full load remains
 				// authoritative for legacy files with very large headers or prefixes.
-				preloadedFileEntries = loadEntriesFromFile(resolvedPath);
+				// Read WITHOUT repairing: loadEntriesFromFile would append the newline
+				// eagerly, writing to the transcript during open (Fix A1). The repair
+				// stays deferred exactly like every other open path.
+				const full = readSessionEntries(resolvedPath);
+				preloadedFileEntries = full.entries;
+				preloadedNeedsTrailingNewlineRepair = full.needsTrailingNewlineRepair;
 				const firstEntry = preloadedFileEntries[0];
 				header = firstEntry?.type === "session" ? firstEntry : null;
 			}
@@ -2414,7 +2547,15 @@ export class SessionManager {
 		const cwd = cwdOverride ?? (header ? getSessionHeaderCwd(header) : undefined) ?? process.cwd();
 		// If no sessionDir provided, derive from file's parent directory
 		const dir = sessionDir ? normalizePath(sessionDir) : resolve(resolvedPath, "..");
-		return new SessionManager(cwd, dir, resolvedPath, true, undefined, preloadedFileEntries);
+		return new SessionManager(
+			cwd,
+			dir,
+			resolvedPath,
+			true,
+			undefined,
+			preloadedFileEntries,
+			preloadedNeedsTrailingNewlineRepair,
+		);
 	}
 
 	/**

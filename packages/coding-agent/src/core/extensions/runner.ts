@@ -82,6 +82,8 @@ import type {
 	SessionBeforeTreeResult,
 	SessionBoundaryDraft,
 	SessionDataLeaseInspectionResult,
+	SessionDataLockOptions,
+	SessionDataLockReleaseOptions,
 	SessionDataLockReleaseResult,
 	SessionDataLockResult,
 	SessionDataReplaceResult,
@@ -386,12 +388,16 @@ export class ExtensionRunner {
 		code: "unsupported_mode",
 		message: "session data lock API is unavailable in this mode",
 	});
-	private acquireSessionDataLockFn: () => Promise<SessionDataLockResult> = async () => ({
-		status: "refused",
-		code: "unsupported_mode",
-		message: "session data lock API is unavailable in this mode",
-	});
-	private releaseSessionDataLockFn: (lockId: string) => Promise<SessionDataLockReleaseResult> = async () => ({
+	private acquireSessionDataLockFn: (options?: SessionDataLockOptions) => Promise<SessionDataLockResult> =
+		async () => ({
+			status: "refused",
+			code: "unsupported_mode",
+			message: "session data lock API is unavailable in this mode",
+		});
+	private releaseSessionDataLockFn: (
+		lockId: string,
+		options?: SessionDataLockReleaseOptions,
+	) => Promise<SessionDataLockReleaseResult> = async () => ({
 		status: "refused",
 		code: "unsupported_mode",
 		message: "session data lock API is unavailable in this mode",
@@ -400,6 +406,7 @@ export class ExtensionRunner {
 		candidatePath: string;
 		lockId: string;
 		backupName?: string;
+		backupDir?: string;
 	}) => Promise<SessionDataReplaceResult> = async () => ({
 		status: "refused",
 		code: "unsupported_mode",
@@ -1111,13 +1118,13 @@ export class ExtensionRunner {
 			this.assertActive();
 			return this.inspectSessionDataLeaseFn();
 		};
-		context.acquireSessionDataLock = () => {
+		context.acquireSessionDataLock = (options?: SessionDataLockOptions) => {
 			this.assertActive();
-			return this.acquireSessionDataLockFn();
+			return this.acquireSessionDataLockFn(options);
 		};
-		context.releaseSessionDataLock = (lockId) => {
+		context.releaseSessionDataLock = (lockId, options) => {
 			this.assertActive();
-			return this.releaseSessionDataLockFn(lockId);
+			return this.releaseSessionDataLockFn(lockId, options);
 		};
 		context.replaceSessionDataTranscript = (options) => {
 			this.assertActive();

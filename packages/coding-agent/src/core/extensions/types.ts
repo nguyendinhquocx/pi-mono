@@ -407,6 +407,7 @@ export type SessionDataRefusalCode =
 	| "lease_conflict"
 	| "lock_missing"
 	| "write_guard_unavailable"
+	| "write_guard_uncertain"
 	| "writer_conflict"
 	| "registry_invalid"
 	| "recovery_blocked"
@@ -437,8 +438,23 @@ export type SessionDataLockResult =
 	  }
 	| { status: "refused"; code: SessionDataRefusalCode; message: string; observedFingerprint?: string };
 
+export type SessionDataLockReleaseOptions = {
+	/**
+	 * Keep the mutation claim/journal in place as recovery evidence (for a
+	 * BLOCKED operation). The guard is still downgraded, the guard record
+	 * cleared, and admission unlocked; the next acquire refuses
+	 * `recovery_blocked` until stale-claim recovery resolves the claim.
+	 */
+	keepClaim?: boolean;
+};
+
 export type SessionDataLockReleaseResult =
-	| { status: "released"; lockId: string }
+	| {
+			status: "released";
+			lockId: string;
+			/** True when the claim was intentionally kept for recovery. */
+			claimKept?: boolean;
+	  }
 	| { status: "refused"; code: SessionDataRefusalCode; message: string };
 
 export type SessionDataReplaceResult =
@@ -468,14 +484,18 @@ export interface ExtensionCommandContext extends ExtensionContext {
 	/** Acquire the in-process admission gate, registry claim, and OS transcript guard. Pass the preview fingerprint so a concurrent write between preview and acquire is refused under the guard. */
 	acquireSessionDataLock(options?: SessionDataLockOptions): Promise<SessionDataLockResult>;
 
-	/** Release a lock after refresh/rollback completes. */
-	releaseSessionDataLock(lockId: string): Promise<SessionDataLockReleaseResult>;
+	/** Release a lock after refresh/rollback completes. `keepClaim` retains the claim journal as recovery evidence. */
+	releaseSessionDataLock(
+		lockId: string,
+		options?: SessionDataLockReleaseOptions,
+	): Promise<SessionDataLockReleaseResult>;
 
 	/** Atomically replace the transcript through the held OS guard and re-lock the published path. */
 	replaceSessionDataTranscript(options: {
 		candidatePath: string;
 		lockId: string;
 		backupName?: string;
+		backupDir?: string;
 	}): Promise<SessionDataReplaceResult>;
 
 	/** Refresh transcript projection in place without restarting extension/runtime state. */
@@ -2315,12 +2335,16 @@ export interface ExtensionContextActions {
 export interface ExtensionCommandContextActions {
 	waitForIdle: () => Promise<void>;
 	inspectSessionDataLease?: () => Promise<SessionDataLeaseInspectionResult>;
-	acquireSessionDataLock?: () => Promise<SessionDataLockResult>;
-	releaseSessionDataLock?: (lockId: string) => Promise<SessionDataLockReleaseResult>;
+	acquireSessionDataLock?: (options?: SessionDataLockOptions) => Promise<SessionDataLockResult>;
+	releaseSessionDataLock?: (
+		lockId: string,
+		options?: SessionDataLockReleaseOptions,
+	) => Promise<SessionDataLockReleaseResult>;
 	replaceSessionDataTranscript?: (options: {
 		candidatePath: string;
 		lockId: string;
 		backupName?: string;
+		backupDir?: string;
 	}) => Promise<SessionDataReplaceResult>;
 	reloadSessionFromDisk?: (options: { expectedFingerprint: string; lockId: string }) => Promise<SessionReloadResult>;
 	newSession: (options?: {

@@ -1,22 +1,24 @@
 import { spawnSync } from "child_process";
-import { createHash } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import {
 	closeSync,
 	existsSync,
 	fsyncSync,
 	linkSync,
+	lstatSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
 	readFileSync,
 	renameSync,
 	rmSync,
+	statSync,
 	unlinkSync,
 	writeSync,
 } from "fs";
-import { join } from "path";
+import { basename, dirname, join } from "path";
 import { canonicalizePath } from "../utils/paths.ts";
-import { TranscriptWriteGuard } from "./transcript-write-guard.ts";
+import { fingerprintThroughGuard, TranscriptWriteGuard } from "./transcript-write-guard.ts";
 
 /**
  * Session-open lease registry (v1) per the session-trim spec.
@@ -70,6 +72,7 @@ export type RegistryErrorCode =
 	| "lease_conflict"
 	| "recovery_blocked"
 	| "writer_conflict"
+	| "write_guard_uncertain"
 	| "write_guard_unavailable"
 	| "io_error";
 
@@ -92,6 +95,8 @@ export interface LeaseRegistryFile {
 	real_write_enabled: boolean;
 	approved_builds: ApprovedBuild[];
 	t20_receipt_sha256?: string;
+	/** Path of the T20 canary receipt file; required (and hash-verified) when real_write_enabled. */
+	t20_receipt_path?: string;
 }
 
 export interface LeaseRecord {
@@ -120,6 +125,8 @@ export interface LeaseClaimRecord {
 	original_fingerprint: string;
 	candidate_fingerprint?: string;
 	backup_name?: string;
+	/** Directory holding the backup file; defaults to `<registry root>/backups` when absent. */
+	backup_dir?: string;
 }
 
 export interface GuardRecord {
@@ -473,6 +480,82 @@ function isSha256(value: string): boolean {
 	return /^[a-f0-9]{64}$/.test(value);
 }
 
+/** A T20 promotion receipt larger than this is not a canary receipt; refuse. */
+const T20_RECEIPT_MAX_BYTES = 64 * 1024;
+
+/**
+ * Validated shape of a T20 canary promotion receipt. The receipt is the
+ * durable human-gate evidence pinned into registry.json via
+ * `t20_receipt_sha256`; the promotion gate verifies not just the bytes but
+ * WHAT was approved: the decision, the exact runtime, and the exact artifact
+ * build this process is running.
+ */
+interface T20PromotionReceipt {
+	schema_version: number;
+	kind: string;
+	decision: string;
+	runtime: string;
+	artifact_sha256: string;
+	protocol_version: number;
+	approved_at?: string;
+}
+
+/**
+ * Strictly parse and shape-check a T20 promotion receipt. Unknown extra
+ * fields are ignored; duplicate keys, malformed JSON, wrong types, or a
+ * version/kind mismatch fail closed.
+ */
+function parseT20Receipt(raw: string): { ok: true; receipt: T20PromotionReceipt } | { ok: false; reason: string } {
+	let parsed: unknown;
+	try {
+		parsed = parseJsonStrict(raw);
+	} catch (error) {
+		return {
+			ok: false,
+			reason: `receipt is not strict JSON (${error instanceof Error ? error.message : String(error)})`,
+		};
+	}
+	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+		return { ok: false, reason: "receipt is not a JSON object" };
+	}
+	const record = parsed as Record<string, unknown>;
+	if (record["schema_version"] !== 1) return { ok: false, reason: "receipt schema_version must be 1" };
+	if (record["kind"] !== "pi-core-t20-promotion-receipt") {
+		return { ok: false, reason: "receipt kind must be pi-core-t20-promotion-receipt" };
+	}
+	if (typeof record["decision"] !== "string" || record["decision"].length === 0) {
+		return { ok: false, reason: "receipt decision must be a non-empty string" };
+	}
+	if (typeof record["runtime"] !== "string" || record["runtime"].length === 0) {
+		return { ok: false, reason: "receipt runtime must be a non-empty string" };
+	}
+	if (typeof record["artifact_sha256"] !== "string" || !isSha256(record["artifact_sha256"])) {
+		return { ok: false, reason: "receipt artifact_sha256 must be lowercase hex64" };
+	}
+	if (
+		typeof record["protocol_version"] !== "number" ||
+		!Number.isFinite(record["protocol_version"]) ||
+		record["protocol_version"] !== LEASE_REGISTRY_PROTOCOL_VERSION
+	) {
+		return { ok: false, reason: `receipt protocol_version must be ${LEASE_REGISTRY_PROTOCOL_VERSION}` };
+	}
+	if (record["approved_at"] !== undefined && typeof record["approved_at"] !== "string") {
+		return { ok: false, reason: "receipt approved_at must be a string when present" };
+	}
+	return {
+		ok: true,
+		receipt: {
+			schema_version: 1,
+			kind: record["kind"] as string,
+			decision: record["decision"] as string,
+			runtime: record["runtime"] as string,
+			artifact_sha256: record["artifact_sha256"] as string,
+			protocol_version: record["protocol_version"] as number,
+			...(record["approved_at"] !== undefined ? { approved_at: record["approved_at"] as string } : {}),
+		},
+	};
+}
+
 function isProcessStartIdentity(value: string): boolean {
 	return value === PROCESS_START_UNKNOWN || normalizeProcessStartUtc(value) === value;
 }
@@ -502,6 +585,8 @@ export function parseRegistryFile(value: unknown): LeaseRegistryFile | null {
 	if (value.t20_receipt_sha256 !== undefined && typeof value.t20_receipt_sha256 !== "string") return null;
 	const receipt = optionalString(value, "t20_receipt_sha256");
 	if (receipt !== undefined && !isSha256(receipt)) return null;
+	if (value.t20_receipt_path !== undefined && typeof value.t20_receipt_path !== "string") return null;
+	const receiptPath = optionalString(value, "t20_receipt_path");
 	const parsed: LeaseRegistryFile = {
 		format_version: LEASE_REGISTRY_FORMAT_VERSION,
 		protocol_version: LEASE_REGISTRY_PROTOCOL_VERSION,
@@ -509,6 +594,7 @@ export function parseRegistryFile(value: unknown): LeaseRegistryFile | null {
 		approved_builds: approvedBuilds,
 	};
 	if (receipt !== undefined) parsed.t20_receipt_sha256 = receipt;
+	if (receiptPath !== undefined) parsed.t20_receipt_path = receiptPath;
 	return parsed;
 }
 
@@ -613,6 +699,12 @@ export function parseClaimRecord(value: unknown): LeaseClaimRecord | null {
 		if (backupName === "." || backupName === ".." || /[\\/]/.test(backupName)) return null;
 		record.backup_name = backupName;
 	}
+	if (value.backup_dir !== undefined && typeof value.backup_dir !== "string") return null;
+	const backupDir = optionalString(value, "backup_dir");
+	if (backupDir !== undefined) {
+		if (backupDir.length === 0 || backupDir.includes("\u0000")) return null;
+		record.backup_dir = backupDir;
+	}
 	return record;
 }
 
@@ -659,6 +751,27 @@ function sha256Hex(bytes: Buffer): string {
 	return createHash("sha256").update(bytes).digest("hex");
 }
 
+/**
+ * One-line recovery inspector for a claim, matching the spec's Task 4
+ * recovery report: phase plus current/original/candidate fingerprints and the
+ * backup location. Used in refusal/blocked messages so an operator can decide
+ * between clearing, finalizing, or restoring without opening the records.
+ */
+export function formatClaimRecoveryInspection(
+	claim: LeaseClaimRecord,
+	currentFingerprint: string | null,
+	defaultBackupDir: string,
+): string {
+	return (
+		`phase=${claim.phase}` +
+		` current=${currentFingerprint ?? "unreadable"}` +
+		` original=${claim.original_fingerprint}` +
+		` candidate=${claim.candidate_fingerprint ?? "none"}` +
+		` backup=${claim.backup_name ?? "none"}` +
+		` backup_dir=${claim.backup_dir ?? defaultBackupDir}`
+	);
+}
+
 /** SHA-256 hex of the exact raw bytes of a file, or null when unreadable. */
 export function fileFingerprint(filePath: string): string | null {
 	try {
@@ -672,6 +785,13 @@ export interface SessionOpenLeaseRegistryOptions {
 	runtime: string;
 	buildHash: string;
 	processInventory?: ProcessInventory;
+	/**
+	 * Test seam: invoked after a stale guard record was observed and proven dead,
+	 * but before the reclaiming rename. Lets deterministic race tests replace the
+	 * record between the initial read and the reclaim, which is exactly the
+	 * interleaving the restore-on-mismatch fence must survive.
+	 */
+	beforeStaleGuardReclaim?: () => void;
 }
 
 interface RegistryPaths {
@@ -755,12 +875,14 @@ export class SessionOpenLeaseRegistry {
 	#available = false;
 	#degradationReason: string | undefined;
 	#registryCache: LeaseRegistryFile | undefined;
+	#beforeStaleGuardReclaim: (() => void) | undefined;
 
 	private constructor(agentDir: string, options: SessionOpenLeaseRegistryOptions, paths: RegistryPaths) {
 		this.agentDir = agentDir;
 		this.runtime = options.runtime;
 		this.buildHash = options.buildHash;
 		this.processInventory = options.processInventory ?? createDefaultProcessInventory();
+		this.#beforeStaleGuardReclaim = options.beforeStaleGuardReclaim;
 		this.#paths = paths;
 	}
 
@@ -794,6 +916,11 @@ export class SessionOpenLeaseRegistry {
 
 	get paths(): RegistryPaths {
 		return this.#paths;
+	}
+
+	/** Directory holding transcript backups; claims may override it per claim via `backup_dir`. */
+	defaultBackupDir(): string {
+		return join(this.#paths.root, "backups");
 	}
 
 	#ensureRegistryFile(): void {
@@ -850,8 +977,11 @@ export class SessionOpenLeaseRegistry {
 	}
 
 	/**
-	 * Promotion gate: real-write requires the registry to enable the flag and to
-	 * approve this exact runtime build hash. Otherwise trim refuses.
+	 * Promotion gate: real-write requires the registry to enable the flag, to
+	 * approve this exact runtime build hash, and to point at a T20 canary
+	 * receipt file whose exact bytes hash to `t20_receipt_sha256`. A
+	 * shape-only registry (hash without a verifiable receipt file) is not
+	 * enough: the receipt must exist on disk and match byte-for-byte.
 	 */
 	checkPromotionGate(): RegistryOpResult<LeaseRegistryFile> {
 		const registry = this.readRegistry();
@@ -862,10 +992,64 @@ export class SessionOpenLeaseRegistry {
 		if (!/^[a-f0-9]{64}$/.test(registry.value.t20_receipt_sha256 ?? "")) {
 			return fail("registry_invalid", "T20 promotion receipt is missing or malformed");
 		}
+		const receiptPath = registry.value.t20_receipt_path;
+		if (typeof receiptPath !== "string" || receiptPath.length === 0) {
+			return fail(
+				"registry_invalid",
+				"T20 promotion receipt path (t20_receipt_path) is missing; real-write requires a verifiable canary receipt file",
+			);
+		}
+		if (!existsSync(receiptPath)) {
+			return fail("registry_invalid", `T20 promotion receipt file is missing at ${receiptPath}`);
+		}
+		const receiptFingerprint = fileFingerprint(receiptPath);
+		if (receiptFingerprint === null) {
+			return fail("registry_invalid", `T20 promotion receipt file is unreadable at ${receiptPath}`);
+		}
+		if (receiptFingerprint !== registry.value.t20_receipt_sha256) {
+			return fail(
+				"registry_invalid",
+				`T20 promotion receipt hash mismatch at ${receiptPath}: file does not hash to t20_receipt_sha256`,
+			);
+		}
+		// Byte-exact match is necessary but not sufficient: the receipt must
+		// actually record an approved promotion of THIS runtime build. A stale
+		// receipt (older build), a wrong-runtime receipt, or a denied decision
+		// must keep the gate closed even when its bytes hash correctly.
+		let receiptRaw: string;
+		try {
+			const stats = statSync(receiptPath);
+			if (stats.size > T20_RECEIPT_MAX_BYTES) {
+				return fail("registry_invalid", `T20 promotion receipt at ${receiptPath} is unreasonably large`);
+			}
+			receiptRaw = readFileSync(receiptPath, "utf8");
+		} catch (error) {
+			return fail("registry_invalid", `T20 promotion receipt at ${receiptPath} is unreadable: ${String(error)}`);
+		}
+		const parsedReceipt = parseT20Receipt(receiptRaw);
+		if (!parsedReceipt.ok) {
+			return fail("registry_invalid", `T20 promotion receipt is invalid: ${parsedReceipt.reason}`);
+		}
+		const receipt = parsedReceipt.receipt;
+		if (receipt.decision !== "approved") {
+			return fail("registry_invalid", `T20 promotion receipt decision is "${receipt.decision}", not approved`);
+		}
+		if (receipt.runtime !== this.runtime) {
+			return fail(
+				"registry_invalid",
+				`T20 promotion receipt approves runtime "${receipt.runtime}", not this runtime ("${this.runtime}")`,
+			);
+		}
 		if (!/^[a-f0-9]{64}$/.test(this.buildHash)) {
 			return fail(
 				"registry_invalid",
 				"current runtime artifact identity is unavailable or the build receipt is dirty",
+			);
+		}
+		if (receipt.artifact_sha256 !== this.buildHash) {
+			return fail(
+				"registry_invalid",
+				`T20 promotion receipt approves build ${receipt.artifact_sha256}, not the running build ${this.buildHash}`,
 			);
 		}
 		const approved = registry.value.approved_builds.some(
@@ -1067,8 +1251,9 @@ export class SessionOpenLeaseRegistry {
 			if (this.processInventory.isProcessAlive(parsed.owner_pid, parsed.owner_start_utc)) {
 				return fail("writer_conflict", `identity guard held by live owner (pid ${parsed.owner_pid})`);
 			}
-			const stalePath = `${guardPath}.${parsed.guard_id}.stale`;
+			const stalePath = `${guardPath}.${parsed.guard_id}.stale-${process.hrtime.bigint()}`;
 			try {
+				this.#beforeStaleGuardReclaim?.();
 				// Atomic quarantine of the exact record we observed; then re-read its
 				// guard_id/path_hash before deleting it. No age/mtime inference.
 				renameSync(guardPath, stalePath);
@@ -1082,9 +1267,21 @@ export class SessionOpenLeaseRegistry {
 				quarantinedRecord.guard_id !== parsed.guard_id ||
 				quarantinedRecord.path_hash !== pathHash
 			) {
+				// A concurrent reclaimer/publisher replaced the record between our
+				// read and our rename: the quarantined bytes are NOT the record we
+				// proved dead. Restore them to the canonical name so a live owner's
+				// record is never stranded under the quarantine suffix (a stranded
+				// record would leave the canonical name free for a publisher while
+				// the true owner still holds the OS write guard), then fail.
+				try {
+					renameSync(stalePath, guardPath);
+				} catch {
+					// Canonical was re-published in the restore window; keep the
+					// quarantined copy as inert recovery evidence.
+				}
 				return fail(
-					"recovery_blocked",
-					"identity guard changed during stale-owner reclaim; quarantined record retained",
+					"writer_conflict",
+					"identity guard was replaced during stale-owner reclaim; observed record restored",
 				);
 			}
 			try {
@@ -1117,11 +1314,68 @@ export class SessionOpenLeaseRegistry {
 			owner_start_utc: processStart,
 			started_at: new Date().toISOString(),
 		};
+		const guardPath = join(this.#paths.guardsDir, `${pathHash}.lock`);
 		try {
-			writeJsonFileSync(join(this.#paths.guardsDir, `${pathHash}.lock`), record);
+			writeJsonFileSync(guardPath, record);
 			return { ok: true, value: record };
 		} catch (error) {
-			return fail("io_error", `failed to write guard record: ${String(error)}`);
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+				return fail("io_error", `failed to write guard record: ${String(error)}`);
+			}
+			// Contention: only a provably dead owner may be reclaimed. Age is never
+			// proof; the recorded PID must be gone or have a different start identity.
+			const existing = readJsonFileSync(guardPath);
+			if (!existing.ok) {
+				return fail("writer_conflict", "guard record exists but is unreadable");
+			}
+			const parsed = parseGuardRecord(existing.value);
+			if (!parsed) {
+				return fail("registry_invalid", "existing guard record failed schema validation");
+			}
+			if (parsed.owner_pid === process.pid) {
+				return fail("writer_conflict", "guard record is already held by this process");
+			}
+			if (this.processInventory.isProcessAlive(parsed.owner_pid, parsed.owner_start_utc)) {
+				return fail("writer_conflict", `guard record held by live owner (pid ${parsed.owner_pid})`);
+			}
+			const stalePath = `${guardPath}.${parsed.guard_id}.stale-${process.hrtime.bigint()}`;
+			try {
+				this.#beforeStaleGuardReclaim?.();
+				// Quarantine the exact record we observed; it is retained as recovery
+				// evidence instead of being deleted.
+				renameSync(guardPath, stalePath);
+			} catch (renameError) {
+				return fail("writer_conflict", `failed to atomically reclaim stale guard record: ${String(renameError)}`);
+			}
+			const quarantined = readJsonFileSync(stalePath);
+			const quarantinedRecord = quarantined.ok ? parseGuardRecord(quarantined.value) : null;
+			if (
+				!quarantinedRecord ||
+				quarantinedRecord.guard_id !== parsed.guard_id ||
+				quarantinedRecord.path_hash !== pathHash
+			) {
+				// The record at the canonical name changed between our initial read
+				// and the reclaiming rename (a concurrent reclaimer or publisher won
+				// the race). Restore the exact bytes so the current owner's record
+				// stays at the canonical name and the registry keeps reflecting the
+				// real OS-guard holder, then refuse.
+				try {
+					renameSync(stalePath, guardPath);
+				} catch {
+					// Canonical was re-published in the restore window; keep the
+					// quarantined copy as inert recovery evidence.
+				}
+				return fail(
+					"writer_conflict",
+					"guard record was replaced during stale-owner reclaim; observed record restored",
+				);
+			}
+			try {
+				writeJsonFileSync(guardPath, record);
+				return { ok: true, value: record };
+			} catch (publishError) {
+				return fail("io_error", `failed to write guard record after stale-owner reclaim: ${String(publishError)}`);
+			}
 		}
 	}
 
@@ -1200,7 +1454,7 @@ export class SessionOpenLeaseRegistry {
 	/** Update the claim under the per-identity guard (phase journal advances). */
 	updateClaim(
 		pathHash: string,
-		update: Partial<Pick<LeaseClaimRecord, "phase" | "candidate_fingerprint" | "backup_name">> & {
+		update: Partial<Pick<LeaseClaimRecord, "phase" | "candidate_fingerprint" | "backup_name" | "backup_dir">> & {
 			expectedPhase?: LeaseClaimPhase;
 		},
 	): RegistryOpResult<LeaseClaimRecord> {
@@ -1220,6 +1474,7 @@ export class SessionOpenLeaseRegistry {
 				...(update.phase ? { phase: update.phase } : {}),
 				...(update.candidate_fingerprint ? { candidate_fingerprint: update.candidate_fingerprint } : {}),
 				...(update.backup_name ? { backup_name: update.backup_name } : {}),
+				...(update.backup_dir ? { backup_dir: update.backup_dir } : {}),
 			};
 			try {
 				writeJsonFileSync(join(this.#paths.claimsDir, `${pathHash}.json`), updated, true);
@@ -1240,7 +1495,7 @@ export class SessionOpenLeaseRegistry {
 		pathHash: string,
 		lockId: string,
 		guardId: string,
-		update: Partial<Pick<LeaseClaimRecord, "phase" | "candidate_fingerprint" | "backup_name">>,
+		update: Partial<Pick<LeaseClaimRecord, "phase" | "candidate_fingerprint" | "backup_name" | "backup_dir">>,
 	): RegistryOpResult<LeaseClaimRecord> {
 		const existing = this.readClaim(pathHash);
 		if (!existing.ok) return fail("registry_invalid", existing.message);
@@ -1257,6 +1512,7 @@ export class SessionOpenLeaseRegistry {
 			...(update.phase ? { phase: update.phase } : {}),
 			...(update.candidate_fingerprint ? { candidate_fingerprint: update.candidate_fingerprint } : {}),
 			...(update.backup_name ? { backup_name: update.backup_name } : {}),
+			...(update.backup_dir ? { backup_dir: update.backup_dir } : {}),
 		};
 		try {
 			writeJsonFileSync(join(this.#paths.claimsDir, `${pathHash}.json`), updated, true);
@@ -1308,7 +1564,12 @@ export class SessionOpenLeaseRegistry {
 	}): RegistryOpResult<
 		| { action: "cleared" }
 		| { action: "finalized" }
-		| { action: "restore_candidate"; backupPath: string; expectedCurrentFingerprint: string }
+		| {
+				action: "restore_candidate";
+				backupPath: string;
+				expectedCurrentFingerprint: string;
+				expectedBackupFingerprint: string;
+		  }
 		| { action: "blocked"; reason: string }
 	> {
 		const existing = this.readClaim(input.pathHash);
@@ -1316,11 +1577,24 @@ export class SessionOpenLeaseRegistry {
 		const claim = existing.value;
 		if (claim === null) return { ok: true, value: { action: "cleared" } };
 		if (this.processInventory.isProcessAlive(claim.owner_pid, claim.owner_start_utc)) {
-			return fail("writer_conflict", `mutation claim owner is alive (pid ${claim.owner_pid})`);
+			return fail(
+				"writer_conflict",
+				`mutation claim owner is alive (pid ${claim.owner_pid}); ${formatClaimRecoveryInspection(
+					claim,
+					fileFingerprint(input.transcriptPath),
+					this.defaultBackupDir(),
+				)}`,
+			);
 		}
 		const currentFingerprint = fileFingerprint(input.transcriptPath);
 		if (currentFingerprint === null) {
-			return { ok: true, value: { action: "blocked", reason: "transcript file is unreadable or missing" } };
+			return {
+				ok: true,
+				value: {
+					action: "blocked",
+					reason: `claim is blocked: ${formatClaimRecoveryInspection(claim, null, this.defaultBackupDir())}: transcript file is unreadable or missing`,
+				},
+			};
 		}
 		if (currentFingerprint === claim.original_fingerprint) {
 			const cleared = this.clearClaim(input.pathHash);
@@ -1341,7 +1615,8 @@ export class SessionOpenLeaseRegistry {
 			}
 		}
 		if (claim.backup_name) {
-			const backupPath = join(this.#paths.root, "backups", claim.backup_name);
+			const backupDir = claim.backup_dir ?? this.defaultBackupDir();
+			const backupPath = join(backupDir, claim.backup_name);
 			if (existsSync(backupPath) && fileFingerprint(backupPath) === claim.original_fingerprint) {
 				return {
 					ok: true,
@@ -1349,6 +1624,11 @@ export class SessionOpenLeaseRegistry {
 						action: "restore_candidate",
 						backupPath,
 						expectedCurrentFingerprint: currentFingerprint,
+						// The claim's recorded original fingerprint is the only trusted
+						// identity of the backup bytes; guardedRestore must re-prove it
+						// at restore time (Node-side and in the helper) so a backup
+						// mutated between inspection and restore is refused.
+						expectedBackupFingerprint: claim.original_fingerprint,
 					},
 				};
 			}
@@ -1357,46 +1637,120 @@ export class SessionOpenLeaseRegistry {
 			ok: true,
 			value: {
 				action: "blocked",
-				reason: `claim phase ${claim.phase}: current hash matches neither original nor candidate`,
+				reason: `claim is blocked: ${formatClaimRecoveryInspection(claim, currentFingerprint, this.defaultBackupDir())}: current hash matches neither original nor candidate`,
 			},
 		};
 	}
 
-	/** Guarded restore of a backup over the transcript under an exclusive OS guard. */
+	/**
+	 * Guarded restore of a backup over the transcript under an exclusive OS guard.
+	 * `expectedBackupFingerprint` is the claim's recorded original fingerprint:
+	 * the backup is fingerprint-verified before the guard is taken and the pinned
+	 * expectation is re-verified Node-side and inside the helper at rewrite time,
+	 * so bytes mutated between recovery inspection and restore are refused.
+	 */
 	async guardedRestore(input: {
 		transcriptPath: string;
 		backupPath: string;
 		pathHash: string;
 		expectedCurrentFingerprint: string;
+		expectedBackupFingerprint: string;
 		guardOpTimeoutMs?: number;
 	}): Promise<RegistryOpResult<{ fingerprint: string }>> {
+		// Bind the backup to the claim's recorded fingerprint BEFORE taking the
+		// exclusive guard: the backup is a plain unlocked file, so a TOCTOU window
+		// between recovery inspection and restore is real. Read/verify first, then
+		// let the pinned rewrite close the remaining Node-to-helper gap.
+		try {
+			const backupStats = lstatSync(input.backupPath);
+			if (!backupStats.isFile() || backupStats.isSymbolicLink()) {
+				return fail("recovery_blocked", `restore backup is not a regular file: ${input.backupPath}`);
+			}
+		} catch (error) {
+			return fail("recovery_blocked", `restore backup is unreadable (${input.backupPath}): ${String(error)}`);
+		}
+		const backupFingerprint = fileFingerprint(input.backupPath);
+		if (backupFingerprint !== input.expectedBackupFingerprint) {
+			return fail(
+				"recovery_blocked",
+				`backup no longer matches the claim's recorded original fingerprint (expected ${input.expectedBackupFingerprint}, found ${backupFingerprint ?? "unreadable"}); guarded restore refused`,
+			);
+		}
 		const acquired = await TranscriptWriteGuard.acquire(input.transcriptPath, {
 			mode: "exclusive",
 			opTimeoutMs: input.guardOpTimeoutMs,
 		});
 		if (!acquired.ok) {
 			return fail(
-				acquired.code === "writer_conflict" ? "writer_conflict" : "write_guard_unavailable",
+				acquired.code === "writer_conflict"
+					? "writer_conflict"
+					: acquired.code === "write_guard_uncertain"
+						? "write_guard_uncertain"
+						: "write_guard_unavailable",
 				acquired.message,
 			);
 		}
 		const guard = acquired.guard;
+		// The exclusive guard's byte-range lock denies plain Node reads of the
+		// transcript, so both fingerprints (pre-rewrite check and post-restore
+		// proof) are taken through the guard's own snapshot op.
+		const snapshotPath = join(
+			dirname(input.transcriptPath),
+			`.${basename(input.transcriptPath)}.restore-${randomUUID()}.tmp`,
+		);
 		try {
-			if (fileFingerprint(input.transcriptPath) !== input.expectedCurrentFingerprint) {
+			const preCheck = await fingerprintThroughGuard(guard, snapshotPath);
+			if (!preCheck.ok) {
+				return fail(
+					preCheck.code === "io_error"
+						? "io_error"
+						: preCheck.code === "writer_conflict"
+							? "writer_conflict"
+							: preCheck.code === "write_guard_uncertain"
+								? "write_guard_uncertain"
+								: "write_guard_unavailable",
+					preCheck.message,
+				);
+			}
+			if (preCheck.fingerprint !== input.expectedCurrentFingerprint) {
 				return fail("recovery_blocked", "transcript changed after recovery inspection; guarded restore refused");
 			}
-			const rewritten = await guard.rewrite(input.backupPath);
+			const rewritten = await guard.rewrite(input.backupPath, {
+				expectedSourceFingerprint: input.expectedBackupFingerprint,
+			});
 			if (!rewritten.ok) {
 				return fail(
-					rewritten.code === "writer_conflict" ? "writer_conflict" : "write_guard_unavailable",
+					rewritten.code === "writer_conflict"
+						? "writer_conflict"
+						: rewritten.code === "write_guard_uncertain"
+							? "write_guard_uncertain"
+							: rewritten.code === "fingerprint_mismatch"
+								? "recovery_blocked"
+								: "write_guard_unavailable",
 					rewritten.message,
 				);
 			}
+			const restored = await fingerprintThroughGuard(guard, snapshotPath);
+			if (!restored.ok) {
+				return fail(
+					restored.code === "io_error"
+						? "io_error"
+						: restored.code === "writer_conflict"
+							? "writer_conflict"
+							: restored.code === "write_guard_uncertain"
+								? "write_guard_uncertain"
+								: "write_guard_unavailable",
+					restored.message,
+				);
+			}
+			return { ok: true, value: { fingerprint: restored.fingerprint } };
 		} finally {
+			try {
+				rmSync(snapshotPath, { force: true });
+			} catch {
+				// Best-effort snapshot cleanup.
+			}
 			await guard.release();
 		}
-		const fingerprint = fileFingerprint(input.transcriptPath);
-		if (fingerprint === null) return fail("io_error", "restored transcript is unreadable");
-		return { ok: true, value: { fingerprint } };
 	}
 }

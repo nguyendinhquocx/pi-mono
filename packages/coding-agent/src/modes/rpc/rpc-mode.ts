@@ -328,8 +328,9 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			commandContextActions: {
 				waitForIdle: () => session.waitForIdle(),
 				inspectSessionDataLease: () => session.inspectSessionDataLease(),
-				acquireSessionDataLock: () => session.acquireSessionDataLock(),
-				releaseSessionDataLock: (lockId) => session.releaseSessionDataLock(lockId),
+				acquireSessionDataLock: (options?: { expectedFingerprint?: string }) =>
+					session.acquireSessionDataLock(options),
+				releaseSessionDataLock: (lockId, releaseOptions) => session.releaseSessionDataLock(lockId, releaseOptions),
 				replaceSessionDataTranscript: (options) => session.replaceSessionDataTranscript(options),
 				reloadSessionFromDisk: (options) => session.reloadSessionFromDisk(options),
 				newSession: async (options) => runtimeHost.newSession(options),
