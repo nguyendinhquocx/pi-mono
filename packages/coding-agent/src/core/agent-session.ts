@@ -560,6 +560,13 @@ export class AgentSession {
 	private _lateMergeDefaults = false;
 	/** Tool names the restored transcript already mentions; late registrations never re-add these. */
 	private _lateKnownToolNames: ReadonlySet<string> = new Set();
+	/**
+	 * Set by this instance's first provider request (SPEC-2026-11-06 r6 C5). After it, late
+	 * default-active registrations no longer self-activate — including on sessions whose restore
+	 * never ran (no transcript), where the old `_lateActivationToolNames === undefined` gate would
+	 * have kept auto-activating them forever.
+	 */
+	private _lateRegistrationCutoff = false;
 	/** Default-active extension/SDK tool names, including registrations filtered from the active registry. */
 	private _registeredDefaultExtensionToolNames: ReadonlySet<string> = new Set();
 	/** Migration notices queued until a UI context is bound. */
@@ -1710,7 +1717,11 @@ export class AgentSession {
 	setActiveToolsByName(toolNames: string[]): void {
 		this._throwIfSessionDataLocked();
 		const previousActive = this.getActiveToolNames();
-		const preservesCurrentLoadout = previousActive.every((name) => toolNames.includes(name));
+		// A replacement drops selected-but-unavailable intent; only an additive
+		// change over a non-empty active set preserves it. With an empty active set
+		// every() is vacuously true, which would union stale intent into a
+		// deliberate replacement (SPEC-2026-11-06 r6 C3).
+		const preservesCurrentLoadout = previousActive.length > 0 && previousActive.every((name) => toolNames.includes(name));
 		// Extensions often add one tool via getActiveTools() + [name]. Preserve selected-but-
 		// unavailable restore intent for that additive change; a replacement that drops any
 		// currently active tool replaces the old snapshot intent too.
@@ -2152,8 +2163,11 @@ export class AgentSession {
 		const entry = this.sessionManager.getEntry(entryId);
 		if (entry) this._emit({ type: "entry_appended", entry });
 		const label = kind === "legacy_unknown" ? "Legacy tool selection is unknown" : "New default tools added";
-		const suffix = truncated ? ", and more" : "";
-		const message = `${label}: ${tools.join(", ")}${suffix}`;
+		// Count-only UI line (SPEC-2026-11-06 r6 C6): the full name list lives in the
+		// tool_selection_notice entry above; enumerating 30+ names in the toast is
+		// noise for the owner.
+		const suffix = truncated ? " (list truncated)" : "";
+		const message = `${label}: ${toolNames.length} tools${suffix} — names recorded in the session entry`;
 		this._pendingToolSelectionNotices.push({ message, type: kind === "legacy_unknown" ? "warning" : "info" });
 		this._flushToolSelectionNotices();
 	}
@@ -2242,6 +2256,7 @@ export class AgentSession {
 		// The first provider request is the cutoff for same-session registration reconciliation;
 		// the snapshot still preserves unavailable selection intent for a later resume.
 		this._pendingToolNames.clear();
+		this._lateRegistrationCutoff = true;
 		if (this._lateActivationToolNames) {
 			this._lateActivationToolNames = new Set();
 			this._lateMergeDefaults = false;
@@ -2291,6 +2306,33 @@ export class AgentSession {
 			result.systemPromptOptions.selectedTools.length !== selectedToolsBefore.length ||
 			result.systemPromptOptions.selectedTools.some((name, index) => name !== selectedToolsBefore[index]);
 		if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
+		else {
+			// Handler replacement intent (SPEC-2026-11-06 r6 C2): the edited list
+			// replaces the selection, it does not union into it. Reset the recorded
+			// intent first so _applyToolLoadout's union lands exactly on the handler's
+			// list instead of resurrecting a dropped tool on the next resume.
+			const previousSelection = new Set(this._selectedToolNames);
+			const replacementNames = new Set(result.systemPromptOptions.selectedTools);
+			this._selectedToolNames = new Set();
+			if (this._lateActivationToolNames) {
+				this._lateActivationToolNames = new Set(result.systemPromptOptions.selectedTools);
+				this._lateMergeDefaults = false;
+			}
+			// Names the handler dropped that were part of the declared loadout must count as
+			// transcript-known: without a removal record a later resume would re-merge them as
+			// untouched default candidates and undo the handler's replacement across restarts.
+			const dropped = [...previousSelection].filter(
+				(name) => !replacementNames.has(name) && this._toolRegistry.has(name),
+			);
+			if (dropped.length > 0) {
+				this.sessionManager.appendMessage({
+					role: "system",
+					content: "",
+					toolsRemoved: dropped.map((name) => ({ name })),
+					timestamp: Date.now(),
+				});
+			}
+		}
 
 		const messages: AgentMessage[] = [];
 		if (trigger.messageType === "custom") {
@@ -4834,9 +4876,11 @@ export class AgentSession {
 		for (const { definition } of allRegisteredTools) {
 			const isDefaultActive = this._registeredDefaultExtensionToolNames.has(definition.name);
 			const allowedByCurrentSelection = this._allowedTools?.(definition.name) ?? false;
+			// After this instance's cutoff (r6 C5), registration-time defaults no longer apply:
+			// only the recorded selection authority may re-add a name.
 			const allowedByRestore =
-				this._lateActivationToolNames === undefined ||
-				this._lateActivationToolNames.has(definition.name) ||
+				(this._lateActivationToolNames === undefined && !this._lateRegistrationCutoff) ||
+				this._lateActivationToolNames?.has(definition.name) === true ||
 				(this._lateMergeDefaults && isDefaultActive && !this._lateKnownToolNames.has(definition.name));
 			if (allowedByRestore && ((isDefaultActive && !this._allowedTools) || allowedByCurrentSelection)) {
 				this._selectedToolNames.add(definition.name);
@@ -4930,6 +4974,10 @@ export class AgentSession {
 						nextActiveToolNames.push(toolName);
 						this._appendToolSelectionNotice("migration_added", [toolName]);
 					}
+				} else if (this._lateRegistrationCutoff) {
+					// Post-cutoff registration: the selection was already recorded by the first
+					// provider request, so default-active tools register inactive (r6 C5). The
+					// owner or an extension can still name them via setActiveTools().
 				} else if (this._isActivatedOnRegistration(toolName)) {
 					nextActiveToolNames.push(toolName);
 				}
@@ -5493,7 +5541,10 @@ export class AgentSession {
 
 			// Update finalized context from the canonical session projection.
 			this._refreshFinalizedContext();
-			this._restoreToolsFromTranscript();
+			// Tree navigation restores from the same resolution rules as open:
+			// without the default modifiers a `+x/-x` tuned loadout silently loses
+			// its tuning when the owner moves the leaf (SPEC-2026-11-06 r6 C4).
+			this._restoreToolsFromTranscript(this._defaultToolModifiers);
 
 			// Emit session_tree event
 			await this._extensionRunner.emit({

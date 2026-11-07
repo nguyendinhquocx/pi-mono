@@ -610,7 +610,8 @@ describe("tool selection snapshot resume", () => {
 		await session.bindExtensions({ uiContext });
 		expect(notifications).toEqual([
 			{
-				message: "Legacy tool selection is unknown: read, bash, edit, write",
+				// Count-only UI line (r6 C6); the full name list lives in the session entry.
+				message: "Legacy tool selection is unknown: 4 tools — names recorded in the session entry",
 				type: "warning",
 			},
 		]);
@@ -897,6 +898,51 @@ describe("tool selection snapshot resume", () => {
 		keepsOff.faux.unregister();
 	});
 
+	it("keeps the first-provider-request cutoff for late default registration", async () => {
+		const controllers: Array<() => void> = [];
+		const controller: InlineExtension = (pi) => {
+			controllers.push(() => {
+				pi.registerTool({
+					name: "cutoff_tool",
+					label: "Cutoff Tool",
+					description: "Registered after the cutoff",
+					parameters: Type.Object({}),
+					execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+				});
+			});
+		};
+
+		// Fresh instance: after the first provider request a late-registered default tool
+		// is registered but stays inactive.
+		const freshManager = SessionManager.inMemory(tempDir);
+		const fresh = await createPromptableSession(freshManager, { extensionFactories: [controller] });
+		await fresh.session.bindExtensions({});
+		await fresh.session.prompt("hi");
+		controllers[0]();
+		expect(fresh.session.getAllTools().map((tool) => tool.name)).toContain("cutoff_tool");
+		expect(fresh.session.getActiveToolNames()).not.toContain("cutoff_tool");
+		fresh.session.dispose();
+		fresh.faux.unregister();
+
+		// Resumed instance gets its own cutoff: pre-prompt registration still merges
+		// (r5 parity), and the cutoff applies from its own first provider request.
+		const resumedManager = SessionManager.inMemory(tempDir);
+		resumedManager.appendMessage({
+			role: "system",
+			content: "",
+			toolSelectionSnapshot: { version: 1, source: "default", selectedNames: ["read", "bash", "edit", "write"] },
+			timestamp: 1,
+		});
+		const resumed = await createPromptableSession(resumedManager, { extensionFactories: [controller] });
+		await resumed.session.bindExtensions({});
+		expect(resumed.session.getActiveToolNames()).not.toContain("cutoff_tool");
+		controllers[1]();
+		expect(resumed.session.getActiveToolNames()).toContain("cutoff_tool");
+		await resumed.session.prompt("one");
+		resumed.session.dispose();
+		resumed.faux.unregister();
+	});
+
 	it("keeps hidden prepareLoadout declarations selected but out of provider payloads", async () => {
 		const hiddenExtension: InlineExtension = (pi) => {
 			pi.registerTool({
@@ -1003,5 +1049,182 @@ describe("tool selection snapshot resume", () => {
 		expect(resumed.session.getActiveToolNames()).toContain("sdk_tool");
 		resumed.session.dispose();
 		resumed.faux.unregister();
+	});
+
+	it("carries the selection snapshot and removed tools through a compaction checkpoint", () => {
+		const sessionManager = SessionManager.inMemory(tempDir);
+		sessionManager.appendMessage({
+			role: "system",
+			content: "",
+			toolsAdded: [declaredTool("x_tool")],
+			timestamp: 1,
+		});
+		sessionManager.appendMessage({
+			role: "system",
+			content: "",
+			toolSelectionSnapshot: { version: 1, source: "explicit", selectedNames: ["read"] },
+			timestamp: 2,
+		});
+		sessionManager.appendMessage({
+			role: "system",
+			content: "",
+			toolsRemoved: [{ name: "x_tool" }],
+			timestamp: 3,
+		});
+		sessionManager.appendMessage({ role: "user", content: "hi", timestamp: 4 });
+		sessionManager.appendCompaction("summary", null, 100);
+		const compactionEntry = sessionManager.getBranch().find((entry) => entry.type === "compaction");
+		expect(compactionEntry).toBeDefined();
+		const checkpoint = (compactionEntry as { systemMessage?: SystemMessage }).systemMessage;
+		expect(checkpoint?.toolSelectionSnapshot).toEqual({
+			version: 1,
+			source: "explicit",
+			selectedNames: ["read"],
+		});
+		expect(checkpoint?.toolsRemoved?.map((tool) => tool.name)).toEqual(["x_tool"]);
+	});
+
+	it("restores an explicit empty selection from a compaction checkpoint without merging defaults", async () => {
+		const sessionManager = SessionManager.inMemory(tempDir);
+		sessionManager.appendMessage({
+			role: "system",
+			content: "",
+			toolSelectionSnapshot: { version: 1, source: "explicit", selectedNames: [] },
+			timestamp: 1,
+		});
+		sessionManager.appendMessage({ role: "user", content: "hi", timestamp: 2 });
+		sessionManager.appendCompaction("summary", null, 100);
+		sessionManager.appendMessage({ role: "user", content: "after", timestamp: 3 });
+		const { session, faux } = await createPromptableSession(sessionManager, {
+			extensionFactories: [extensionToolExtension],
+		});
+		// The checkpoint carries the explicit-empty snapshot: no legacy_unknown, no defaults merge.
+		expect(session.getActiveToolNames()).toEqual([]);
+		expect(notices(sessionManager)).toEqual([]);
+		session.dispose();
+		faux.unregister();
+	});
+
+	it("does not resurrect removed tools from a compaction checkpoint", async () => {
+		const sessionManager = SessionManager.inMemory(tempDir);
+		sessionManager.appendMessage({
+			role: "system",
+			content: "",
+			toolsAdded: [declaredTool("gone_tool")],
+			timestamp: 1,
+		});
+		sessionManager.appendMessage({
+			role: "system",
+			content: "",
+			toolsRemoved: [{ name: "gone_tool" }],
+			timestamp: 2,
+		});
+		sessionManager.appendMessage({ role: "user", content: "hi", timestamp: 3 });
+		sessionManager.appendCompaction("summary", null, 100);
+		sessionManager.appendMessage({ role: "user", content: "after", timestamp: 4 });
+		const { session, faux } = await createPromptableSession(sessionManager, {
+			extensionFactories: [extensionToolExtension],
+		});
+		// Delta history survives the checkpoint, so the recorded empty state stays empty.
+		expect(session.getActiveToolNames()).toEqual([]);
+		expect(notices(sessionManager)).toEqual([]);
+		await session.prompt("one");
+		expect(recordedSnapshots(sessionManager).at(-1)?.selectedNames).not.toContain("gone_tool");
+		session.dispose();
+		faux.unregister();
+	});
+
+	it("treats a handler-edited selectedTools list as a replacement", async () => {
+		const sessionManager = SessionManager.inMemory(tempDir);
+		let turn = 0;
+		const dropWrite: InlineExtension = (pi) => {
+			pi.on("before_agent_start", (event) => {
+				if (++turn === 1) {
+					event.systemPromptOptions.selectedTools = event.systemPromptOptions.selectedTools.filter(
+						(name) => name !== "write",
+					);
+				}
+			});
+		};
+		const { session, faux } = await createPromptableSession(sessionManager, {
+			extensionFactories: [dropWrite],
+		});
+		await session.prompt("hi");
+		// The dropped tool must not survive in the recorded selection intent.
+		const snapshot = recordedSnapshots(sessionManager).at(-1);
+		expect(snapshot?.selectedNames).not.toContain("write");
+		expect(snapshot?.selectedNames).toContain("read");
+		session.dispose();
+
+		const reopened = await createPromptableSession(sessionManager);
+		expect(reopened.session.getActiveToolNames()).not.toContain("write");
+		expect(reopened.session.getActiveToolNames()).toContain("read");
+		await reopened.session.prompt("again");
+		reopened.session.dispose();
+		reopened.faux.unregister();
+		faux.unregister();
+	});
+
+	it("drops selected-unavailable intent on replacement with an empty active set", async () => {
+		const sessionManager = SessionManager.inMemory(tempDir);
+		sessionManager.appendMessage({
+			role: "system",
+			content: "",
+			toolSelectionSnapshot: { version: 1, source: "explicit", selectedNames: ["ghost_tool"] },
+			timestamp: 1,
+		});
+		sessionManager.appendMessage({ role: "user", content: "hi", timestamp: 2 });
+		const { session, faux } = await createPromptableSession(sessionManager);
+		// The ghost selection keeps nothing active; every() must not treat that as "preserved".
+		expect(session.getActiveToolNames()).toEqual([]);
+		await session.prompt("one");
+		session.setActiveToolsByName(["read"]);
+		await session.prompt("two");
+		const snapshot = recordedSnapshots(sessionManager).at(-1);
+		expect(snapshot?.selectedNames).toEqual(["read"]);
+		session.dispose();
+		faux.unregister();
+	});
+
+	it("keeps default tool modifiers across tree navigation", async () => {
+		const sessionManager = SessionManager.inMemory(tempDir);
+		sessionManager.appendMessage({ role: "user", content: "root turn", timestamp: 1 });
+		const { session, faux } = await createPromptableSession(sessionManager, {
+			tools: ["-edit", "-write"],
+		});
+		expect(session.getActiveToolNames()).not.toContain("edit");
+		expect(session.getActiveToolNames()).not.toContain("write");
+		const rootEntry = sessionManager.getBranch()[0];
+		await session.navigateTree(rootEntry.id);
+		// Navigation restores with the same modifiers; without them edit/write come back.
+		expect(session.getActiveToolNames()).not.toContain("edit");
+		expect(session.getActiveToolNames()).not.toContain("write");
+		session.dispose();
+		faux.unregister();
+	});
+
+	it("notifies migration additions as a count with the entry carrying the names", async () => {
+		const sessionManager = SessionManager.inMemory(tempDir);
+		sessionManager.appendMessage({ role: "system", content: "legacy prompt", timestamp: 1 });
+		const { session, faux } = await createPromptableSession(sessionManager, {
+			extensionFactories: [extensionToolExtension],
+		});
+		const notifications: Array<{ message: string; type: string | undefined }> = [];
+		const uiContext = {
+			notify: (message: string, type?: string) => notifications.push({ message, type }),
+		} as unknown as ExtensionUIContext;
+		await session.bindExtensions({ uiContext });
+		expect(notifications).toEqual([
+			{
+				message: "Legacy tool selection is unknown: 5 tools — names recorded in the session entry",
+				type: "warning",
+			},
+		]);
+		// The session entry still records the full name list for audit.
+		expect(notices(sessionManager)).toEqual([
+			{ kind: "legacy_unknown", tools: ["read", "bash", "edit", "write", "active_tool"] },
+		]);
+		session.dispose();
+		faux.unregister();
 	});
 });

@@ -2,10 +2,12 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	getCurrentSystemMessage,
+	getLatestToolSelectionSnapshot,
 	type ImageContent,
 	type Message,
 	type SystemMessage,
 	type TextContent,
+	type ToolReference,
 	type ToolResultMessage,
 	type Usage,
 	type UserMessage,
@@ -1956,7 +1958,37 @@ export class SessionManager {
 		usage?: Usage,
 	): string {
 		const timestamp = new Date().toISOString();
-		const systemMessage = getCurrentSystemMessage(this.buildSessionProjection().messages);
+		const messages = this.buildSessionProjection().messages;
+		const systemMessage = getCurrentSystemMessage(messages);
+		// Compaction checkpoint (SPEC-2026-11-06 r6 C1): the replayed system message
+		// carries only the current prompt/tools, and buildContextEntries() drops older
+		// system entries from the kept range, so without these two fields the resumed
+		// session would lose the recorded selection intent and every `toolsRemoved`
+		// evidence — an empty selection could then degrade to `legacy_unknown`, merge
+		// current defaults, and resurrect deliberately removed tools.
+		const snapshot = getLatestToolSelectionSnapshot(messages);
+		const currentToolNames = new Set((systemMessage?.toolsAdded ?? []).map((tool) => tool.name));
+		const removedTools = new Map<string, ToolReference>();
+		for (const message of messages) {
+			if (message.role !== "system") continue;
+			for (const tool of message.toolsRemoved ?? []) removedTools.set(tool.name, tool);
+		}
+		const checkpointRemoved = [...removedTools.values()].filter((tool) => !currentToolNames.has(tool.name));
+		const checkpointSystemMessage: SystemMessage | undefined = systemMessage
+			? {
+					...systemMessage,
+					...(snapshot ? { toolSelectionSnapshot: snapshot } : {}),
+					...(checkpointRemoved.length > 0 ? { toolsRemoved: checkpointRemoved } : {}),
+			  }
+			: snapshot || checkpointRemoved.length > 0
+				? {
+						role: "system",
+						content: "",
+						...(snapshot ? { toolSelectionSnapshot: snapshot } : {}),
+						...(checkpointRemoved.length > 0 ? { toolsRemoved: checkpointRemoved } : {}),
+						timestamp: new Date(timestamp).getTime(),
+				  }
+				: undefined;
 		const id = generateId(this.byId);
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
@@ -1969,7 +2001,9 @@ export class SessionManager {
 			details,
 			usage,
 			fromHook,
-			...(systemMessage ? { systemMessage: { ...systemMessage, timestamp: new Date(timestamp).getTime() } } : {}),
+			...(checkpointSystemMessage
+				? { systemMessage: { ...checkpointSystemMessage, timestamp: new Date(timestamp).getTime() } }
+				: {}),
 		};
 		this._appendEntry(entry);
 		return entry.id;
