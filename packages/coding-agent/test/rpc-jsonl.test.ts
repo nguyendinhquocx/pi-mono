@@ -1,5 +1,6 @@
 import { Readable } from "node:stream";
 import { describe, expect, test } from "vitest";
+import { toJsonEvent } from "../src/modes/json-event.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "../src/modes/rpc/jsonl.ts";
 
 describe("RPC JSONL framing", () => {
@@ -61,5 +62,16 @@ describe("RPC JSONL framing", () => {
 		await done;
 
 		expect(lines).toEqual(['{"a":1}']);
+	});
+
+	test("forwards the internal session_data_reloaded event unchanged", () => {
+		const event = {
+			type: "session_data_reloaded" as const,
+			sessionId: "synthetic-session",
+			fingerprint: "a".repeat(64),
+			entryCount: 12,
+		};
+
+		expect(toJsonEvent(event)).toEqual(event);
 	});
 });

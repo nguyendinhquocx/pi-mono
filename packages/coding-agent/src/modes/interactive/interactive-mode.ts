@@ -1995,6 +1995,11 @@ export class InteractiveMode {
 			},
 			commandContextActions: {
 				waitForIdle: () => this.session.waitForIdle(),
+				inspectSessionDataLease: () => this.session.inspectSessionDataLease(),
+				acquireSessionDataLock: () => this.session.acquireSessionDataLock(),
+				releaseSessionDataLock: (lockId) => this.session.releaseSessionDataLock(lockId),
+				replaceSessionDataTranscript: (options) => this.session.replaceSessionDataTranscript(options),
+				reloadSessionFromDisk: (options) => this.session.reloadSessionFromDisk(options),
 				newSession: async (options) => {
 					this.clearStatusIndicator();
 					try {
@@ -3241,6 +3246,13 @@ export class InteractiveMode {
 		this.defaultEditor.onSubmit = async (text: string) => {
 			text = text.trim();
 			if (!text) return;
+			if (this.session.isSessionDataLocked) {
+				this.editor.setText(text);
+				this.showWarning(
+					"Session refresh is in progress. Your input was kept; submit it again after the lock is released.",
+				);
+				return;
+			}
 
 			// Handle commands
 			if (text === "/settings") {
@@ -3525,6 +3537,16 @@ export class InteractiveMode {
 					this.footer.invalidate();
 					this.ui.requestRender();
 				}
+				break;
+
+			case "session_data_reloaded":
+				this.chatContainer.clear();
+				this.entriesRenderedByBoundaryCompaction.clear();
+				this.renderSessionEntries(this.sessionManager.buildContextEntries());
+				this.updateTerminalTitle();
+				this.footer.invalidate();
+				this.updateEditorBorderColor();
+				this.ui.requestRender();
 				break;
 
 			case "session_info_changed":

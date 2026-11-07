@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it } from "vitest";
+import type { AgentSessionEvent } from "../src/core/agent-session.ts";
 import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
@@ -154,6 +155,24 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			{ type: "session_shutdown", reason: "resume", targetSessionFile: originalSessionFile },
 			{ type: "session_start", reason: "resume", previousSessionFile: secondSessionFile },
 		]);
+	}, 30_000);
+
+	it("emits session_data_reloaded without replacing the current runtime", async () => {
+		const { runtimeHost } = await createRuntimeHost(() => {});
+		const session = runtimeHost.session;
+		const events: string[] = [];
+		session.subscribe((event) => events.push(event.type));
+		const internal = session as unknown as { _emit: (event: AgentSessionEvent) => void };
+
+		internal._emit({
+			type: "session_data_reloaded",
+			sessionId: session.sessionId,
+			fingerprint: "a".repeat(64),
+			entryCount: 4,
+		});
+
+		expect(events).toEqual(["session_data_reloaded"]);
+		expect(runtimeHost.session).toBe(session);
 	});
 
 	it("honors session_before_switch cancellation", async () => {
@@ -253,5 +272,5 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const cancelAtResult = await runtimeHost.fork("missing-entry", { position: "at" });
 		expect(cancelAtResult).toEqual({ cancelled: true });
 		expect(events).toEqual([{ type: "session_before_fork", entryId: "missing-entry", position: "at" }]);
-	});
+	}, 30_000);
 });

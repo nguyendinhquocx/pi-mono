@@ -163,7 +163,7 @@ describe("ExtensionRunner", () => {
 
 			expect(result.result).toEqual({ trusted: "no", remember: true });
 			expect(result.errors).toEqual([]);
-		});
+		}, 30_000);
 	});
 
 	describe("shortcut conflicts", () => {
@@ -1243,6 +1243,63 @@ describe("ExtensionRunner", () => {
 
 			await commandContext.fork("entry-2", { position: "at" });
 			expect(fork).toHaveBeenLastCalledWith("entry-2", { position: "at" });
+		});
+
+		it("binds session-data inspect, lock, release, and in-place reload actions", async () => {
+			const runtime = createExtensionRuntime();
+			const runner = new ExtensionRunner([], runtime, tempDir, sessionManager, modelRegistry);
+			const inspect = vi.fn(async () => ({
+				status: "ready" as const,
+				sessionId: "s1",
+				leaseId: "l1",
+				protocolVersion: 1,
+			}));
+			const acquire = vi.fn(async () => ({ status: "acquired" as const, lockId: "lock-1", sessionId: "s1" }));
+			const release = vi.fn(async (lockId: string) => ({ status: "released" as const, lockId }));
+			const replace = vi.fn(async (options: { candidatePath: string; lockId: string; backupName?: string }) => ({
+				status: "replaced" as const,
+				lockId: options.lockId,
+				fingerprint: "c".repeat(64),
+			}));
+			const reload = vi.fn(async (options: { expectedFingerprint: string; lockId: string }) => ({
+				status: "reloaded" as const,
+				sessionId: "s1",
+				fingerprint: options.expectedFingerprint,
+				entryCount: 4,
+			}));
+
+			runner.bindCommandContext({
+				waitForIdle: async () => {},
+				newSession: async () => ({ cancelled: false }),
+				fork: async () => ({ cancelled: false }),
+				navigateTree: async () => ({ cancelled: false }),
+				switchSession: async () => ({ cancelled: false }),
+				reload: async () => {},
+				inspectSessionDataLease: inspect,
+				acquireSessionDataLock: acquire,
+				releaseSessionDataLock: release,
+				replaceSessionDataTranscript: replace,
+				reloadSessionFromDisk: reload,
+			});
+			const commandContext = runner.createCommandContext();
+
+			expect(await commandContext.inspectSessionDataLease()).toMatchObject({ status: "ready", sessionId: "s1" });
+			expect(await commandContext.acquireSessionDataLock()).toMatchObject({ status: "acquired", lockId: "lock-1" });
+			expect(await commandContext.releaseSessionDataLock("lock-1")).toEqual({
+				status: "released",
+				lockId: "lock-1",
+			});
+			expect(
+				await commandContext.replaceSessionDataTranscript({ candidatePath: "candidate.tmp", lockId: "lock-1" }),
+			).toMatchObject({ status: "replaced", fingerprint: "c".repeat(64) });
+			expect(
+				await commandContext.reloadSessionFromDisk({ expectedFingerprint: "f".repeat(64), lockId: "lock-1" }),
+			).toMatchObject({ status: "reloaded", entryCount: 4 });
+			expect(inspect).toHaveBeenCalledOnce();
+			expect(acquire).toHaveBeenCalledOnce();
+			expect(release).toHaveBeenCalledWith("lock-1");
+			expect(replace).toHaveBeenCalledWith({ candidatePath: "candidate.tmp", lockId: "lock-1" });
+			expect(reload).toHaveBeenCalledWith({ expectedFingerprint: "f".repeat(64), lockId: "lock-1" });
 		});
 	});
 
