@@ -1996,8 +1996,10 @@ export class InteractiveMode {
 			commandContextActions: {
 				waitForIdle: () => this.session.waitForIdle(),
 				inspectSessionDataLease: () => this.session.inspectSessionDataLease(),
-				acquireSessionDataLock: () => this.session.acquireSessionDataLock(),
-				releaseSessionDataLock: (lockId) => this.session.releaseSessionDataLock(lockId),
+				acquireSessionDataLock: (options?: { expectedFingerprint?: string }) =>
+					this.session.acquireSessionDataLock(options),
+				releaseSessionDataLock: (lockId, releaseOptions) =>
+					this.session.releaseSessionDataLock(lockId, releaseOptions),
 				replaceSessionDataTranscript: (options) => this.session.replaceSessionDataTranscript(options),
 				reloadSessionFromDisk: (options) => this.session.reloadSessionFromDisk(options),
 				newSession: async (options) => {

@@ -151,8 +151,10 @@ import {
 	type StagedSessionReload,
 } from "./session-manager.ts";
 import {
+	type CanonicalTranscriptIdentity,
 	canonicalTranscriptIdentity,
 	fileFingerprint,
+	formatClaimRecoveryInspection,
 	type LeaseClaimRecord,
 	type LeaseRecord,
 	parseJsonStrict,
@@ -176,7 +178,11 @@ import {
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
-import { TranscriptWriteGuard } from "./transcript-write-guard.ts";
+import {
+	fingerprintThroughGuard,
+	type TranscriptGuardErrorCode,
+	TranscriptWriteGuard,
+} from "./transcript-write-guard.ts";
 import { addUsageToTotals, combineUsage, createUsageTotals } from "./usage-totals.ts";
 import {
 	findLatestResponse,
@@ -425,33 +431,22 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 	return tokens;
 }
 
-const HELD_GUARD_LOCKED = "byte-range locks deny reads through every handle except the helper's own";
-
-/**
- * Snapshot the guarded transcript through the helper's locked handle and
- * return its fingerprint. Reads through plain Node handles fail with EBUSY
- * while a full-range exclusive lock is held, so guarded verification flows
- * must read via the guard itself (same process/handle as the lock owner).
- */
-async function fingerprintThroughGuard(
-	guard: TranscriptWriteGuard,
-	snapshotPath: string,
-): Promise<{ ok: true; fingerprint: string } | { ok: false; code: SessionDataRefusalCode; message: string }> {
-	const snapshot = await guard.snapshotTo(snapshotPath);
-	if (!snapshot.ok) {
-		return {
-			ok: false,
-			code: snapshot.code === "writer_conflict" ? "writer_conflict" : "write_guard_unavailable",
-			message: snapshot.message,
-		};
-	}
-	const fingerprint = fileFingerprint(snapshotPath);
-	if (!fingerprint) return { ok: false, code: "io_error", message: HELD_GUARD_LOCKED };
-	return { ok: true, fingerprint };
-}
-
 function decodeSessionBytesStrict(raw: Buffer): string {
 	return new TextDecoder("utf-8", { fatal: true }).decode(raw);
+}
+
+/** Map a guard-level failure code to the session-data refusal vocabulary. */
+function guardRefusalCode(code: TranscriptGuardErrorCode): SessionDataRefusalCode {
+	switch (code) {
+		case "writer_conflict":
+			return "writer_conflict";
+		case "write_guard_uncertain":
+			return "write_guard_uncertain";
+		case "fingerprint_mismatch":
+			return "fingerprint_mismatch";
+		default:
+			return "write_guard_unavailable";
+	}
 }
 
 /** Artifact identity from the clean Li build receipt; missing/dirty receipts fail closed. */
@@ -3798,11 +3793,19 @@ export class AgentSession {
 	private async _ensureSessionAccessGuard(): Promise<void> {
 		const sessionFile = this.sessionManager.getSessionFile();
 		if (!this.sessionManager.isPersisted() || !sessionFile || !existsSync(sessionFile)) return;
-		if (this._sessionAccessGuard?.isHeld) return;
+		if (this._sessionAccessGuard?.isHeld) {
+			// The guard was already acquired in an earlier call; still converge any
+			// startup repairs that were deferred at open time.
+			this.sessionManager.applyDeferredStartupRepairs();
+			return;
+		}
 		this._acquireSessionOpenLeaseIfNeeded();
 		const registry = this._leaseRegistry;
 		if (!registry || !registry.available) {
 			this._markSessionAccessUnguarded(registry?.degradationReason ?? "session-open lease registry unavailable");
+			// Degraded mode already appends without an OS guard; converge the
+			// deferred startup repairs instead of silently keeping a stale file.
+			this.sessionManager.applyDeferredStartupRepairs();
 			return;
 		}
 		const { pathHash } = canonicalTranscriptIdentity(sessionFile);
@@ -3816,12 +3819,14 @@ export class AgentSession {
 				throw new SessionDataLockedError();
 			}
 			this._markSessionAccessUnguarded(claim.ok ? "session-open lease could not be acquired" : claim.message);
+			this.sessionManager.applyDeferredStartupRepairs();
 			return;
 		}
 
 		const existingClaim = registry.readClaim(pathHash);
 		if (!existingClaim.ok) {
 			this._markSessionAccessUnguarded(existingClaim.message);
+			this.sessionManager.applyDeferredStartupRepairs();
 			return;
 		}
 		if (existingClaim.value) {
@@ -3851,6 +3856,7 @@ export class AgentSession {
 					backupPath: recovered.value.backupPath,
 					pathHash,
 					expectedCurrentFingerprint: recovered.value.expectedCurrentFingerprint,
+					expectedBackupFingerprint: recovered.value.expectedBackupFingerprint,
 				});
 				if (!restored.ok) throw new Error(`Session recovery restore failed: ${restored.message}`);
 				const raw = decodeSessionBytesStrict(readFileSync(sessionFile));
@@ -3865,11 +3871,15 @@ export class AgentSession {
 		if (!acquired.ok) {
 			if (acquired.code === "writer_conflict") throw new SessionDataLockedError();
 			this._markSessionAccessUnguarded(acquired.message);
+			this.sessionManager.applyDeferredStartupRepairs();
 			return;
 		}
 		this._sessionAccessGuard = acquired.guard;
 		this._sessionAccessUnguarded = false;
 		this._sessionAccessFailure = undefined;
+		// Guarded startup repairs: the shared guard is held, so the deferred
+		// newline repair / migration rewrite can finally touch the transcript.
+		this.sessionManager.applyDeferredStartupRepairs();
 	}
 
 	private _sessionDataRefused(code: SessionDataRefusalCode, message: string): SessionDataLeaseInspectionResult {
@@ -3904,8 +3914,11 @@ export class AgentSession {
 			this._sessionAccessUnguarded
 		) {
 			return this._sessionDataRefused(
-				"write_guard_unavailable",
-				this._sessionAccessFailure ?? "session is unguarded; trim requires a held SessionAccessGuard",
+				this._sessionAccessGuard?.isUncertain ? "write_guard_uncertain" : "write_guard_unavailable",
+				this._sessionAccessFailure ??
+					(this._sessionAccessGuard?.isUncertain
+						? "session access guard is uncertain after a timed-out mutation"
+						: "session is unguarded; trim requires a held SessionAccessGuard"),
 			);
 		}
 		const registry = this._leaseRegistry;
@@ -3942,9 +3955,15 @@ export class AgentSession {
 		const claim = registry.readClaim(identity.pathHash);
 		if (!claim.ok) return this._sessionDataRefused("registry_invalid", claim.message);
 		if (claim.value) {
+			// Recovery inspector detail per spec Task 4: phase, current/original/
+			// candidate fingerprints, and backup location in the refusal itself.
 			return this._sessionDataRefused(
 				"recovery_blocked",
-				`mutation claim exists at phase ${claim.value.phase}; resolve stale-claim recovery before preview`,
+				`mutation claim exists; resolve stale-claim recovery before preview: ${formatClaimRecoveryInspection(
+					claim.value,
+					fileFingerprint(sessionFile),
+					registry.defaultBackupDir(),
+				)}`,
 			);
 		}
 		return {
@@ -3959,6 +3978,11 @@ export class AgentSession {
 	 * Synchronously closes in-process admission before the first await, then
 	 * claims and upgrades the session's OS access guard. No prompt or append can
 	 * slip through while native lock acquisition is pending.
+	 *
+	 * A total try/finally wraps every step: typed refusals and unexpected throws
+	 * alike roll back the upgraded guard, the guard record, and the claim, and
+	 * always unlock the admission gate, so no failure path leaves a
+	 * half-acquired session lock (or a leaked guard helper) behind.
 	 */
 	async acquireSessionDataLock(options?: { expectedFingerprint?: string }): Promise<SessionDataLockResult> {
 		if (this._sessionDataAdmissionLocked) {
@@ -3974,119 +3998,186 @@ export class AgentSession {
 			this._sessionDataAdmissionLocked = false;
 			this.sessionManager.setWriteGate(undefined);
 		};
-		const inspected = await this._inspectSessionDataLease(true);
-		if (inspected.status !== "ready") {
-			unlockGate();
-			return { status: "refused", code: inspected.code, message: inspected.message };
-		}
-		const sessionFile = this.sessionManager.getSessionFile();
 		const registry = this._leaseRegistry;
 		const accessGuard = this._sessionAccessGuard;
-		if (!sessionFile || !registry || !accessGuard) {
-			unlockGate();
-			return { status: "refused", code: "write_guard_unavailable", message: "session access guard is unavailable" };
-		}
-		const identity = canonicalTranscriptIdentity(sessionFile);
-		const fingerprint = fileFingerprint(sessionFile);
-		if (!fingerprint) {
-			unlockGate();
-			return { status: "refused", code: "io_error", message: "cannot fingerprint current transcript" };
-		}
-		if (options?.expectedFingerprint !== undefined && fingerprint !== options.expectedFingerprint) {
-			unlockGate();
-			return {
-				status: "refused",
-				code: "fingerprint_mismatch",
-				message: "transcript changed between preview and lock acquisition",
-				observedFingerprint: fingerprint,
+		let identity: CanonicalTranscriptIdentity | undefined;
+		let lockId: string | undefined;
+		let guardUpgraded = false;
+		let upgradeStarted = false;
+		let upgradeCompleted = false;
+		let success = false;
+		try {
+			const inspected = await this._inspectSessionDataLease(true);
+			if (inspected.status !== "ready") {
+				return { status: "refused", code: inspected.code, message: inspected.message };
+			}
+			const sessionFile = this.sessionManager.getSessionFile();
+			if (!sessionFile || !registry || !accessGuard) {
+				return {
+					status: "refused",
+					code: "write_guard_unavailable",
+					message: "session access guard is unavailable",
+				};
+			}
+			identity = canonicalTranscriptIdentity(sessionFile);
+			const fingerprint = fileFingerprint(sessionFile);
+			if (!fingerprint) {
+				return { status: "refused", code: "io_error", message: "cannot fingerprint current transcript" };
+			}
+			if (options?.expectedFingerprint !== undefined && fingerprint !== options.expectedFingerprint) {
+				return {
+					status: "refused",
+					code: "fingerprint_mismatch",
+					message: "transcript changed between preview and lock acquisition",
+					observedFingerprint: fingerprint,
+				};
+			}
+			lockId = randomUUID();
+			const processStart = registry.processInventory.getProcessStartUtc(process.pid) ?? "UNKNOWN";
+			const claim: LeaseClaimRecord = {
+				lock_id: lockId,
+				path_hash: identity.pathHash,
+				session_id: this.sessionManager.getSessionId(),
+				purpose: "in_place_session_refresh",
+				owner_pid: process.pid,
+				owner_start_utc: processStart,
+				owner_runtime: registry.runtime,
+				owner_build_hash: registry.buildHash,
+				phase: "acquired",
+				operation_id: randomUUID(),
+				original_fingerprint: fingerprint,
 			};
-		}
-		const lockId = randomUUID();
-		const processStart = registry.processInventory.getProcessStartUtc(process.pid) ?? "UNKNOWN";
-		const claim: LeaseClaimRecord = {
-			lock_id: lockId,
-			path_hash: identity.pathHash,
-			session_id: this.sessionManager.getSessionId(),
-			purpose: "in_place_session_refresh",
-			owner_pid: process.pid,
-			owner_start_utc: processStart,
-			owner_runtime: registry.runtime,
-			owner_build_hash: registry.buildHash,
-			phase: "acquired",
-			operation_id: randomUUID(),
-			original_fingerprint: fingerprint,
-		};
-		const promotion = registry.checkPromotionGate();
-		if (!promotion.ok) {
-			unlockGate();
-			return { status: "refused", code: "promotion_required", message: promotion.message };
-		}
-		const claimResult = registry.createClaim(claim);
-		if (!claimResult.ok) {
-			unlockGate();
+			const promotion = registry.checkPromotionGate();
+			if (!promotion.ok) {
+				return { status: "refused", code: "promotion_required", message: promotion.message };
+			}
+			const claimResult = registry.createClaim(claim);
+			if (!claimResult.ok) {
+				return {
+					status: "refused",
+					code: claimResult.code === "writer_conflict" ? "writer_conflict" : "registry_invalid",
+					message: claimResult.message,
+				};
+			}
+			const promotionAfterClaim = registry.checkPromotionGate();
+			if (!promotionAfterClaim.ok) {
+				return { status: "refused", code: "promotion_required", message: promotionAfterClaim.message };
+			}
+			upgradeStarted = true;
+			const upgraded = await accessGuard.upgrade();
+			upgradeCompleted = true;
+			if (!upgraded.ok) {
+				return {
+					status: "refused",
+					code: guardRefusalCode(upgraded.code),
+					message: upgraded.message,
+				};
+			}
+			guardUpgraded = true;
+			const guardRecord = registry.publishGuardRecord(identity.pathHash, accessGuard.guardId);
+			if (!guardRecord.ok) {
+				return { status: "refused", code: "registry_invalid", message: guardRecord.message };
+			}
+			// Re-hash under the held exclusive guard: between the pre-upgrade hash and this
+			// point an external writer could still have touched the file, so the preview
+			// fingerprint contract must be checked against the locked bytes. Range locks deny
+			// plain Node reads, so fingerprint through the guard's helper snapshot.
+			const lockedProbe = await fingerprintThroughGuard(accessGuard, this._snapshotPath("pre-acquire"));
+			if (!lockedProbe.ok) {
+				return { status: "refused", code: lockedProbe.code, message: lockedProbe.message };
+			}
+			const lockedFingerprint = lockedProbe.fingerprint;
+			if (options?.expectedFingerprint !== undefined && lockedFingerprint !== options.expectedFingerprint) {
+				return {
+					status: "refused",
+					code: "fingerprint_mismatch",
+					message: "transcript changed before the exclusive guard was held",
+					observedFingerprint: lockedFingerprint,
+				};
+			}
+			this._heldSessionDataLock = { lockId, pathHash: identity.pathHash, guard: accessGuard };
+			success = true;
 			return {
-				status: "refused",
-				code: claimResult.code === "writer_conflict" ? "writer_conflict" : "registry_invalid",
-				message: claimResult.message,
+				status: "acquired",
+				lockId,
+				sessionId: this.sessionManager.getSessionId(),
+				fingerprint: lockedFingerprint,
 			};
+		} finally {
+			if (!success) {
+				// Roll back each acquired resource independently. A failure in one
+				// cleanup step must not skip the next step (especially gate unlock).
+				if (guardUpgraded && accessGuard) {
+					try {
+						const downgraded = await accessGuard.downgrade();
+						if (!downgraded.ok && accessGuard.isHeld) {
+							// A held guard whose downgrade failed would leak the helper's
+							// shared lock; release the whole guard and mark the session
+							// unguarded (same semantics as the release-path rollback).
+							await accessGuard.release();
+							this._sessionAccessGuard = undefined;
+							this._sessionAccessUnguarded = true;
+						}
+					} catch {
+						// A thrown downgrade has the same leak risk as a typed refusal.
+						try {
+							if (accessGuard.isHeld) await accessGuard.release();
+						} catch {
+							// Continue cleaning registry state and unlock admission below.
+						} finally {
+							this._sessionAccessGuard = undefined;
+							this._sessionAccessUnguarded = true;
+						}
+					}
+				} else if (upgradeStarted && !upgradeCompleted && accessGuard) {
+					// An unexpected throw before the upgrade result arrived leaves the
+					// helper mode unknown. Release it rather than risk a leaked exclusive
+					// or shared handle.
+					try {
+						await accessGuard.release();
+					} catch {
+						// Keep unwinding; the admission gate still must be unlocked.
+					} finally {
+						this._sessionAccessGuard = undefined;
+						this._sessionAccessUnguarded = true;
+					}
+				}
+				if (guardUpgraded && registry && identity && accessGuard) {
+					try {
+						// Expected-guard-id fencing makes this safe even if publishing
+						// wrote the file and then threw before returning success.
+						registry.clearGuardRecord(identity.pathHash, accessGuard.guardId);
+					} catch {
+						// Keep unwinding; the helper and gate cleanup are more important.
+					}
+				}
+				if (lockId && registry && identity) {
+					try {
+						// The lock id fence makes this safe even if createClaim wrote
+						// the record and then threw before returning success.
+						registry.clearClaim(identity.pathHash, lockId);
+					} catch {
+						// Keep unwinding even if the registry itself throws unexpectedly.
+					}
+				}
+				// The admission gate must never stay locked behind a failed acquire.
+				unlockGate();
+			}
 		}
-		const promotionAfterClaim = registry.checkPromotionGate();
-		if (!promotionAfterClaim.ok) {
-			registry.clearClaim(identity.pathHash, lockId);
-			unlockGate();
-			return { status: "refused", code: "promotion_required", message: promotionAfterClaim.message };
-		}
-		const upgraded = await accessGuard.upgrade();
-		if (!upgraded.ok) {
-			registry.clearClaim(identity.pathHash, lockId);
-			unlockGate();
-			return {
-				status: "refused",
-				code: upgraded.code === "writer_conflict" ? "writer_conflict" : "write_guard_unavailable",
-				message: upgraded.message,
-			};
-		}
-		const guardRecord = registry.publishGuardRecord(identity.pathHash, accessGuard.guardId);
-		if (!guardRecord.ok) {
-			await accessGuard.downgrade();
-			registry.clearClaim(identity.pathHash, lockId);
-			unlockGate();
-			return { status: "refused", code: "registry_invalid", message: guardRecord.message };
-		}
-		// Re-hash under the held exclusive guard: between the pre-upgrade hash and this
-		// point an external writer could still have touched the file, so the preview
-		// fingerprint contract must be checked against the locked bytes. Range locks deny
-		// plain Node reads, so fingerprint through the guard's helper snapshot.
-		const lockedProbe = await fingerprintThroughGuard(accessGuard, this._snapshotPath("pre-acquire"));
-		if (!lockedProbe.ok) {
-			await accessGuard.downgrade();
-			registry.clearClaim(identity.pathHash, lockId);
-			unlockGate();
-			return { status: "refused", code: lockedProbe.code, message: lockedProbe.message };
-		}
-		const lockedFingerprint = lockedProbe.fingerprint;
-		if (options?.expectedFingerprint !== undefined && lockedFingerprint !== options.expectedFingerprint) {
-			await accessGuard.downgrade();
-			registry.clearClaim(identity.pathHash, lockId);
-			unlockGate();
-			return {
-				status: "refused",
-				code: "fingerprint_mismatch",
-				message: "transcript changed before the exclusive guard was held",
-				observedFingerprint: lockedFingerprint,
-			};
-		}
-		this._heldSessionDataLock = { lockId, pathHash: identity.pathHash, guard: accessGuard };
-		return {
-			status: "acquired",
-			lockId,
-			sessionId: this.sessionManager.getSessionId(),
-			fingerprint: lockedFingerprint,
-		};
 	}
 
-	/** Release the mutation claim and downgrade the OS guard, always clearing the in-process gate. */
-	async releaseSessionDataLock(lockId: string): Promise<SessionDataLockReleaseResult> {
+	/**
+	 * Release the mutation lock and downgrade the OS guard, always clearing the
+	 * in-process gate. With `keepClaim` the mutation claim/journal is kept in
+	 * place as recovery evidence (used when the operation ended BLOCKED); the
+	 * guard is still downgraded, the guard record cleared, and admission
+	 * unlocked, so the next acquire refuses with `recovery_blocked` until the
+	 * claim is resolved by recovery.
+	 */
+	async releaseSessionDataLock(
+		lockId: string,
+		options?: { keepClaim?: boolean },
+	): Promise<SessionDataLockReleaseResult> {
 		if (this._extensionMode !== "tui") {
 			return {
 				status: "refused",
@@ -4102,38 +4193,47 @@ export class AgentSession {
 				message: "session data lock token is missing or does not match",
 			};
 		}
-		let failure: { code: "registry_invalid" | "write_guard_unavailable"; message: string } | undefined;
+		const keepClaim = options?.keepClaim === true;
+		let failure: { code: SessionDataRefusalCode; message: string } | undefined;
 		try {
 			const downgraded = await held.guard.downgrade();
 			if (!downgraded.ok) {
-				failure = { code: "write_guard_unavailable", message: downgraded.message };
+				failure = { code: guardRefusalCode(downgraded.code), message: downgraded.message };
 				await held.guard.release();
 				this._sessionAccessGuard = undefined;
 				this._sessionAccessUnguarded = true;
 			}
 		} finally {
-			const registry = this._leaseRegistry;
-			if (registry) {
-				const clearedGuard = registry.clearGuardRecord(held.pathHash, held.guard.guardId);
-				const clearedClaim = registry.clearClaim(held.pathHash, held.lockId);
-				if ((!clearedGuard.ok || !clearedClaim.ok) && !failure) {
-					failure = {
-						code: "registry_invalid",
-						message: !clearedGuard.ok
-							? clearedGuard.message
-							: !clearedClaim.ok
-								? clearedClaim.message
-								: "registry cleanup failed",
-					};
+			try {
+				const registry = this._leaseRegistry;
+				if (registry) {
+					const clearedGuard = registry.clearGuardRecord(held.pathHash, held.guard.guardId);
+					// keepClaim intentionally retains the claim/journal as recovery
+					// evidence; recovery owns it from here (next acquire refuses
+					// recovery_blocked while the claim exists).
+					const clearedClaim = keepClaim
+						? ({ ok: true, value: true } as const)
+						: registry.clearClaim(held.pathHash, held.lockId);
+					if ((!clearedGuard.ok || !clearedClaim.ok) && !failure) {
+						failure = {
+							code: "registry_invalid",
+							message: !clearedGuard.ok
+								? clearedGuard.message
+								: !clearedClaim.ok
+									? clearedClaim.message
+									: "registry cleanup failed",
+						};
+					}
 				}
+			} finally {
+				this._heldSessionDataLock = undefined;
+				this._sessionDataAdmissionLocked = false;
+				this.sessionManager.setWriteGate(undefined);
 			}
-			this._heldSessionDataLock = undefined;
-			this._sessionDataAdmissionLocked = false;
-			this.sessionManager.setWriteGate(undefined);
 		}
 		return failure
 			? { status: "refused", code: failure.code, message: failure.message }
-			: { status: "released", lockId };
+			: { status: "released", lockId, ...(keepClaim ? { claimKept: true } : {}) };
 	}
 
 	private _snapshotPath(label: string): string {
@@ -4153,6 +4253,8 @@ export class AgentSession {
 		candidatePath: string;
 		lockId: string;
 		backupName?: string;
+		/** Directory holding the backup file; recorded in the claim for recovery lookup. */
+		backupDir?: string;
 	}): Promise<SessionDataReplaceResult> {
 		const refuse = (
 			code: SessionDataRefusalCode,
@@ -4182,10 +4284,18 @@ export class AgentSession {
 		) {
 			return refuse("identity_changed", "held guard identity does not match the current session path");
 		}
+		if (options.backupDir !== undefined && (options.backupDir.length === 0 || options.backupDir.includes("\u0000"))) {
+			return refuse("registry_invalid", "backupDir must be a non-empty path without NUL characters");
+		}
 		const promotion = registry.checkPromotionGate();
 		if (!promotion.ok) return refuse("promotion_required", promotion.message);
 		if (!(await held.guard.verifyHeld()))
-			return refuse("write_guard_unavailable", "exclusive transcript guard is not held");
+			return refuse(
+				held.guard.isUncertain ? "write_guard_uncertain" : "write_guard_unavailable",
+				held.guard.isUncertain
+					? "exclusive transcript guard state is uncertain after a timed-out mutation"
+					: "exclusive transcript guard is not held",
+			);
 		const claim = registry.readClaim(held.pathHash);
 		if (!claim.ok) return refuse("registry_invalid", claim.message);
 		if (
@@ -4223,14 +4333,12 @@ export class AgentSession {
 				phase: "candidate_ready",
 				candidate_fingerprint: candidateFingerprint,
 				...(backupName ? { backup_name: backupName } : {}),
+				...(options.backupDir ? { backup_dir: options.backupDir } : {}),
 			});
 			if (!candidateReady.ok) return refuse("registry_invalid", candidateReady.message);
 			const replacement = await held.guard.rewrite(options.candidatePath);
 			if (!replacement.ok) {
-				return refuse(
-					replacement.code === "writer_conflict" ? "writer_conflict" : "write_guard_unavailable",
-					replacement.message,
-				);
+				return refuse(guardRefusalCode(replacement.code), replacement.message);
 			}
 			const published = await fingerprintThroughGuard(held.guard, currentSnapshot);
 			if (!published.ok) {
@@ -4283,11 +4391,16 @@ export class AgentSession {
 		if (!this._sessionDataAdmissionLocked || this._hasPendingSessionWork() || !this.isIdle) {
 			return refuse("pending_work", "session is no longer idle or has pending work");
 		}
-		if (
-			canonicalTranscriptIdentity(held.guard.path).identity !== canonicalTranscriptIdentity(sessionFile).identity ||
-			!(await held.guard.verifyHeld())
-		) {
-			return refuse("write_guard_unavailable", "exclusive transcript guard is no longer held");
+		if (canonicalTranscriptIdentity(held.guard.path).identity !== canonicalTranscriptIdentity(sessionFile).identity) {
+			return refuse("write_guard_unavailable", "exclusive transcript guard identity changed");
+		}
+		if (!(await held.guard.verifyHeld())) {
+			return refuse(
+				held.guard.isUncertain ? "write_guard_uncertain" : "write_guard_unavailable",
+				held.guard.isUncertain
+					? "exclusive transcript guard state is uncertain after a timed-out mutation"
+					: "exclusive transcript guard is no longer held",
+			);
 		}
 		// Byte-range locks deny reads through plain Node handles, so every read of
 		// the guarded transcript flows through the helper (snapshot + hash).

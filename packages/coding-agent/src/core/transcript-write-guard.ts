@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from "child_process";
-import { createHash } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { lstatSync, mkdtempSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join, resolve } from "path";
@@ -56,6 +56,7 @@ export type TranscriptGuardMode = "exclusive" | "shared";
 
 export type TranscriptGuardErrorCode =
 	| "write_guard_unavailable"
+	| "write_guard_uncertain"
 	| "writer_conflict"
 	| "io_error"
 	| "fingerprint_mismatch"
@@ -98,7 +99,23 @@ interface WireResponse {
 	byteLength?: number;
 	/** Helper handle generation: increments only when the guard handle is (re)opened. */
 	gen?: number;
+	/** Echo of the per-request correlation id; responses without it cannot be matched. */
+	reqId?: string;
 }
+
+/** Parse a helper response only when its correlation id matches the pending request. */
+export function parseCorrelatedGuardResponse(line: string, expectedRequestId: string): WireResponse | undefined {
+	let response: WireResponse;
+	try {
+		response = JSON.parse(line) as WireResponse;
+	} catch {
+		return undefined;
+	}
+	return response.reqId === expectedRequestId ? response : undefined;
+}
+
+/** Helper ops whose outcome mutates the guarded file or the guard handle itself. */
+const MUTATION_OPS = new Set(["rewrite", "upgrade", "downgrade"]);
 
 const GUARD_SCRIPT = `
 $ErrorActionPreference = 'Stop'
@@ -145,9 +162,10 @@ while ($true) {
   if ($line.Trim() -eq '') { continue }
   try {
     $req = $line | ConvertFrom-Json
+    $reqId = $req.reqId
     $op = $req.op
     if ($op -eq 'ping') {
-      Respond @{ ok = $true; held = ($null -ne $state.Stream); gen = $state.HandleGen }
+      Respond @{ ok = $true; held = ($null -ne $state.Stream); gen = $state.HandleGen; reqId = $reqId }
     } elseif ($op -eq 'acquire') {
       if ($null -ne $state.Stream) { throw 'guard already held by this helper' }
       $stream = OpenLocked $req.path $req.mode
@@ -161,7 +179,7 @@ while ($true) {
       $state.Mode = $req.mode
       $state.GuardId = $req.guardId
       $state.HandleGen = 1
-      Respond @{ ok = $true; guardId = $req.guardId; gen = $state.HandleGen }
+      Respond @{ ok = $true; guardId = $req.guardId; gen = $state.HandleGen; reqId = $reqId }
     } elseif ($op -eq 'upgrade' -or $op -eq 'downgrade') {
       if ($null -eq $state.Stream) { throw 'guard not held' }
       $oldMode = $state.Mode
@@ -193,7 +211,7 @@ while ($true) {
         }
         throw
       }
-      Respond @{ ok = $true; guardId = $state.GuardId; gen = $state.HandleGen }
+      Respond @{ ok = $true; guardId = $state.GuardId; gen = $state.HandleGen; reqId = $reqId }
     } elseif ($op -eq 'rewrite') {
       # No-gap in-place rewrite. The canonical guard Stream and its LockFileEx
       # range stay held for the whole op: the handle is never closed, the path
@@ -242,7 +260,7 @@ while ($true) {
       }
       if ($publishedHash -ne $req.expectedFingerprint) { throw 'rewrite verification failed: stream fingerprint mismatch' }
       $state.Stream.Position = 0
-      Respond @{ ok = $true; guardId = $state.GuardId; byteLength = [int64]$bytes.Length; gen = $state.HandleGen }
+      Respond @{ ok = $true; guardId = $state.GuardId; byteLength = [int64]$bytes.Length; gen = $state.HandleGen; reqId = $reqId }
     } elseif ($op -eq 'snapshot') {
       # The owner's own Node handles hit the byte-range lock, so reads during a
       # held exclusive guard must flow through this locked handle: copy the
@@ -262,10 +280,10 @@ while ($true) {
         [System.IO.File]::WriteAllBytes([string]$req.dest, $bytes[0..($read - 1)])
       }
       $state.Stream.Position = 0
-      Respond @{ ok = $true; byteLength = $read }
+      Respond @{ ok = $true; byteLength = $read; reqId = $reqId }
     } elseif ($op -eq 'release') {
       if ($null -ne $state.Stream) { $state.Stream.Dispose(); $state.Stream = $null }
-      Respond @{ ok = $true }
+      Respond @{ ok = $true; reqId = $reqId }
       break
     } else {
       throw "unknown op: $op"
@@ -273,7 +291,9 @@ while ($true) {
   } catch {
     $hresult = 0
     try { $hresult = $_.Exception.HResult } catch {}
-    Respond @{ ok = $false; error = $_.Exception.Message; hresult = $hresult; held = ($null -ne $state.Stream) }
+    $echoId = $null
+    try { $echoId = $req.reqId } catch {}
+    Respond @{ ok = $false; error = $_.Exception.Message; hresult = $hresult; held = ($null -ne $state.Stream); reqId = $echoId }
   }
 }
 `;
@@ -322,9 +342,20 @@ export class TranscriptWriteGuard {
 	#mode: TranscriptGuardMode;
 	#guardId: string;
 	#held = false;
+	/**
+	 * True after a mutation op (rewrite/upgrade/downgrade) timed out: the helper
+	 * may have half-applied the mutation, so the guard state can no longer be
+	 * trusted. Every further op on this guard refuses with
+	 * `write_guard_uncertain` until the guard is released and re-acquired.
+	 */
+	#uncertain = false;
 	/** Helper-side counter that increments only when the guard handle is (re)opened. */
 	#handleGen = 0;
-	#pending: Array<{ resolve: (response: WireResponse) => void; reject: (error: Error) => void }> = [];
+	#pending: Array<{
+		id: string;
+		resolve: (response: WireResponse) => void;
+		reject: (error: Error) => void;
+	}> = [];
 	#buffer = "";
 	#opTimeoutMs: number;
 	#lossListener: (() => void) | undefined;
@@ -347,6 +378,11 @@ export class TranscriptWriteGuard {
 
 	get guardId(): string {
 		return this.#guardId;
+	}
+
+	/** Whether a previous mutation op timed out and the guard state is no longer trustworthy. */
+	get isUncertain(): boolean {
+		return this.#uncertain;
 	}
 
 	/**
@@ -375,7 +411,12 @@ export class TranscriptWriteGuard {
 	 */
 	static async acquire(
 		canonicalPath: string,
-		options?: { mode?: TranscriptGuardMode; opTimeoutMs?: number },
+		options?: {
+			mode?: TranscriptGuardMode;
+			opTimeoutMs?: number;
+			/** Optional deadline for the initial helper acquire handshake; defaults to opTimeoutMs. */
+			acquireTimeoutMs?: number;
+		},
 	): Promise<TranscriptGuardAcquireResult> {
 		const mode = options?.mode ?? "exclusive";
 		const opTimeoutMs = options?.opTimeoutMs ?? 20_000;
@@ -392,7 +433,10 @@ export class TranscriptWriteGuard {
 		const guard = new TranscriptWriteGuard(canonical, mode, guardId, opTimeoutMs);
 		let response: WireResponse;
 		try {
-			response = await guard.#spawnAndRequest({ op: "acquire", path: canonical, mode, guardId });
+			response = await guard.#spawnAndRequest(
+				{ op: "acquire", path: canonical, mode, guardId },
+				options?.acquireTimeoutMs,
+			);
 		} catch (error) {
 			guard.#teardown();
 			return guardFailure(
@@ -455,28 +499,38 @@ export class TranscriptWriteGuard {
 	}
 
 	#dispatch(line: string): void {
-		let response: WireResponse;
-		try {
-			response = JSON.parse(line) as WireResponse;
-		} catch {
-			return;
-		}
-		const next = this.#pending.shift();
+		const next = this.#pending[0];
 		if (!next) return;
+		// A stale or uncorrelated response belongs to another request and is
+		// discarded; it must never be assigned to the currently pending op.
+		const response = parseCorrelatedGuardResponse(line, next.id);
+		if (!response) return;
+		this.#pending.shift();
 		next.resolve(response);
 	}
 
-	#request(payload: Record<string, unknown>): Promise<WireResponse> {
+	#request(payload: Record<string, unknown>, timeoutMs = this.#opTimeoutMs): Promise<WireResponse> {
 		const child = this.#child;
 		if (!child || child.exitCode !== null || !child.stdin?.writable) {
 			return Promise.reject(new Error("guard helper is not running"));
 		}
+		const reqId = randomUUID();
 		return new Promise<WireResponse>((resolveRequest, rejectRequest) => {
 			const timer = setTimeout(() => {
 				const index = this.#pending.findIndex((entry) => entry.reject === settleReject);
 				if (index !== -1) this.#pending.splice(index, 1);
-				settleReject(new Error(`guard op timed out after ${this.#opTimeoutMs}ms`));
-			}, this.#opTimeoutMs);
+				const error = new Error(`guard op timed out after ${this.#opTimeoutMs}ms`);
+				if (typeof payload.op === "string" && MUTATION_OPS.has(payload.op)) {
+					// The helper may or may not have applied the mutation before the
+					// timeout: kill it so the stale helper cannot act further and
+					// mark the guard uncertain — later ops must refuse instead of
+					// assuming the pre-op guard state.
+					this.#teardown();
+					this.#held = false;
+					this.#uncertain = true;
+				}
+				settleReject(error);
+			}, timeoutMs);
 			const settleResolve = (response: WireResponse) => {
 				clearTimeout(timer);
 				resolveRequest(response);
@@ -485,16 +539,20 @@ export class TranscriptWriteGuard {
 				clearTimeout(timer);
 				rejectRequest(error);
 			};
-			this.#pending.push({ resolve: settleResolve, reject: settleReject });
-			child.stdin?.write(`${JSON.stringify(payload)}\n`, (error) => {
-				if (error) settleReject(error);
+			this.#pending.push({ id: reqId, resolve: settleResolve, reject: settleReject });
+			child.stdin?.write(`${JSON.stringify({ ...payload, reqId })}\n`, (error) => {
+				if (error) {
+					const index = this.#pending.findIndex((entry) => entry.id === reqId);
+					if (index !== -1) this.#pending.splice(index, 1);
+					settleReject(error);
+				}
 			});
 		});
 	}
 
-	async #spawnAndRequest(payload: Record<string, unknown>): Promise<WireResponse> {
+	async #spawnAndRequest(payload: Record<string, unknown>, timeoutMs?: number): Promise<WireResponse> {
 		await this.#spawnChild();
-		return this.#request(payload);
+		return this.#request(payload, timeoutMs);
 	}
 
 	async #requestWithSpawnGuard(payload: Record<string, unknown>): Promise<WireResponse> {
@@ -516,7 +574,20 @@ export class TranscriptWriteGuard {
 	 * between candidate hash and guarded restore).
 	 * The source may live anywhere readable on disk; it is read, not consumed.
 	 */
-	async rewrite(sourcePath: string): Promise<TranscriptRewriteResult> {
+	/** Typed refusal used by every op once the guard is in the uncertain state. */
+	#uncertainRefusal(): TranscriptGuardFailure {
+		return guardFailure(
+			new TranscriptGuardUnavailableError(
+				"write_guard_uncertain",
+				"guard state is uncertain after a timed-out mutation op; release and re-acquire the guard",
+			),
+		);
+	}
+
+	async rewrite(
+		sourcePath: string,
+		options?: { expectedSourceFingerprint?: string },
+	): Promise<TranscriptRewriteResult> {
 		const sourceAbsolutePath = resolve(sourcePath);
 		try {
 			const sourceStats = lstatSync(sourceAbsolutePath);
@@ -534,6 +605,7 @@ export class TranscriptWriteGuard {
 				message: error instanceof Error ? error.message : String(error),
 			};
 		}
+		if (this.#uncertain) return this.#uncertainRefusal();
 		if (!this.isHeld) {
 			return guardFailure(
 				new TranscriptGuardUnavailableError("writer_conflict", "guard is no longer held; refusing rewrite"),
@@ -548,10 +620,23 @@ export class TranscriptWriteGuard {
 		}
 		try {
 			const sourceFingerprint = createHash("sha256").update(readFileSync(sourceAbsolutePath)).digest("hex");
+			// A caller-pinned fingerprint (e.g. the claim's recorded original
+			// fingerprint for guarded restore) binds the source bytes to what the
+			// caller inspected, not to whatever happens to sit at the path now.
+			if (
+				options?.expectedSourceFingerprint !== undefined &&
+				sourceFingerprint !== options.expectedSourceFingerprint
+			) {
+				return {
+					ok: false,
+					code: "fingerprint_mismatch",
+					message: `rewrite source fingerprint ${sourceFingerprint} does not match the pinned expectation ${options.expectedSourceFingerprint}`,
+				};
+			}
 			const response = await this.#requestWithSpawnGuard({
 				op: "rewrite",
 				source: sourceAbsolutePath,
-				expectedFingerprint: sourceFingerprint,
+				expectedFingerprint: options?.expectedSourceFingerprint ?? sourceFingerprint,
 			});
 			if (!response.ok) {
 				if (response.held !== true) this.#held = false;
@@ -570,7 +655,7 @@ export class TranscriptWriteGuard {
 			this.#held = false;
 			return guardFailure(
 				new TranscriptGuardUnavailableError(
-					"writer_conflict",
+					this.#uncertain ? "write_guard_uncertain" : "writer_conflict",
 					error instanceof Error ? error.message : String(error),
 				),
 			);
@@ -584,6 +669,7 @@ export class TranscriptWriteGuard {
 	 * previous guard mode before replying where possible.
 	 */
 	async upgrade(): Promise<TranscriptGuardResult> {
+		if (this.#uncertain) return this.#uncertainRefusal();
 		if (!this.isHeld || this.#mode !== "shared") {
 			return { ok: false, code: "writer_conflict", message: "shared access guard is not held" };
 		}
@@ -607,7 +693,7 @@ export class TranscriptWriteGuard {
 			this.#held = false;
 			return {
 				ok: false,
-				code: "write_guard_unavailable",
+				code: this.#uncertain ? "write_guard_uncertain" : "write_guard_unavailable",
 				message: error instanceof Error ? error.message : String(error),
 			};
 		}
@@ -615,6 +701,7 @@ export class TranscriptWriteGuard {
 
 	/** Downgrade an exclusive trim guard back to the held shared session guard. */
 	async downgrade(): Promise<TranscriptGuardResult> {
+		if (this.#uncertain) return this.#uncertainRefusal();
 		if (!this.isHeld || this.#mode !== "exclusive") {
 			return { ok: false, code: "writer_conflict", message: "exclusive write guard is not held" };
 		}
@@ -638,7 +725,7 @@ export class TranscriptWriteGuard {
 			this.#held = false;
 			return {
 				ok: false,
-				code: "write_guard_unavailable",
+				code: this.#uncertain ? "write_guard_uncertain" : "write_guard_unavailable",
 				message: error instanceof Error ? error.message : String(error),
 			};
 		}
@@ -646,6 +733,7 @@ export class TranscriptWriteGuard {
 
 	/** Liveness probe used before commit: the helper must still hold the lock. */
 	async verifyHeld(): Promise<boolean> {
+		if (this.#uncertain) return false;
 		if (!this.#child || !this.#held) return false;
 		try {
 			const response = await this.#requestWithSpawnGuard({ op: "ping" });
@@ -663,6 +751,7 @@ export class TranscriptWriteGuard {
 	 * exclusive guard is held. The snapshot is a plain unlocked file.
 	 */
 	async snapshotTo(destPath: string): Promise<TranscriptGuardResult & { byteLength?: number }> {
+		if (this.#uncertain) return this.#uncertainRefusal();
 		if (!this.isHeld) {
 			return { ok: false, code: "writer_conflict", message: "guard is no longer held; refusing snapshot" };
 		}
@@ -746,6 +835,15 @@ function guardFailure(error: TranscriptGuardUnavailableError): TranscriptGuardFa
 	return { ok: false, code: error.code, message: error.message };
 }
 
+/** SHA-256 hex of the exact raw bytes of a file, or null when unreadable. */
+function fileFingerprint(filePath: string): string | null {
+	try {
+		return createHash("sha256").update(readFileSync(filePath)).digest("hex");
+	} catch {
+		return null;
+	}
+}
+
 /**
  * Scratch directory used by tests to observe helper behavior; not used in
  * production paths.
@@ -757,4 +855,43 @@ export function createGuardScratchDir(): string {
 /** Remove a scratch dir created by `createGuardScratchDir`. */
 export function removeGuardScratchDir(dir: string): void {
 	rmSync(dir, { recursive: true, force: true });
+}
+
+const HELD_GUARD_LOCKED = "byte-range locks deny reads through every handle except the helper's own";
+
+/** Failure codes `fingerprintThroughGuard` can actually produce. */
+export type GuardedFingerprintFailureCode =
+	| "writer_conflict"
+	| "write_guard_uncertain"
+	| "write_guard_unavailable"
+	| "io_error";
+
+export type GuardedFingerprintResult =
+	| { ok: true; fingerprint: string }
+	| { ok: false; code: GuardedFingerprintFailureCode; message: string };
+
+/**
+ * Snapshot the guarded transcript through the helper's locked handle and
+ * return its fingerprint. Reads through plain Node handles fail with EBUSY
+ * while a full-range exclusive lock is held, so guarded verification flows
+ * must read via the guard itself (same process/handle as the lock owner).
+ */
+export async function fingerprintThroughGuard(
+	guard: TranscriptWriteGuard,
+	snapshotPath: string,
+): Promise<GuardedFingerprintResult> {
+	const snapshot = await guard.snapshotTo(snapshotPath);
+	if (!snapshot.ok) {
+		return {
+			ok: false,
+			code:
+				snapshot.code === "writer_conflict" || snapshot.code === "write_guard_uncertain"
+					? snapshot.code
+					: "write_guard_unavailable",
+			message: snapshot.message,
+		};
+	}
+	const fingerprint = fileFingerprint(snapshotPath);
+	if (!fingerprint) return { ok: false, code: "io_error", message: HELD_GUARD_LOCKED };
+	return { ok: true, fingerprint };
 }

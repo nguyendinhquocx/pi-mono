@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
 	closeSync,
 	existsSync,
@@ -13,7 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { TranscriptWriteGuard } from "../src/core/transcript-write-guard.ts";
+import { parseCorrelatedGuardResponse, TranscriptWriteGuard } from "../src/core/transcript-write-guard.ts";
 
 const roots: string[] = [];
 
@@ -261,6 +262,41 @@ describe("TranscriptWriteGuard", () => {
 	);
 
 	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
+		"binds rewrite to a pinned source fingerprint and refuses mutated bytes with the guard held",
+		async () => {
+			const { root, transcript } = fixture();
+			const backup = join(root, "session.jsonl.bak");
+			writeFileSync(backup, "original backed up bytes\n");
+			writeFileSync(transcript, "candidate bytes\n");
+			const acquired = await TranscriptWriteGuard.acquire(transcript, { mode: "exclusive" });
+			expect(acquired.ok).toBe(true);
+			if (!acquired.ok) return;
+			try {
+				// Pin the expected source fingerprint to something other than the
+				// bytes currently at the source path (e.g. the claim's recorded
+				// original fingerprint after the backup was mutated in the window
+				// between inspection and restore).
+				const refused = await acquired.guard.rewrite(backup, {
+					expectedSourceFingerprint: createHash("sha256").update("other bytes\n").digest("hex"),
+				});
+				expect(refused).toMatchObject({ ok: false, code: "fingerprint_mismatch" });
+				// The refusal is a pre-op check: the guard stays held and the
+				// guarded bytes are untouched.
+				expect(acquired.guard.isHeld).toBe(true);
+				expect(await snapshotThrough(acquired.guard, root)).toBe("candidate bytes\n");
+
+				// The correct pin publishes the pinned bytes.
+				const pinned = createHash("sha256").update("original backed up bytes\n").digest("hex");
+				const rewritten = await acquired.guard.rewrite(backup, { expectedSourceFingerprint: pinned });
+				expect(rewritten).toMatchObject({ ok: true, byteLength: "original backed up bytes\n".length });
+				expect(await snapshotThrough(acquired.guard, root)).toBe("original backed up bytes\n");
+			} finally {
+				await acquired.guard.release();
+			}
+		},
+	);
+
+	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
 		"refuses rewrite in shared mode and when the guard is lost",
 		async () => {
 			const { root, transcript } = fixture();
@@ -344,4 +380,76 @@ describe("TranscriptWriteGuard", () => {
 			await acquired.guard.release();
 		}
 	});
+
+	// =======================================================================
+	// Fix 6: per-request correlation + uncertain state after a mutation timeout
+	// =======================================================================
+
+	it("accepts only a helper response whose correlation id matches the pending request", () => {
+		const stale = parseCorrelatedGuardResponse(
+			JSON.stringify({ ok: true, held: true, reqId: "req-stale" }),
+			"req-current",
+		);
+		expect(stale).toBeUndefined();
+
+		const uncorrelated = parseCorrelatedGuardResponse(JSON.stringify({ ok: true, held: true }), "req-current");
+		expect(uncorrelated).toBeUndefined();
+
+		const current = parseCorrelatedGuardResponse(
+			JSON.stringify({ ok: true, held: true, reqId: "req-current" }),
+			"req-current",
+		);
+		expect(current).toMatchObject({ ok: true, reqId: "req-current" });
+	});
+
+	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
+		"marks the guard uncertain after a timed-out rewrite and refuses later ops",
+		async () => {
+			const { root, transcript } = fixture();
+			const candidate = join(root, "candidate.tmp");
+			writeFileSync(candidate, "candidate bytes\n");
+			// A 1ms timeout simulates a stalled helper mutation op.
+			const acquired = await TranscriptWriteGuard.acquire(transcript, {
+				mode: "exclusive",
+				opTimeoutMs: 1,
+				acquireTimeoutMs: 20_000,
+			});
+			expect(acquired.ok).toBe(true);
+			if (!acquired.ok) return;
+			const guard = acquired.guard;
+			try {
+				const timedOut = await guard.rewrite(candidate);
+				expect(timedOut).toMatchObject({ ok: false, code: "write_guard_uncertain" });
+				// The helper was killed and the guard can no longer be trusted.
+				expect(guard.isHeld).toBe(false);
+				expect(guard.isUncertain).toBe(true);
+				// Every later op on the uncertain guard refuses with the typed code.
+				const laterRewrite = await guard.rewrite(candidate);
+				expect(laterRewrite).toMatchObject({ ok: false, code: "write_guard_uncertain" });
+				const laterSnapshot = await guard.snapshotTo(join(root, "later-snapshot.tmp"));
+				expect(laterSnapshot).toMatchObject({ ok: false, code: "write_guard_uncertain" });
+				const laterUpgrade = await guard.upgrade();
+				expect(laterUpgrade).toMatchObject({ ok: false, code: "write_guard_uncertain" });
+				expect(await guard.verifyHeld()).toBe(false);
+			} finally {
+				await guard.release();
+				// The killed helper releases its OS handle asynchronously; wait for
+				// the transcript to become unlockable before the shared afterEach
+				// cleanup rmSync runs.
+				const deadline = Date.now() + 10_000;
+				let unlocked = false;
+				while (Date.now() < deadline) {
+					try {
+						const handle = openSync(transcript, "r+");
+						closeSync(handle);
+						unlocked = true;
+						break;
+					} catch {
+						await delay(50);
+					}
+				}
+				expect(unlocked).toBe(true);
+			}
+		},
+	);
 });

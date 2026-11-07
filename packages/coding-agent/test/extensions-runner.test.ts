@@ -1260,7 +1260,11 @@ describe("ExtensionRunner", () => {
 				sessionId: "s1",
 				fingerprint: "f".repeat(64),
 			}));
-			const release = vi.fn(async (lockId: string) => ({ status: "released" as const, lockId }));
+			const release = vi.fn(async (lockId: string, options?: { keepClaim?: boolean }) => ({
+				status: "released" as const,
+				lockId,
+				...(options?.keepClaim ? { claimKept: true } : {}),
+			}));
 			const replace = vi.fn(async (options: { candidatePath: string; lockId: string; backupName?: string }) => ({
 				status: "replaced" as const,
 				lockId: options.lockId,
@@ -1290,9 +1294,23 @@ describe("ExtensionRunner", () => {
 
 			expect(await commandContext.inspectSessionDataLease()).toMatchObject({ status: "ready", sessionId: "s1" });
 			expect(await commandContext.acquireSessionDataLock()).toMatchObject({ status: "acquired", lockId: "lock-1" });
+			// Fix B plumbing: lock options reach the bound action instead of being
+			// dropped at the context wrapper.
+			expect(await commandContext.acquireSessionDataLock({ expectedFingerprint: "a".repeat(64) })).toMatchObject({
+				status: "acquired",
+				lockId: "lock-1",
+			});
+			expect(acquire).toHaveBeenLastCalledWith({ expectedFingerprint: "a".repeat(64) });
 			expect(await commandContext.releaseSessionDataLock("lock-1")).toEqual({
 				status: "released",
 				lockId: "lock-1",
+			});
+			// keepClaim passthrough: options reach the bound action and the result
+			// reports the retained claim journal.
+			expect(await commandContext.releaseSessionDataLock("lock-1", { keepClaim: true })).toEqual({
+				status: "released",
+				lockId: "lock-1",
+				claimKept: true,
 			});
 			expect(
 				await commandContext.replaceSessionDataTranscript({ candidatePath: "candidate.tmp", lockId: "lock-1" }),
@@ -1301,8 +1319,13 @@ describe("ExtensionRunner", () => {
 				await commandContext.reloadSessionFromDisk({ expectedFingerprint: "f".repeat(64), lockId: "lock-1" }),
 			).toMatchObject({ status: "reloaded", entryCount: 4 });
 			expect(inspect).toHaveBeenCalledOnce();
-			expect(acquire).toHaveBeenCalledOnce();
-			expect(release).toHaveBeenCalledWith("lock-1");
+			// Fix B plumbing: both the bare call and the options call reach the
+			// bound action with exactly the arguments the context received.
+			expect(acquire).toHaveBeenCalledTimes(2);
+			expect(acquire).toHaveBeenNthCalledWith(1, undefined);
+			expect(acquire).toHaveBeenNthCalledWith(2, { expectedFingerprint: "a".repeat(64) });
+			expect(release).toHaveBeenNthCalledWith(1, "lock-1", undefined);
+			expect(release).toHaveBeenNthCalledWith(2, "lock-1", { keepClaim: true });
 			expect(replace).toHaveBeenCalledWith({ candidatePath: "candidate.tmp", lockId: "lock-1" });
 			expect(reload).toHaveBeenCalledWith({ expectedFingerprint: "f".repeat(64), lockId: "lock-1" });
 		});
