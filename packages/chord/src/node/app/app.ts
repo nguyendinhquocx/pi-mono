@@ -4,13 +4,12 @@
 // the server's plugins with the kit's own facets (the start-data object, sessions, the owner link, pairing, files),
 // and gives the app the controls it needs: the owner link, `applyChanges`, installs, export and import per address.
 
-import { statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import type { TelemetryContext } from "@earendil-works/pi-telemetry";
 import { type Context, withAbortSignal } from "../../context/index.ts";
 import { type Address, type HostKind, hostKind, type KindShape } from "../../contracts/index.ts";
 import type { Principal } from "../../data/index.ts";
-import { canonicalJson } from "../../data/principal.ts";
+import { principalKey, samePrincipal } from "../../data/principal.ts";
 import {
 	createHost,
 	type Facet,
@@ -19,7 +18,7 @@ import {
 	type PluginFacet,
 	type PrincipalAttributes,
 } from "../../host/index.ts";
-import type { JsonValue } from "../../json.ts";
+import { isJsonValue, type JsonValue } from "../../json.ts";
 import { openNodeSqliteDatabase } from "../../sqlite/node.ts";
 import { openStore, type Store, sqliteBackend } from "../../store/index.ts";
 import { localeChoiceFacet, themeChoiceFacet, themesFacet, translationsFacet } from "../../surfaces/index.ts";
@@ -27,6 +26,7 @@ import { type TelemetryIngestTarget, telemetryIngestFacet } from "../../telemetr
 import type { Watchable } from "../../watch.ts";
 import { createHttp, type HttpComponent, type HttpError, type ListenAddress } from "../http/index.ts";
 import {
+	type BaseInputs,
 	createPlugins,
 	type HostPackages,
 	type InstallOptions,
@@ -37,14 +37,28 @@ import {
 	type RolloutResult,
 	type RolloutStep,
 } from "../plugins/index.ts";
-import { tuiSurface, WEB_PREFIX, type WebSurfaceOptions, webSurface } from "../surfaces/index.ts";
-import { createWorkers, type ProcessLock, processLock, type Workers, type WorkersError } from "../workers/index.ts";
+import {
+	processConditions,
+	type TuiSurfaceOptions,
+	tuiSurface,
+	WEB_PREFIX,
+	type WebSurfaceOptions,
+	webSurface,
+} from "../surfaces/index.ts";
+import {
+	createWorkers,
+	nodeBaseInputs,
+	type ProcessLock,
+	processLock,
+	type Workers,
+	type WorkersError,
+} from "../workers/index.ts";
 import { ARCHIVE_FORMAT, type ArchiveManifest, packData, unpackData } from "./archive.ts";
 import { addressParam, HostData } from "./data.ts";
 import { type FilesCaps, filesFacet } from "./files.ts";
 import { appInfoFacet } from "./info.ts";
 import { type AppLayout, createLayout, defaultDataDir, openDataDir, privateStore, workerDirectory } from "./layout.ts";
-import { OWNER_PATH, OwnerLink, type OwnerPrincipal, ownerFacet, ownerTokenFile } from "./owner.ts";
+import { OWNER_PATH, OwnerLink, ownerFacet, ownerTokenFile } from "./owner.ts";
 import { Pairings, pairingFacet } from "./pairing.ts";
 import { secretFile } from "./secrets.ts";
 import { createSessions } from "./sessions.ts";
@@ -89,14 +103,21 @@ export type AppWorkerKind<P extends Principal> = {
 	readonly idleMs?: () => number;
 };
 
-/** What the kit reports: from its host, its HTTP component, its workers or its plugins. */
+/**
+ * What the kit reports: from its host, its HTTP component, its workers or its plugins, or a failed scan of the server's
+ * own code (`server_scan`: the server starts, that code is not compared).
+ */
 export type AppError =
 	| { readonly kind: "host"; readonly error: HostError }
 	| { readonly kind: "http"; readonly error: HttpError }
 	| { readonly kind: "workers"; readonly error: WorkersError }
-	| { readonly kind: "plugins"; readonly error: PluginsError };
+	| { readonly kind: "plugins"; readonly error: PluginsError }
+	| { readonly kind: "server_scan"; readonly error: unknown };
 
-/** What `startServer` takes. `{ kind: "owner" }` must be one of the app's principals (the kit's owner). */
+/**
+ * What `startServer` takes. Worker kinds need `principal.worker`: a type error without it, also for a `workers` list
+ * typed as an array (not a tuple) that is empty.
+ */
 export type AppOptions<P extends Principal> = {
 	/** The app's name: its default data directory is `~/.<name>`, its archives carry it. */
 	readonly name: string;
@@ -109,8 +130,12 @@ export type AppOptions<P extends Principal> = {
 	readonly api: AppApi;
 	/** The app's facet kinds: `server` and each worker kind's facet kind among them. */
 	readonly kinds: Readonly<Record<string, AppKind>>;
-	/** The server's principal and each worker's (stamped on its link). */
-	readonly principal: { readonly server: P; readonly worker: (address: Address) => P };
+	/**
+	 * The server's principal, each worker's (stamped on its link; only with worker kinds) and the owner's: whom the owner
+	 * link, the owner token file and device pairing sign in, and who approves pairings and makes invites (`AppInfo.owner`).
+	 * The owner must be strict JSON and not the server's principal (refused at start).
+	 */
+	readonly principal: { readonly server: P; readonly worker?: (address: Address) => P; readonly owner: P };
 	/** The worker kinds; none: a server with clients only. */
 	readonly workers?: readonly AppWorkerKind<P>[];
 	/** The caps of each host's files (the server's and every worker's). */
@@ -121,11 +146,15 @@ export type AppOptions<P extends Principal> = {
 	readonly install?: InstallOptions;
 	/**
 	 * The web surface (slice 11): the app's web entry (the base bundle's), its page template, the paths serving the
-	 * page (`["/"]`), whether the page is public; the `web` facet kind. None: no web surface.
+	 * page (`["/"]`), whether the page is public, the conditions its packages resolve with (the server process's by
+	 * default); the `web` facet kind. None: no web surface.
 	 */
 	readonly web?: AppWeb;
-	/** The terminal surface (slice 11): the app's terminal entry; the `tui` facet kind. None: no terminal clients. */
-	readonly tui?: { readonly entry: string };
+	/**
+	 * The terminal surface (slice 11): the app's terminal entry and the conditions its packages resolve with (the server
+	 * process's by default); the `tui` facet kind. None: no terminal clients.
+	 */
+	readonly tui?: Pick<TuiSurfaceOptions, "entry" | "conditions">;
 	/**
 	 * The app's telemetry store (§29; decision "The server is the one place telemetry is stored"): the server's host,
 	 * its HTTP requests and the kit's ingest record to it (`createSqliteTelemetry`'s store). With one, every worker
@@ -139,9 +168,10 @@ export type AppOptions<P extends Principal> = {
 	 */
 	readonly principalAttributes?: PrincipalAttributes<P>;
 	/**
-	 * The app's base code beside what the kit knows (files or directories: its API modules, its start script): a change
-	 * sets `plugins.state.base`. The kit adds every file its base bundles were built from: the web's, the terminal's and
-	 * each worker kind's.
+	 * The app's base code beside what the kit knows (files or directories: its API modules, its start script), hashed at
+	 * start: `plugins.state.base` is true while a file differs from what the server or a base bundle read (or a source
+	 * file is new in one of the directories). The kit adds every file its base bundles were built from, with the bytes
+	 * they read: the web's, the terminal's and each worker kind's.
 	 */
 	readonly base?: readonly string[];
 	/**
@@ -150,7 +180,7 @@ export type AppOptions<P extends Principal> = {
 	 */
 	readonly timeouts?: AppTimeouts;
 	readonly onError: (error: AppError) => void;
-} & (OwnerPrincipal extends P ? unknown : { readonly "the app's principal type must have { kind: 'owner' }": never });
+} & ({ readonly workers?: readonly [] } | { readonly principal: { readonly worker: (address: Address) => P } });
 
 /**
  * The bounds of what public endpoints, clients and imports may cost: live ephemeral sessions (1,000; past it the
@@ -178,7 +208,7 @@ export type AppTimeouts = {
 };
 
 /** The kit's web surface options (`webSurface`'s, its kind `web` and plugins the kit's). */
-export type AppWeb = Pick<WebSurfaceOptions, "entry" | "page" | "paths" | "public">;
+export type AppWeb = Pick<WebSurfaceOptions, "entry" | "page" | "paths" | "public" | "conditions">;
 
 /** The plugins of a running app, for its "apply changes" control and its installs. */
 export type AppPlugins = {
@@ -247,6 +277,7 @@ export type KitStart = {
  * root (or a problem discovery reports there) rejects with the plugins component's `PluginError`, everything closed.
  */
 export async function startServer<P extends Principal>(options: AppOptions<P>, context: Context): Promise<App<P>> {
+	checkOwner(options.principal.owner, options.principal.server, context);
 	const { layout, cookieSecret, store, lock } = await openServer(
 		resolve(options.dataDir ?? defaultDataDir(options.name)),
 		context,
@@ -273,9 +304,6 @@ export async function startServer<P extends Principal>(options: AppOptions<P>, c
 		},
 		context,
 	);
-	// Base code by kind: directories are watched as trees, files one by one (`watchBase`).
-	const base = (options.base ?? []).map((path) => resolve(path));
-	const baseDirs = base.filter((path) => statSync(path, { throwIfNoEntry: false })?.isDirectory() === true);
 	const plugins = createPlugins(
 		{
 			roots: [{ path: resolve(options.root ?? "plugins"), required: true }, layout.plugins],
@@ -287,7 +315,8 @@ export async function startServer<P extends Principal>(options: AppOptions<P>, c
 				]),
 			),
 			install: options.install,
-			base: baseDirs,
+			// The server's own base code, hashed now; each base bundle's record is added once built (`watchBase`).
+			base: (options.base ?? []).map((path) => resolve(path)),
 			publicPath: `${WEB_PREFIX}assets/`,
 			onError: (error) => onError({ kind: "plugins", error }),
 		},
@@ -297,18 +326,20 @@ export async function startServer<P extends Principal>(options: AppOptions<P>, c
 	// The address key of each worker by its principal's key: the principal its link stamps on its telemetry batches.
 	const workerHosts = new Map<string, string>();
 	const link = new OwnerLink();
+	const { owner } = options.principal;
 	const core: PluginFacet<P>[] = [
 		{ name: "chord.http", facet: http.facet },
 		{
 			name: "chord.app.info",
-			facet: appInfoFacet({ dataDir: layout.dataDir, name: options.name, version: api.versions[0] ?? "" }),
+			facet: appInfoFacet({ dataDir: layout.dataDir, name: options.name, version: api.versions[0] ?? "", owner }),
 		},
 		{ name: "chord.app.sessions", facet: sessions.facet },
-		{ name: "chord.app.owner", facet: ownerFacet(link) },
+		{ name: "chord.app.owner", facet: ownerFacet(link, owner) },
 		{
 			name: "chord.app.pairing",
 			facet: pairingFacet(
 				new Pairings({ maxPending: limits.pendingPairings, perAddress: limits.pairingsPerAddress }),
+				owner,
 			),
 		},
 		{ name: "chord.app.files", facet: filesFacet(join(layout.server, "files"), options.files, limits.uploads) },
@@ -320,7 +351,7 @@ export async function startServer<P extends Principal>(options: AppOptions<P>, c
 	if (telemetry !== undefined) {
 		const facet = telemetryIngestFacet<P>({
 			target: telemetry,
-			workerHost: (principal) => workerHosts.get(canonicalJson(principal as unknown as JsonValue, context)),
+			workerHost: (principal) => workerHosts.get(principalKey(principal, context)),
 			principalAttributes: (principal) => host.principalAttributes(principal, context),
 		});
 		core.push({ name: "chord.telemetry", facet });
@@ -328,6 +359,17 @@ export async function startServer<P extends Principal>(options: AppOptions<P>, c
 	const surfaces: Surface<P>[] = [];
 	const app = new RunningApp(host, http, workers, plugins, surfaces, { store, lock }, layout, options);
 	try {
+		// The server's own code, the static graph of its entry (the start script): compared like every base bundle's.
+		// An entry under `node_modules` is installed code (an npm-installed app, a test runner), never compared.
+		const entry = process.argv[1];
+		if (entry !== undefined && !entry.split(sep).includes("node_modules")) {
+			const conditions = processConditions(process.execArgv, process.env.NODE_OPTIONS);
+			// Best effort: a scan that fails stops nothing; that code is then not compared.
+			await nodeBaseInputs(entry, conditions).then(
+				(inputs) => plugins.watchBase(inputs),
+				(error: unknown) => onError({ kind: "server_scan", error }),
+			);
+		}
 		// Each worker kind's base bundled now: one that does not build fails the start, everything closed.
 		for (const kind of options.workers ?? []) {
 			workers.set(
@@ -339,11 +381,9 @@ export async function startServer<P extends Principal>(options: AppOptions<P>, c
 			surfaces.push(surface);
 			core.push({ name: `chord.${surface.name}`, facet: surface.facet });
 		}
-		const files = base.filter((path) => !baseDirs.includes(path));
-		const bundled = [...surfaces, ...workers.values()].flatMap(({ inputs }) => inputs);
-		plugins.watchBase([...files, ...bundled]);
+		for (const { inputs } of [...surfaces, ...workers.values()]) plugins.watchBase(inputs);
 		await plugins.load(host, { kind: "server", core, modules: modulesOf(api, options.kinds.server) }, context);
-		await ownerTokenFile(layout.ownerToken, host, context);
+		await ownerTokenFile(layout.ownerToken, owner, host, context);
 		app.started(link.renew(), await http.listening(context));
 	} catch (error) {
 		await app.close(context);
@@ -352,14 +392,30 @@ export async function startServer<P extends Principal>(options: AppOptions<P>, c
 	return app;
 }
 
+/**
+ * Refuses an owner the kit could not recognize or that would act as the server (a declaration policy the types cannot
+ * express): sessions keep the owner as JSON, so a field `undefined` (or anything else not strict JSON) would never
+ * match it again; the server's principal reaches every worker's kit objects.
+ */
+function checkOwner<P extends Principal>(owner: P, server: P, context: Context): void {
+	if (!isJsonValue(owner)) {
+		throw new Error(
+			"startServer: principal.owner must be strict JSON (no undefined fields, functions or class instances)",
+		);
+	}
+	if (samePrincipal(owner, server, context)) {
+		throw new Error("startServer: principal.owner must not be the server's principal");
+	}
+}
+
 /** A client surface of the app: its name (`web`, `tui`), its facet, its rollout step, its base bundle's hash. */
 type Surface<P extends Principal> = {
 	readonly name: "web" | "tui";
 	readonly facet: Facet<P>;
 	step(name: string): RolloutStep;
 	readonly base: string;
-	/** The files its base bundle was built from. */
-	readonly inputs: readonly string[];
+	/** The files its base bundle was built from, with their bytes' hashes. */
+	readonly inputs: BaseInputs;
 };
 
 /** The app's client surfaces, built (their base bundles) in order: the web's, the terminal's. */
@@ -373,7 +429,7 @@ async function surfacesOf<P extends Principal>(
 	if (options.web !== undefined)
 		surfaces.push({ name: "web", ...(await webSurface(host, { ...options.web, plugins }, context)) });
 	if (options.tui !== undefined) {
-		surfaces.push({ name: "tui", ...(await tuiSurface(host, { entry: options.tui.entry, plugins }, context)) });
+		surfaces.push({ name: "tui", ...(await tuiSurface(host, { ...options.tui, plugins }, context)) });
 	}
 	return surfaces;
 }
@@ -432,8 +488,9 @@ function workersOf<P extends Principal>(
 	context: Context,
 ): Promise<Workers<HostKind>> {
 	const facet = kind.facet ?? "worker";
-	const serverKey = canonicalJson(options.principal.server as unknown as JsonValue, context);
-	const isServer = (principal: P): boolean => canonicalJson(principal as unknown as JsonValue, context) === serverKey;
+	// `AppOptions` admits worker kinds only with `principal.worker`.
+	const worker = options.principal.worker as (address: Address) => P;
+	const { server } = options.principal;
 	return createWorkers(
 		host,
 		// A host kind of the app: any params; its addresses come back from its route as the kit hands them on.
@@ -444,17 +501,18 @@ function workersOf<P extends Principal>(
 			...(kind.execArgv === undefined ? {} : { execArgv: kind.execArgv }),
 			...(kind.env === undefined ? {} : { env: kind.env }),
 			// The server reaches its workers' kit objects (`HostData`) whatever the app admits.
-			authorize: (principal, address) => isServer(principal) || kind.authorize(principal, address),
-			principal: options.principal.worker,
+			authorize: (principal, address) =>
+				samePrincipal(principal, server, context) || kind.authorize(principal, address),
+			principal: worker,
 			start: async (address, ctx) => {
-				// Principals are JSON (they cross links).
-				const principal = options.principal.worker(address) as unknown as JsonValue;
-				workerHosts.set(canonicalJson(principal, ctx), address.key);
+				const principal = worker(address);
+				workerHosts.set(principalKey(principal, ctx), address.key);
 				const kit: KitStart = {
 					dir: workerDirectory(dataDir, address),
 					facet,
-					principal,
-					server: options.principal.server as unknown as JsonValue,
+					// Principals are JSON (they cross links).
+					principal: principal as unknown as JsonValue,
+					server: server as unknown as JsonValue,
 					files: { ...options.files },
 					telemetry: options.telemetry !== undefined,
 					...(options.limits?.uploads === undefined ? {} : { uploads: options.limits.uploads }),
