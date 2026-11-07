@@ -1254,7 +1254,12 @@ describe("ExtensionRunner", () => {
 				leaseId: "l1",
 				protocolVersion: 1,
 			}));
-			const acquire = vi.fn(async () => ({ status: "acquired" as const, lockId: "lock-1", sessionId: "s1" }));
+			const acquire = vi.fn(async () => ({
+				status: "acquired" as const,
+				lockId: "lock-1",
+				sessionId: "s1",
+				fingerprint: "f".repeat(64),
+			}));
 			const release = vi.fn(async (lockId: string) => ({ status: "released" as const, lockId }));
 			const replace = vi.fn(async (options: { candidatePath: string; lockId: string; backupName?: string }) => ({
 				status: "replaced" as const,

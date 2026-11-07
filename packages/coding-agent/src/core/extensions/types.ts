@@ -423,9 +423,19 @@ export type SessionDataLeaseInspectionResult =
 	| { status: "ready"; sessionId: string; leaseId: string; protocolVersion: number }
 	| { status: "refused"; code: SessionDataRefusalCode; message: string };
 
+export type SessionDataLockOptions = {
+	/** Preview fingerprint; core refuses `fingerprint_mismatch` under the exclusive guard on mismatch. */
+	expectedFingerprint?: string;
+};
+
 export type SessionDataLockResult =
-	| { status: "acquired"; lockId: string; sessionId: string }
-	| { status: "refused"; code: SessionDataRefusalCode; message: string };
+	| {
+			status: "acquired";
+			lockId: string;
+			sessionId: string /** Fingerprint captured under the held exclusive guard. */;
+			fingerprint: string;
+	  }
+	| { status: "refused"; code: SessionDataRefusalCode; message: string; observedFingerprint?: string };
 
 export type SessionDataLockReleaseResult =
 	| { status: "released"; lockId: string }
@@ -455,8 +465,8 @@ export interface ExtensionCommandContext extends ExtensionContext {
 	/** Read-only pre-preview inspection of the current session's lease and trim gate. */
 	inspectSessionDataLease(): Promise<SessionDataLeaseInspectionResult>;
 
-	/** Acquire the in-process admission gate, registry claim, and OS transcript guard. */
-	acquireSessionDataLock(): Promise<SessionDataLockResult>;
+	/** Acquire the in-process admission gate, registry claim, and OS transcript guard. Pass the preview fingerprint so a concurrent write between preview and acquire is refused under the guard. */
+	acquireSessionDataLock(options?: SessionDataLockOptions): Promise<SessionDataLockResult>;
 
 	/** Release a lock after refresh/rollback completes. */
 	releaseSessionDataLock(lockId: string): Promise<SessionDataLockReleaseResult>;

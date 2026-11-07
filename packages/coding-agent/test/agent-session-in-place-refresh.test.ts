@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
@@ -129,6 +129,43 @@ describe("AgentSession in-place refresh", () => {
 			fixture.restorePackageDir();
 		}
 	});
+
+	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
+		"refuses acquire on preview fingerprint mismatch under the exclusive guard and reports the locked fingerprint",
+		async () => {
+			const fixture = await createPersistedSession();
+			const { session, sessionFile, header } = fixture;
+			try {
+				expect((await session.inspectSessionDataLease()).status).toBe("ready");
+				const currentHash = createHash("sha256").update(readFileSync(sessionFile)).digest("hex");
+
+				// Stale preview fingerprint: a writer touched the file between preview and acquire.
+				const stale = await session.acquireSessionDataLock({
+					expectedFingerprint: "0".repeat(64),
+				});
+				expect(stale).toMatchObject({ status: "refused", code: "fingerprint_mismatch" });
+				if (stale.status === "refused") expect(stale.observedFingerprint).toBe(currentHash);
+				// Admission gate must be fully released after the refused acquire.
+				expect((session as unknown as { _sessionDataAdmissionLocked: boolean })._sessionDataAdmissionLocked).toBe(
+					false,
+				);
+
+				// Matching preview fingerprint: acquired, and the result carries the locked fingerprint.
+				const lock = await session.acquireSessionDataLock({ expectedFingerprint: currentHash });
+				expect(lock).toMatchObject({ status: "acquired" });
+				if (lock.status === "acquired") {
+					expect(lock.fingerprint).toBe(currentHash);
+					await session.releaseSessionDataLock(lock.lockId);
+				}
+				expect(header.id).toBe(session.sessionManager.getSessionId());
+			} finally {
+				await session.releaseSessionDataAccess();
+				session.dispose();
+				fixture.restorePackageDir();
+			}
+		},
+		30_000,
+	);
 
 	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
 		"reloads a replaced transcript in-place and emits exactly one internal event",

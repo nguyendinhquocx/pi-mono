@@ -3960,7 +3960,7 @@ export class AgentSession {
 	 * claims and upgrades the session's OS access guard. No prompt or append can
 	 * slip through while native lock acquisition is pending.
 	 */
-	async acquireSessionDataLock(): Promise<SessionDataLockResult> {
+	async acquireSessionDataLock(options?: { expectedFingerprint?: string }): Promise<SessionDataLockResult> {
 		if (this._sessionDataAdmissionLocked) {
 			return { status: "refused", code: "session_data_locked", message: "session data lock is already held" };
 		}
@@ -3991,6 +3991,15 @@ export class AgentSession {
 		if (!fingerprint) {
 			unlockGate();
 			return { status: "refused", code: "io_error", message: "cannot fingerprint current transcript" };
+		}
+		if (options?.expectedFingerprint !== undefined && fingerprint !== options.expectedFingerprint) {
+			unlockGate();
+			return {
+				status: "refused",
+				code: "fingerprint_mismatch",
+				message: "transcript changed between preview and lock acquisition",
+				observedFingerprint: fingerprint,
+			};
 		}
 		const lockId = randomUUID();
 		const processStart = registry.processInventory.getProcessStartUtc(process.pid) ?? "UNKNOWN";
@@ -4044,8 +4053,36 @@ export class AgentSession {
 			unlockGate();
 			return { status: "refused", code: "registry_invalid", message: guardRecord.message };
 		}
+		// Re-hash under the held exclusive guard: between the pre-upgrade hash and this
+		// point an external writer could still have touched the file, so the preview
+		// fingerprint contract must be checked against the locked bytes. Range locks deny
+		// plain Node reads, so fingerprint through the guard's helper snapshot.
+		const lockedProbe = await fingerprintThroughGuard(accessGuard, this._snapshotPath("pre-acquire"));
+		if (!lockedProbe.ok) {
+			await accessGuard.downgrade();
+			registry.clearClaim(identity.pathHash, lockId);
+			unlockGate();
+			return { status: "refused", code: lockedProbe.code, message: lockedProbe.message };
+		}
+		const lockedFingerprint = lockedProbe.fingerprint;
+		if (options?.expectedFingerprint !== undefined && lockedFingerprint !== options.expectedFingerprint) {
+			await accessGuard.downgrade();
+			registry.clearClaim(identity.pathHash, lockId);
+			unlockGate();
+			return {
+				status: "refused",
+				code: "fingerprint_mismatch",
+				message: "transcript changed before the exclusive guard was held",
+				observedFingerprint: lockedFingerprint,
+			};
+		}
 		this._heldSessionDataLock = { lockId, pathHash: identity.pathHash, guard: accessGuard };
-		return { status: "acquired", lockId, sessionId: this.sessionManager.getSessionId() };
+		return {
+			status: "acquired",
+			lockId,
+			sessionId: this.sessionManager.getSessionId(),
+			fingerprint: lockedFingerprint,
+		};
 	}
 
 	/** Release the mutation claim and downgrade the OS guard, always clearing the in-process gate. */
