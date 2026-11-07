@@ -2,8 +2,8 @@
 artifact_type: "working-spec"
 spec_id: "SPEC-2026-11-06-li-resume-tool-loadout-and-ep-routing"
 status: "working"
-revision: "r5"
-review_status: "Terra r2 findings incorporated; owner-selected hard EP guard; r5 needs independent review"
+revision: "r6"
+review_status: "Terra/Luna/GLM r5 review xong; owner duyệt full repair + race reservation; r6 ghi repair Li T1 (trim core r5 đã merge 8dcd2020f)"
 title: "Li resume toolset và định tuyến EP đúng profile"
 created: "2026-11-06"
 project: "pi-mono-li + code-python Pi extension source"
@@ -208,6 +208,19 @@ flowchart TD
 - Thiết kế lại EP auth/grant, direct `/implement` UX hoặc writer lock.
 - Các provider/model catalog ngoài khả năng dispatch của Terra/Luna.
 - Thay đổi Li release pipeline ngoài việc xác nhận verify gate.
+
+## r6 repair — findings sau review r5 (owner-approved, chỉ Li T1)
+
+Ba reviewer độc lập (Terra/Luna/GLM) verdict NEEDS REVISION. Python T2/T3 và trim core r5 được xử lý theo workstream riêng; phần này chỉ Li T1 trên HEAD `8dcd2020f`:
+
+1. **C1 (P1) Compaction carry-through:** `appendCompaction` replay `getCurrentSystemMessage` mất `toolSelectionSnapshot` và toàn bộ `toolsRemoved` history, còn `buildContextEntries` drop mọi system entry cũ trong kept range → compact→close→resume có thể `legacy_unknown`, merge lại defaults, resurrect tool đã remove và mất selected-unavailable intent. Fix: checkpoint systemMessage của CompactionEntry phải gắn `toolSelectionSnapshot` mới nhất (nếu có) và `toolsRemoved` gộp từ vùng bị summarize (lọc bỏ tool đang active), giữ đúng precedence r5 (empty snapshot không delta vẫn là default mode).
+2. **C2 (P2) Handler-edited selectedTools là replacement:** `_prepareRun` khi `handlerEditedTools=true` chỉ union qua `_applyToolLoadout` → tool bị handler drop vẫn còn trong `_selectedToolNames` và sống lại qua resume. Fix: replacement intent — reset selection trước apply.
+3. **C3 (P2) Empty-active heuristic:** `setActiveToolsByName` dùng `previousActive.every` — mảng rỗng là vacuous true → selected-unavailable bị union dù caller replacement. Fix: preserve chỉ khi previousActive non-empty và là superset; replacement drop selected-unavailable.
+4. **C4 (P2) Branch navigation modifiers:** nhánh tree navigation gọi `_restoreToolsFromTranscript()` không modifiers → mất `+x/-x`. Fix: truyền `this._defaultToolModifiers` như constructor.
+5. **C5 (P2) Late-registration cutoff parity:** fresh set cutoff tại prompt đầu; resumed phải cùng semantics qua instance mới. Kiểm chứng và sửa lệch nếu có; regression test register muộn ở cả hai đường.
+6. **C6 (L6) Migration notice count-only:** UI notify hiện liệt kê từng tên (30+ trên session thật). Fix: UI text chỉ đếm (`N tools`, hướng xem session entry); custom entry `tool_selection_notice` giữ nguyên tên đầy đủ + `truncated` để audit.
+
+Acceptance r6: mỗi fix có regression test trên cùng test file hiện có; compact→close→resume không legacy_unknown, không resurrect, giữ unavailable intent; handler drop tool không sống lại sau resume; branch switch giữ modifiers; UI notify không liệt kê wall-of-names. Verify: targeted `vitest` default-tools + dynamic-tools + transcript-tool-changes + agent-loop tests, `npx tsc --noEmit` các package đụng, `git diff --check`.
 
 ## User Test
 
