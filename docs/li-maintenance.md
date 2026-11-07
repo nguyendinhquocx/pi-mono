@@ -48,6 +48,7 @@ Sau khi sửa test count, merge summary vào receipt:
 artifact hash. Trước khi hash, build neutralize `TERMINAL_COLOR_QUERY` ngay trong Li bundle và ghi
 `li-osc-patch-receipt.json` với SHA trước/sau; runtime guard không cần vá bundle Li lúc mở session.
 `li --version` đọc receipt này (`li <base-version> (source <short-sha>)`).
+Resume tool-loadout + EP routing integration smoke nằm ở Python repo `tests/super-parent/resume-tool-loadout-smoke.ps1`; nó rebuild Li, nạp extension closure vào profile tạm và chỉ dùng provider/WezTerm giả. Chạy từ Python repo: `powershell -NoProfile -File tests/super-parent/resume-tool-loadout-smoke.ps1 -LiRepo ..\pi-mono-li -ExtensionSource app_presets\pi\extensions`; evidence vào `tests/artifacts/resume-tool-loadout-smoke`.
 Trước lần boot đầu trên profile thật, snapshot `.pi` xong phải rebuild kèm snapshot ID để provenance
 receipt truy được đúng bản backup:
 
