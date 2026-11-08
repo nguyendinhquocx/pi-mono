@@ -94,6 +94,7 @@ describe("getSupportedThinkingLevels", () => {
 		"gpt-6-sol",
 		"gpt-6-luna",
 		"gpt-6.1-sol",
+		"gpt-6.1-terra",
 	] as const)("includes xhigh for openai-codex %s models", (modelId) => {
 		const model = getModel("openai-codex", modelId);
 		expect(model).toBeDefined();
@@ -156,6 +157,24 @@ describe("getSupportedThinkingLevels", () => {
 				},
 			});
 		}
+	});
+
+	it("includes Codex GPT-6.1 Terra with its Codex catalog metadata", () => {
+		const model = getModel("openai-codex", "gpt-6.1-terra");
+		expect(model).toMatchObject({
+			api: "openai-codex-responses",
+			input: ["text", "image"],
+			cost: {
+				input: 1,
+				output: 5,
+				cacheRead: 0.05,
+				cacheWrite: 1.25,
+			},
+			contextWindow: 1_000_000,
+			maxTokens: 128_000,
+		});
+		expect(getSupportedThinkingLevels(model!)).toContain("xhigh");
+		expect(getSupportedThinkingLevels(model!)).toContain("max");
 	});
 
 	it("includes only medium/high/xhigh for OpenAI GPT-5.5 Pro", () => {

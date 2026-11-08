@@ -371,7 +371,9 @@ const ANT_LING_RING_THINKING_LEVEL_MAP = {
 } as const;
 
 const BEDROCK_INFERENCE_PROFILE_ONLY_MODEL_IDS = new Set(["anthropic.claude-opus-5"]);
-const MODELS_DEV_OPENAI_UNSUPPORTED_MODEL_IDS = new Set(["gpt-5.6"]);
+// gpt-5.6: alias listed by models.dev but not accepted by OpenAI APIs.
+// gpt-6.1-terra: intentionally hidden from api.openai; exposed only via openai-codex.
+const MODELS_DEV_OPENAI_UNSUPPORTED_MODEL_IDS = new Set(["gpt-5.6", "gpt-6.1-terra"]);
 const OPENAI_TOOL_SEARCH_MODEL_IDS = new Set([
 	"gpt-5.4",
 	"gpt-5.4-mini",
@@ -461,6 +463,7 @@ const OPENAI_STANDARD_COSTS: Record<string, ModelCost> = {
 	"gpt-6-luna": { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 },
 	"gpt-6-sol": { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
 	"gpt-6.1-sol": { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 },
+	"gpt-6.1-terra": { input: 1, output: 5, cacheRead: 0.05, cacheWrite: 1.25 },
 };
 
 const OPENAI_RESPONSES_NONE_REASONING_MODELS = new Set([
@@ -3156,6 +3159,7 @@ async function generateModels() {
 	const CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 	const CODEX_CONTEXT = 272000;
 	const CODEX_GPT_61_SOL_CONTEXT = 500000;
+	const CODEX_GPT_61_TERRA_CONTEXT = 1000000;
 	const CODEX_GPT_56_CONTEXT = 272000;
 	const CODEX_SPARK_CONTEXT = 128000;
 	const CODEX_MAX_TOKENS = 128000;
@@ -3170,6 +3174,18 @@ async function generateModels() {
 			input: ["text", "image"],
 			cost: withOpenAiLongContextPricing(OPENAI_STANDARD_COSTS["gpt-6.1-sol"]),
 			contextWindow: CODEX_GPT_61_SOL_CONTEXT,
+			maxTokens: CODEX_MAX_TOKENS,
+		},
+		{
+			id: "gpt-6.1-terra",
+			name: "GPT-6.1 Terra",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: CODEX_BASE_URL,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: withOpenAiLongContextPricing(OPENAI_STANDARD_COSTS["gpt-6.1-terra"]),
+			contextWindow: CODEX_GPT_61_TERRA_CONTEXT,
 			maxTokens: CODEX_MAX_TOKENS,
 		},
 		{
