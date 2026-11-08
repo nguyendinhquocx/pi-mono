@@ -627,8 +627,16 @@ describe("tool selection snapshot resume", () => {
 		const { session, faux } = await createPromptableSession(sessionManager, {
 			extensionFactories: [extensionToolExtension],
 		});
+		const notifications: Array<{ message: string; type: string | undefined }> = [];
+		const uiContext = {
+			notify: (message: string, type?: string) => notifications.push({ message, type }),
+		} as unknown as ExtensionUIContext;
+		await session.bindExtensions({ uiContext });
+		expect(notifications).toEqual([]);
 		expect(session.getActiveToolNames().sort()).toEqual(["active_tool", "bash", "edit", "read", "write"]);
 		expect(notices(sessionManager)).toEqual([]);
+		await session.prompt("hi");
+		expect(notifications).toEqual([]);
 		session.dispose();
 		faux.unregister();
 	});

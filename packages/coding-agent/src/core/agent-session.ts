@@ -2043,7 +2043,7 @@ export class AgentSession {
 	 * merges current default candidates the transcript has never mentioned, so a resumed session
 	 * gains newly added default-active tools; an explicit-source selection keeps its recorded names
 	 * exactly. A replayed empty selection stays empty, and a legacy transcript with no tool
-	 * history at all is unknown state restored to current defaults with a notice. Modifiers,
+	 * history at all is unknown state restored to current defaults silently. Modifiers,
 	 * `excludeTools`, the allowlist, exposure, and registry availability apply after the base
 	 * selection.
 	 * @param modifiers `+name`/`-name` entries applied to the resolved loadout.
