@@ -45,3 +45,6 @@ plans/
 .pi/hf-sessions-backup/
 collect.sh
 packages/agent/docs/extensions/pi-server-artifact/index.md
+
+# Agent workbench evidence (keep builds clean for T20 promotion gate)
+.agent-workbench/
