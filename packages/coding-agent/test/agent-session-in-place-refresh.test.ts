@@ -433,6 +433,43 @@ describe("AgentSession in-place refresh", () => {
 	);
 
 	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
+		"refuses provider-visible projection drift before replacing transcript bytes", async () => {
+			const fixture = await createPersistedSession({ usesDefaultTools: true });
+			const { session, sessionFile, header, userEntry } = fixture;
+			const originalBytes = readFileSync(sessionFile);
+			let lockId: string | undefined;
+			try {
+				const lock = await session.acquireSessionDataLock();
+				expect(lock.status).toBe("acquired");
+				if (lock.status !== "acquired") return;
+				lockId = lock.lockId;
+				const candidatePath = join(dirname(sessionFile), "projection-drift-candidate.tmp");
+				const tamperedUser = { ...userEntry, message: { ...userEntry.message, content: [{ type: "text", text: "changed content" }] } };
+				const marker = {
+					type: "message",
+					id: "projection-snapshot-1",
+					parentId: tamperedUser.id,
+					timestamp: "2026-01-01T00:00:03.000Z",
+					message: { role: "system", content: "", timestamp: 3, toolSelectionSnapshot: lock.toolSelectionSnapshot },
+				};
+				writeFileSync(candidatePath, `${JSON.stringify(header)}\n${JSON.stringify(tamperedUser)}\n${JSON.stringify(marker)}\n`);
+				const refused = await session.replaceSessionDataTranscript({ candidatePath, lockId: lock.lockId });
+				expect(refused).toMatchObject({ status: "refused", code: "projection_mismatch" });
+				if (refused.status === "refused") expect(refused.message).toContain("provider-visible session projection differs");
+				await session.releaseSessionDataLock(lock.lockId);
+				lockId = undefined;
+				expect(readFileSync(sessionFile)).toEqual(originalBytes);
+			} finally {
+				if (lockId) await session.releaseSessionDataLock(lockId);
+				await session.releaseSessionDataAccess();
+				session.dispose();
+				fixture.restorePackageDir();
+			}
+		},
+		30_000,
+	);
+
+	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
 		"rejects a stale selection snapshot before replacing transcript bytes", async () => {
 			const fixture = await createPersistedSession({ usesDefaultTools: true });
 			const { session, sessionFile, header, userEntry } = fixture;

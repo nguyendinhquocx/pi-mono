@@ -435,6 +435,17 @@ function sameToolSelectionSnapshot(a: ToolSelectionSnapshot | undefined, b: Tool
 		JSON.stringify([...a.selectedNames].sort()) === JSON.stringify([...b.selectedNames].sort());
 }
 
+function providerVisibleSessionProjection(projection: SessionProjection): string {
+	const messages = projection.messages.flatMap((message) => {
+		if (message.role !== "system" || !message.toolSelectionSnapshot) return [message];
+		const { toolSelectionSnapshot: _snapshot, ...providerVisible } = message;
+		const markerOnly = providerVisible.content === "" && !providerVisible.sections && !providerVisible.toolsAdded &&
+			!providerVisible.toolsRemoved && Object.keys(providerVisible).every((key) => ["role", "content", "timestamp"].includes(key));
+		return markerOnly ? [] : [providerVisible as SystemMessage];
+	});
+	return JSON.stringify({ messages, model: projection.model, thinkingLevel: projection.thinkingLevel });
+}
+
 function describeToolSelectionMismatch(candidate: ToolSelectionSnapshot | undefined, runtime: ToolSelectionSnapshot): string {
 	if (!candidate) return "candidate has no toolSelectionSnapshot";
 	const candidateNames = new Set(candidate.selectedNames);
@@ -4363,6 +4374,9 @@ export class AgentSession {
 				const candidateSelection = getLatestToolSelectionSnapshot(candidateProjection.messages);
 				const runtimeSelection = this._currentToolSelectionSnapshot();
 				const isOriginalRestore = candidateFingerprint === claim.value.original_fingerprint;
+				if (!isOriginalRestore && providerVisibleSessionProjection(candidateProjection) !== providerVisibleSessionProjection(this.sessionManager.buildSessionProjection())) {
+					return refuse("projection_mismatch", "candidate provider-visible session projection differs from the current transcript");
+				}
 				if (!isOriginalRestore && !sameToolSelectionSnapshot(candidateSelection, runtimeSelection)) {
 					return refuse("projection_mismatch", describeToolSelectionMismatch(candidateSelection, runtimeSelection));
 				}
@@ -4518,6 +4532,10 @@ export class AgentSession {
 				stage.leafId,
 				stage.byId,
 			);
+			const isOriginalRestoreProjection = isOriginalRestore;
+			if (!isOriginalRestoreProjection && providerVisibleSessionProjection(candidateProjection) !== providerVisibleSessionProjection(this.sessionManager.buildSessionProjection())) {
+				return refuse("projection_mismatch", "candidate provider-visible session projection differs from the current transcript");
+			}
 			if (candidateProjection.thinkingLevel !== this.thinkingLevel) {
 				return refuse("projection_mismatch", "candidate thinking level does not match the active runtime");
 			}
