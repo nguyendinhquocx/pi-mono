@@ -40,6 +40,7 @@ import type {
 	SimpleStreamOptions,
 	TextContent,
 	ToolResultMessage,
+	ToolSelectionSnapshot,
 	TranscriptContext,
 	Usage,
 } from "@earendil-works/pi-ai";
@@ -421,7 +422,14 @@ export type SessionDataRefusalCode =
 	| "commit_error";
 
 export type SessionDataLeaseInspectionResult =
-	| { status: "ready"; sessionId: string; leaseId: string; protocolVersion: number }
+	| {
+			status: "ready";
+			sessionId: string;
+			leaseId: string;
+			protocolVersion: number;
+			/** Current logical loadout intent; transcript-only selection state, not raw tool schemas. */
+			toolSelectionSnapshot: ToolSelectionSnapshot;
+	  }
 	| { status: "refused"; code: SessionDataRefusalCode; message: string };
 
 export type SessionDataLockOptions = {
@@ -435,6 +443,8 @@ export type SessionDataLockResult =
 			lockId: string;
 			sessionId: string /** Fingerprint captured under the held exclusive guard. */;
 			fingerprint: string;
+			/** Snapshot rechecked under the exclusive session-data admission gate. */
+			toolSelectionSnapshot: ToolSelectionSnapshot;
 	  }
 	| { status: "refused"; code: SessionDataRefusalCode; message: string; observedFingerprint?: string };
 

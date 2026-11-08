@@ -13,7 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import {
@@ -428,6 +428,21 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 
 function decodeSessionBytesStrict(raw: Buffer): string {
 	return new TextDecoder("utf-8", { fatal: true }).decode(raw);
+}
+
+function sameToolSelectionSnapshot(a: ToolSelectionSnapshot | undefined, b: ToolSelectionSnapshot): boolean {
+	return !!a && a.version === b.version && a.source === b.source &&
+		JSON.stringify([...a.selectedNames].sort()) === JSON.stringify([...b.selectedNames].sort());
+}
+
+function describeToolSelectionMismatch(candidate: ToolSelectionSnapshot | undefined, runtime: ToolSelectionSnapshot): string {
+	if (!candidate) return "candidate has no toolSelectionSnapshot";
+	const candidateNames = new Set(candidate.selectedNames);
+	const runtimeNames = new Set(runtime.selectedNames);
+	const missing = runtime.selectedNames.filter((name) => !candidateNames.has(name));
+	const extra = candidate.selectedNames.filter((name) => !runtimeNames.has(name));
+	const show = (names: string[]) => `${names.length}: ${names.slice(0, 20).join(", ") || "(none)"}${names.length > 20 ? ", …" : ""}`;
+	return `tool selection snapshot differs (source candidate=${candidate.source}, runtime=${runtime.source}; missing=${show(missing)}; extra=${show(extra)})`;
 }
 
 /** Map a guard-level failure code to the session-data refusal vocabulary. */
@@ -2006,11 +2021,16 @@ export class AgentSession {
 		this.agent.transformContext = async (messages, signal) => {
 			const transformed = previousTransformContext ? await previousTransformContext(messages, signal) : messages;
 			let mutated = false;
-			const projected = transformed.map((message) => {
-				if (message.role !== "system" || !message.toolSelectionSnapshot) return message;
+			const projected = transformed.flatMap((message) => {
+				if (message.role !== "system" || !message.toolSelectionSnapshot) return [message];
 				mutated = true;
 				const { toolSelectionSnapshot: _snapshot, ...rest } = message;
-				return rest as SystemMessage;
+				const metadataOnly = rest.content === "" && !rest.sections && !rest.toolsAdded && !rest.toolsRemoved
+					&& Object.keys(rest).every((key) => ["role", "content", "timestamp"].includes(key));
+				// A synthetic snapshot-only system entry preserves selection intent on a
+				// compacted transcript that no longer has a system message. It is durable
+				// metadata, not a provider-visible instruction.
+				return metadataOnly ? [] : [rest as SystemMessage];
 			});
 			return mutated ? projected : transformed;
 		};
@@ -2124,12 +2144,16 @@ export class AgentSession {
 		return [...new Set([...settingNames, ...this._registeredDefaultExtensionToolNames])];
 	}
 
-	private _toolSelectionSnapshotEvent(): SystemMessage | undefined {
-		const desired: ToolSelectionSnapshot = {
+	private _currentToolSelectionSnapshot(): ToolSelectionSnapshot {
+		return {
 			version: 1,
 			source: this._toolSelectionSource,
 			selectedNames: [...this._selectedToolNames],
 		};
+	}
+
+	private _toolSelectionSnapshotEvent(): SystemMessage | undefined {
+		const desired = this._currentToolSelectionSnapshot();
 		const recorded = getLatestToolSelectionSnapshot(this.sessionManager.buildSessionContext().messages);
 		if (
 			recorded &&
@@ -3742,18 +3766,35 @@ export class AgentSession {
 		this._sessionAccessUnguarded = true;
 	}
 
+	private _pendingSessionWorkDetails(): Record<string, number | boolean> {
+		return {
+			steering: this._steeringMessages.length,
+			follow_up: this._followUpMessages.length,
+			next_turn: this._pendingNextTurnMessages.length,
+			custom: this._pendingCustomMessages.length,
+			bash: this._pendingBashMessages.length,
+			deferred_settled: this._deferredSettledActions.length,
+			agent_queue: this.agent.hasQueuedMessages(),
+			agent_run: this._isAgentRunActive,
+			compacting: this.isCompacting,
+			emitting_settled: this._isEmittingAgentSettled,
+			retrying: this._retryAbortController !== undefined,
+			failed_response: this._failedResponse !== undefined,
+		};
+	}
+
 	private _hasPendingSessionWork(): boolean {
-		return (
-			this._steeringMessages.length > 0 ||
-			this._followUpMessages.length > 0 ||
-			this._pendingNextTurnMessages.length > 0 ||
-			this._pendingCustomMessages.length > 0 ||
-			this._pendingBashMessages.length > 0 ||
-			this._deferredSettledActions.length > 0 ||
-			this.agent.hasQueuedMessages() ||
-			this._retryAbortController !== undefined ||
-			this._failedResponse !== undefined
+		return Object.values(this._pendingSessionWorkDetails()).some((value) =>
+			typeof value === "number" ? value > 0 : value,
 		);
+	}
+
+	private _pendingSessionWorkMessage(prefix: string): string {
+		const pending = Object.entries(this._pendingSessionWorkDetails()).filter(([, value]) =>
+			typeof value === "number" ? value > 0 : value,
+		);
+		const summary = pending.map(([name, value]) => `${name}=${value}`).join(", ") || "unknown";
+		return `${prefix}: session has pending work (${summary})`;
 	}
 
 	private _throwIfSessionDataLocked(): void {
@@ -3887,7 +3928,7 @@ export class AgentSession {
 			return this._sessionDataRefused("not_idle", "agent run, compaction, retry, or continuation is active");
 		}
 		if (this._hasPendingSessionWork()) {
-			return this._sessionDataRefused("pending_work", "session has pending queue, continuation, or custom work");
+			return this._sessionDataRefused("pending_work", this._pendingSessionWorkMessage("Session trim is blocked"));
 		}
 		if (
 			!this._sessionAccessGuard?.isHeld ||
@@ -3952,6 +3993,7 @@ export class AgentSession {
 			sessionId: this.sessionManager.getSessionId(),
 			leaseId: lease.value.leaseId,
 			protocolVersion: 1,
+			toolSelectionSnapshot: this._currentToolSelectionSnapshot(),
 		};
 	}
 
@@ -4083,6 +4125,7 @@ export class AgentSession {
 				lockId,
 				sessionId: this.sessionManager.getSessionId(),
 				fingerprint: lockedFingerprint,
+				toolSelectionSnapshot: inspected.toolSelectionSnapshot,
 			};
 		} finally {
 			if (!success) {
@@ -4301,8 +4344,31 @@ export class AgentSession {
 					currentFingerprint,
 				);
 			}
-			const candidateFingerprint = fileFingerprint(options.candidatePath);
-			if (!candidateFingerprint) return refuse("io_error", "candidate transcript is unreadable");
+			let candidateFingerprint: string;
+			try {
+				const candidateBytes = readFileSync(options.candidatePath);
+				candidateFingerprint = createHash("sha256").update(candidateBytes).digest("hex");
+				const candidateStage = this.sessionManager.stageReload(decodeSessionBytesStrict(candidateBytes));
+				if (candidateStage.sessionId !== this.sessionManager.getSessionId()) {
+					return refuse("identity_changed", "candidate transcript session id does not match current runtime");
+				}
+				if (resolvePath(candidateStage.header.cwd) !== this.sessionManager.getCwd()) {
+					return refuse("identity_changed", "candidate transcript cwd does not match current runtime");
+				}
+				const candidateProjection = buildSessionProjection(
+					candidateStage.entries.filter((entry): entry is SessionEntry => entry.type !== "session"),
+					candidateStage.leafId,
+					candidateStage.byId,
+				);
+				const candidateSelection = getLatestToolSelectionSnapshot(candidateProjection.messages);
+				const runtimeSelection = this._currentToolSelectionSnapshot();
+				const isOriginalRestore = candidateFingerprint === claim.value.original_fingerprint;
+				if (!isOriginalRestore && !sameToolSelectionSnapshot(candidateSelection, runtimeSelection)) {
+					return refuse("projection_mismatch", describeToolSelectionMismatch(candidateSelection, runtimeSelection));
+				}
+			} catch (error) {
+				return refuse("invalid_transcript", error instanceof Error ? error.message : String(error));
+			}
 			const backupName = options.backupName;
 			if (
 				backupName !== undefined &&
@@ -4370,7 +4436,7 @@ export class AgentSession {
 		if (!sessionFile || !this.sessionManager.isPersisted())
 			return refuse("not_persisted", "current session is not persisted");
 		if (!this._sessionDataAdmissionLocked || this._hasPendingSessionWork() || !this.isIdle) {
-			return refuse("pending_work", "session is no longer idle or has pending work");
+			return refuse("pending_work", this._pendingSessionWorkMessage("Session is no longer idle or has pending work"));
 		}
 		if (canonicalTranscriptIdentity(held.guard.path).identity !== canonicalTranscriptIdentity(sessionFile).identity) {
 			return refuse("write_guard_unavailable", "exclusive transcript guard identity changed");
@@ -4404,6 +4470,7 @@ export class AgentSession {
 			if (!replacedJournal?.ok) {
 				return refuse("registry_invalid", replacedJournal?.message ?? "claim registry is unavailable");
 			}
+			const isOriginalRestore = observedFingerprint === replacedJournal.value.original_fingerprint;
 			let stage: StagedSessionReload;
 			try {
 				const rawBytes = readFileSync(snapshotPath);
@@ -4467,15 +4534,20 @@ export class AgentSession {
 			) {
 				return refuse("projection_mismatch", "candidate model selection does not match the active runtime");
 			}
-			const candidateToolNames = (getCurrentSystemMessage(candidateProjection.messages)?.toolsAdded ?? [])
-				.map((tool) => tool.name)
-				.sort();
-			const runtimeToolNames = this.getActiveToolNames().slice().sort();
-			if (
-				candidateToolNames.length !== runtimeToolNames.length ||
-				candidateToolNames.some((name, index) => name !== runtimeToolNames[index])
-			) {
-				return refuse("projection_mismatch", "candidate tool loadout does not match the active runtime");
+			// Raw `toolsAdded` is only the transcript's declaration history. A legacy/default
+			// session may have silently merged newly registered defaults into the active
+			// runtime, so comparing that raw delta with getActiveToolNames() rejects valid
+			// sessions after replacement. The candidate carries the same transcript-only
+			// selection snapshot captured by inspect/acquire; preserving it leaves the live
+			// Agent toolset untouched and makes the next resume restore the same intent.
+			const candidateToolSelection = getLatestToolSelectionSnapshot(candidateProjection.messages);
+			const currentToolSelection = this._currentToolSelectionSnapshot();
+			// A rollback to the exact original fingerprint may legitimately lack a
+			// newly-added metadata-only selection snapshot. The transcript's original
+			// bytes are the recovery authority; never make restore impossible merely
+			// because the failed candidate introduced that snapshot.
+			if (!isOriginalRestore && !sameToolSelectionSnapshot(candidateToolSelection, currentToolSelection)) {
+				return refuse("projection_mismatch", describeToolSelectionMismatch(candidateToolSelection, currentToolSelection));
 			}
 
 			if (!(await held.guard.verifyHeld()))

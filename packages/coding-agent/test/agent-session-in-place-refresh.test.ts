@@ -29,6 +29,7 @@ async function createPersistedSession(options?: {
 	legacyTranscript?: boolean;
 	foreignLiveClaim?: boolean;
 	skipExtensionBinding?: boolean;
+	usesDefaultTools?: boolean;
 }) {
 	const root = mkdtempSync(join(tmpdir(), "pi-session-refresh-test-"));
 	roots.push(root);
@@ -158,6 +159,7 @@ async function createPersistedSession(options?: {
 		modelRuntime: getModelRuntime(await createInMemoryModelRegistry(authStorage)),
 		resourceLoader: createTestResourceLoader(),
 		initialActiveToolNames: [],
+		usesDefaultTools: options?.usesDefaultTools === true,
 	});
 	if (!options?.skipExtensionBinding) await session.bindExtensions({ mode: "tui" });
 	return {
@@ -312,7 +314,14 @@ describe("AgentSession in-place refresh", () => {
 					timestamp: "2026-01-01T00:00:02.000Z",
 					name: "trimmed candidate",
 				};
-				const candidate = `${JSON.stringify(header)}\n${JSON.stringify(userEntry)}\n${JSON.stringify(candidateEntry)}\n`;
+				const selectionSnapshotEntry = {
+					type: "message",
+					id: "selection-snapshot-1",
+					parentId: candidateEntry.id,
+					timestamp: "2026-01-01T00:00:03.000Z",
+					message: { role: "system", content: "", timestamp: 3, toolSelectionSnapshot: lock.toolSelectionSnapshot },
+				};
+				const candidate = `${JSON.stringify(header)}\n${JSON.stringify(userEntry)}\n${JSON.stringify(candidateEntry)}\n${JSON.stringify(selectionSnapshotEntry)}\n`;
 				const candidatePath = join(dirname(sessionFile), "candidate.tmp");
 				writeFileSync(candidatePath, candidate);
 				const backupDir = join(fixture.root, "synthetic-backups");
@@ -334,7 +343,7 @@ describe("AgentSession in-place refresh", () => {
 					lockId: lock.lockId,
 				});
 
-				expect(result).toMatchObject({ status: "reloaded", sessionId: header.id, fingerprint, entryCount: 2 });
+				expect(result).toMatchObject({ status: "reloaded", sessionId: header.id, fingerprint, entryCount: 3 });
 				expect(session.agent).toBe(agentIdentity);
 				expect(session.sessionManager).toBe(managerIdentity);
 				expect(sessionManager.getSessionName()).toBe("trimmed candidate");
@@ -354,6 +363,163 @@ describe("AgentSession in-place refresh", () => {
 	);
 
 	// Fix 1: keepClaim keeps the mutation journal as recovery evidence.
+	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
+		"reports which pending-work queues block session-data inspection without exposing contents", async () => {
+			const fixture = await createPersistedSession();
+			const internals = fixture.session as unknown as { _pendingCustomMessages: unknown[] };
+			internals._pendingCustomMessages.push({ customType: "private-test", content: "must-not-leak" });
+			try {
+				const result = await fixture.session.inspectSessionDataLease();
+				expect(result).toMatchObject({ status: "refused", code: "pending_work" });
+				if (result.status === "refused") {
+					expect(result.message).toContain("custom=1");
+					expect(result.message).not.toContain("must-not-leak");
+				}
+			} finally {
+				await fixture.session.releaseSessionDataAccess();
+				fixture.session.dispose();
+				fixture.restorePackageDir();
+			}
+		},
+		30_000,
+	);
+
+	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
+		"trims a legacy default-migrated loadout by preserving the active selection snapshot", async () => {
+			const fixture = await createPersistedSession({ usesDefaultTools: true });
+			const { session, sessionFile, header, userEntry } = fixture;
+			const activeToolsBefore = session.getActiveToolNames().slice().sort();
+			try {
+				expect(activeToolsBefore.length).toBeGreaterThan(0);
+				const inspection = await session.inspectSessionDataLease();
+				expect(inspection.status).toBe("ready");
+				if (inspection.status !== "ready") return;
+				expect(inspection.toolSelectionSnapshot.source).toBe("default");
+				expect(inspection.toolSelectionSnapshot.selectedNames.length).toBeGreaterThan(0);
+
+				const lock = await session.acquireSessionDataLock();
+				expect(lock.status).toBe("acquired");
+				if (lock.status !== "acquired") return;
+				expect(lock.toolSelectionSnapshot).toEqual(inspection.toolSelectionSnapshot);
+				const candidatePath = join(dirname(sessionFile), "default-migrated-candidate.tmp");
+				const snapshotEntry = {
+					type: "message",
+					id: "selection-snapshot-1",
+					parentId: userEntry.id,
+					timestamp: "2026-01-01T00:00:03.000Z",
+					message: {
+						role: "system",
+						content: "",
+						timestamp: 3,
+						toolSelectionSnapshot: lock.toolSelectionSnapshot,
+					},
+				};
+				writeFileSync(candidatePath, `${JSON.stringify(header)}\n${JSON.stringify(userEntry)}\n${JSON.stringify(snapshotEntry)}\n`);
+				const replaced = await session.replaceSessionDataTranscript({ candidatePath, lockId: lock.lockId });
+				expect(replaced.status).toBe("replaced");
+				if (replaced.status !== "replaced") return;
+				const reloaded = await session.reloadSessionFromDisk({ expectedFingerprint: replaced.fingerprint, lockId: lock.lockId });
+				expect(reloaded.status).toBe("reloaded");
+				expect(session.getActiveToolNames().slice().sort()).toEqual(activeToolsBefore);
+				const latestSystem = [...session.sessionManager.buildSessionProjection().messages].reverse().find((message) => message.role === "system");
+				expect(latestSystem?.toolSelectionSnapshot).toEqual(lock.toolSelectionSnapshot);
+			} finally {
+				await session.releaseSessionDataAccess();
+				session.dispose();
+				fixture.restorePackageDir();
+			}
+		},
+		30_000,
+	);
+
+	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
+		"rejects a stale selection snapshot before replacing transcript bytes", async () => {
+			const fixture = await createPersistedSession({ usesDefaultTools: true });
+			const { session, sessionFile, header, userEntry } = fixture;
+			const originalBytes = readFileSync(sessionFile);
+			let lockId: string | undefined;
+			try {
+				const lock = await session.acquireSessionDataLock();
+				expect(lock.status).toBe("acquired");
+				if (lock.status !== "acquired") return;
+				lockId = lock.lockId;
+				const candidatePath = join(dirname(sessionFile), "stale-selection-candidate.tmp");
+				const staleSelection = { version: 1 as const, source: "explicit" as const, selectedNames: ["nonexistent"] };
+				const marker = {
+					type: "message",
+					id: "stale-selection-1",
+					parentId: userEntry.id,
+					timestamp: "2026-01-01T00:00:03.000Z",
+					message: { role: "system", content: "", timestamp: 3, toolSelectionSnapshot: staleSelection },
+				};
+				writeFileSync(candidatePath, `${JSON.stringify(header)}\n${JSON.stringify(userEntry)}\n${JSON.stringify(marker)}\n`);
+				const refused = await session.replaceSessionDataTranscript({ candidatePath, lockId: lock.lockId });
+				expect(refused).toMatchObject({ status: "refused", code: "projection_mismatch" });
+				if (refused.status === "refused") expect(refused.message).toContain("selection snapshot differs");
+				const released = await session.releaseSessionDataLock(lock.lockId);
+				expect(released.status).toBe("released");
+				lockId = undefined;
+				expect(readFileSync(sessionFile)).toEqual(originalBytes);
+			} finally {
+				if (lockId) await session.releaseSessionDataLock(lockId);
+				await session.releaseSessionDataAccess();
+				session.dispose();
+				fixture.restorePackageDir();
+			}
+		},
+		30_000,
+	);
+
+	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
+		"reloads original rollback bytes without a selection snapshot after candidate refresh", async () => {
+			const fixture = await createPersistedSession({ usesDefaultTools: true });
+			const { session, sessionFile, header, userEntry } = fixture;
+			const originalBytes = readFileSync(sessionFile);
+			const originalFingerprint = createHash("sha256").update(originalBytes).digest("hex");
+			const activeToolsBefore = session.getActiveToolNames().slice().sort();
+			let lockId: string | undefined;
+			try {
+				const inspection = await session.inspectSessionDataLease();
+				expect(inspection.status).toBe("ready");
+				if (inspection.status !== "ready") return;
+				const lock = await session.acquireSessionDataLock();
+				expect(lock.status).toBe("acquired");
+				if (lock.status !== "acquired") return;
+				lockId = lock.lockId;
+
+				const candidatePath = join(dirname(sessionFile), "candidate-with-selection.tmp");
+				const selectionEntry = {
+					type: "message",
+					id: "selection-1",
+					parentId: userEntry.id,
+					timestamp: "2026-01-01T00:00:03.000Z",
+					message: { role: "system", content: "", timestamp: 3, toolSelectionSnapshot: lock.toolSelectionSnapshot },
+				};
+				const candidate = `${JSON.stringify(header)}\n${JSON.stringify(userEntry)}\n${JSON.stringify(selectionEntry)}\n`;
+				writeFileSync(candidatePath, candidate);
+				const replaced = await session.replaceSessionDataTranscript({ candidatePath, lockId: lock.lockId });
+				expect(replaced.status).toBe("replaced");
+				if (replaced.status !== "replaced") return;
+				const candidateReload = await session.reloadSessionFromDisk({ expectedFingerprint: replaced.fingerprint, lockId: lock.lockId });
+				expect(candidateReload.status).toBe("reloaded");
+
+				const originalPath = join(dirname(sessionFile), "original-rollback.tmp");
+				writeFileSync(originalPath, originalBytes);
+				const rollbackReplace = await session.replaceSessionDataTranscript({ candidatePath: originalPath, lockId: lock.lockId });
+				expect(rollbackReplace).toMatchObject({ status: "replaced", fingerprint: originalFingerprint });
+				const originalReload = await session.reloadSessionFromDisk({ expectedFingerprint: originalFingerprint, lockId: lock.lockId });
+				expect(originalReload).toMatchObject({ status: "reloaded", fingerprint: originalFingerprint });
+				expect(session.getActiveToolNames().slice().sort()).toEqual(activeToolsBefore);
+			} finally {
+				if (lockId) await session.releaseSessionDataLock(lockId);
+				await session.releaseSessionDataAccess();
+				session.dispose();
+				fixture.restorePackageDir();
+			}
+		},
+		30_000,
+	);
+
 	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
 		"keeps the claim journal on keepClaim release and refuses the next acquire as recovery_blocked",
 		async () => {

@@ -1248,17 +1248,20 @@ describe("ExtensionRunner", () => {
 		it("binds session-data inspect, lock, release, and in-place reload actions", async () => {
 			const runtime = createExtensionRuntime();
 			const runner = new ExtensionRunner([], runtime, tempDir, sessionManager, modelRegistry);
+			const toolSelectionSnapshot = { version: 1 as const, source: "default" as const, selectedNames: ["read"] };
 			const inspect = vi.fn(async () => ({
 				status: "ready" as const,
 				sessionId: "s1",
 				leaseId: "l1",
 				protocolVersion: 1,
+				toolSelectionSnapshot,
 			}));
 			const acquire = vi.fn(async () => ({
 				status: "acquired" as const,
 				lockId: "lock-1",
 				sessionId: "s1",
 				fingerprint: "f".repeat(64),
+				toolSelectionSnapshot,
 			}));
 			const release = vi.fn(async (lockId: string, options?: { keepClaim?: boolean }) => ({
 				status: "released" as const,
