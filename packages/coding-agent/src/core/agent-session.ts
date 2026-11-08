@@ -431,28 +431,40 @@ function decodeSessionBytesStrict(raw: Buffer): string {
 }
 
 function sameToolSelectionSnapshot(a: ToolSelectionSnapshot | undefined, b: ToolSelectionSnapshot): boolean {
-	return !!a && a.version === b.version && a.source === b.source &&
-		JSON.stringify([...a.selectedNames].sort()) === JSON.stringify([...b.selectedNames].sort());
+	return (
+		!!a &&
+		a.version === b.version &&
+		a.source === b.source &&
+		JSON.stringify([...a.selectedNames].sort()) === JSON.stringify([...b.selectedNames].sort())
+	);
 }
 
 function providerVisibleSessionProjection(projection: SessionProjection): string {
 	const messages = projection.messages.flatMap((message) => {
 		if (message.role !== "system" || !message.toolSelectionSnapshot) return [message];
 		const { toolSelectionSnapshot: _snapshot, ...providerVisible } = message;
-		const markerOnly = providerVisible.content === "" && !providerVisible.sections && !providerVisible.toolsAdded &&
-			!providerVisible.toolsRemoved && Object.keys(providerVisible).every((key) => ["role", "content", "timestamp"].includes(key));
+		const markerOnly =
+			providerVisible.content === "" &&
+			!providerVisible.sections &&
+			!providerVisible.toolsAdded &&
+			!providerVisible.toolsRemoved &&
+			Object.keys(providerVisible).every((key) => ["role", "content", "timestamp"].includes(key));
 		return markerOnly ? [] : [providerVisible as SystemMessage];
 	});
 	return JSON.stringify({ messages, model: projection.model, thinkingLevel: projection.thinkingLevel });
 }
 
-function describeToolSelectionMismatch(candidate: ToolSelectionSnapshot | undefined, runtime: ToolSelectionSnapshot): string {
+function describeToolSelectionMismatch(
+	candidate: ToolSelectionSnapshot | undefined,
+	runtime: ToolSelectionSnapshot,
+): string {
 	if (!candidate) return "candidate has no toolSelectionSnapshot";
 	const candidateNames = new Set(candidate.selectedNames);
 	const runtimeNames = new Set(runtime.selectedNames);
 	const missing = runtime.selectedNames.filter((name) => !candidateNames.has(name));
 	const extra = candidate.selectedNames.filter((name) => !runtimeNames.has(name));
-	const show = (names: string[]) => `${names.length}: ${names.slice(0, 20).join(", ") || "(none)"}${names.length > 20 ? ", …" : ""}`;
+	const show = (names: string[]) =>
+		`${names.length}: ${names.slice(0, 20).join(", ") || "(none)"}${names.length > 20 ? ", …" : ""}`;
 	return `tool selection snapshot differs (source candidate=${candidate.source}, runtime=${runtime.source}; missing=${show(missing)}; extra=${show(extra)})`;
 }
 
@@ -1740,7 +1752,8 @@ export class AgentSession {
 		// change over a non-empty active set preserves it. With an empty active set
 		// every() is vacuously true, which would union stale intent into a
 		// deliberate replacement (SPEC-2026-11-06 r6 C3).
-		const preservesCurrentLoadout = previousActive.length > 0 && previousActive.every((name) => toolNames.includes(name));
+		const preservesCurrentLoadout =
+			previousActive.length > 0 && previousActive.every((name) => toolNames.includes(name));
 		// Extensions often add one tool via getActiveTools() + [name]. Preserve selected-but-
 		// unavailable restore intent for that additive change; a replacement that drops any
 		// currently active tool replaces the old snapshot intent too.
@@ -2036,8 +2049,12 @@ export class AgentSession {
 				if (message.role !== "system" || !message.toolSelectionSnapshot) return [message];
 				mutated = true;
 				const { toolSelectionSnapshot: _snapshot, ...rest } = message;
-				const metadataOnly = rest.content === "" && !rest.sections && !rest.toolsAdded && !rest.toolsRemoved
-					&& Object.keys(rest).every((key) => ["role", "content", "timestamp"].includes(key));
+				const metadataOnly =
+					rest.content === "" &&
+					!rest.sections &&
+					!rest.toolsAdded &&
+					!rest.toolsRemoved &&
+					Object.keys(rest).every((key) => ["role", "content", "timestamp"].includes(key));
 				// A synthetic snapshot-only system entry preserves selection intent on a
 				// compacted transcript that no longer has a system message. It is durable
 				// metadata, not a provider-visible instruction.
@@ -4374,11 +4391,21 @@ export class AgentSession {
 				const candidateSelection = getLatestToolSelectionSnapshot(candidateProjection.messages);
 				const runtimeSelection = this._currentToolSelectionSnapshot();
 				const isOriginalRestore = candidateFingerprint === claim.value.original_fingerprint;
-				if (!isOriginalRestore && providerVisibleSessionProjection(candidateProjection) !== providerVisibleSessionProjection(this.sessionManager.buildSessionProjection())) {
-					return refuse("projection_mismatch", "candidate provider-visible session projection differs from the current transcript");
+				if (
+					!isOriginalRestore &&
+					providerVisibleSessionProjection(candidateProjection) !==
+						providerVisibleSessionProjection(this.sessionManager.buildSessionProjection())
+				) {
+					return refuse(
+						"projection_mismatch",
+						"candidate provider-visible session projection differs from the current transcript",
+					);
 				}
 				if (!isOriginalRestore && !sameToolSelectionSnapshot(candidateSelection, runtimeSelection)) {
-					return refuse("projection_mismatch", describeToolSelectionMismatch(candidateSelection, runtimeSelection));
+					return refuse(
+						"projection_mismatch",
+						describeToolSelectionMismatch(candidateSelection, runtimeSelection),
+					);
 				}
 			} catch (error) {
 				return refuse("invalid_transcript", error instanceof Error ? error.message : String(error));
@@ -4450,7 +4477,10 @@ export class AgentSession {
 		if (!sessionFile || !this.sessionManager.isPersisted())
 			return refuse("not_persisted", "current session is not persisted");
 		if (!this._sessionDataAdmissionLocked || this._hasPendingSessionWork() || !this.isIdle) {
-			return refuse("pending_work", this._pendingSessionWorkMessage("Session is no longer idle or has pending work"));
+			return refuse(
+				"pending_work",
+				this._pendingSessionWorkMessage("Session is no longer idle or has pending work"),
+			);
 		}
 		if (canonicalTranscriptIdentity(held.guard.path).identity !== canonicalTranscriptIdentity(sessionFile).identity) {
 			return refuse("write_guard_unavailable", "exclusive transcript guard identity changed");
@@ -4533,8 +4563,15 @@ export class AgentSession {
 				stage.byId,
 			);
 			const isOriginalRestoreProjection = isOriginalRestore;
-			if (!isOriginalRestoreProjection && providerVisibleSessionProjection(candidateProjection) !== providerVisibleSessionProjection(this.sessionManager.buildSessionProjection())) {
-				return refuse("projection_mismatch", "candidate provider-visible session projection differs from the current transcript");
+			if (
+				!isOriginalRestoreProjection &&
+				providerVisibleSessionProjection(candidateProjection) !==
+					providerVisibleSessionProjection(this.sessionManager.buildSessionProjection())
+			) {
+				return refuse(
+					"projection_mismatch",
+					"candidate provider-visible session projection differs from the current transcript",
+				);
 			}
 			if (candidateProjection.thinkingLevel !== this.thinkingLevel) {
 				return refuse("projection_mismatch", "candidate thinking level does not match the active runtime");
@@ -4565,7 +4602,10 @@ export class AgentSession {
 			// bytes are the recovery authority; never make restore impossible merely
 			// because the failed candidate introduced that snapshot.
 			if (!isOriginalRestore && !sameToolSelectionSnapshot(candidateToolSelection, currentToolSelection)) {
-				return refuse("projection_mismatch", describeToolSelectionMismatch(candidateToolSelection, currentToolSelection));
+				return refuse(
+					"projection_mismatch",
+					describeToolSelectionMismatch(candidateToolSelection, currentToolSelection),
+				);
 			}
 
 			if (!(await held.guard.verifyHeld()))

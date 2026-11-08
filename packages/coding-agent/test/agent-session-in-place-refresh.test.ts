@@ -319,7 +319,12 @@ describe("AgentSession in-place refresh", () => {
 					id: "selection-snapshot-1",
 					parentId: candidateEntry.id,
 					timestamp: "2026-01-01T00:00:03.000Z",
-					message: { role: "system", content: "", timestamp: 3, toolSelectionSnapshot: lock.toolSelectionSnapshot },
+					message: {
+						role: "system",
+						content: "",
+						timestamp: 3,
+						toolSelectionSnapshot: lock.toolSelectionSnapshot,
+					},
 				};
 				const candidate = `${JSON.stringify(header)}\n${JSON.stringify(userEntry)}\n${JSON.stringify(candidateEntry)}\n${JSON.stringify(selectionSnapshotEntry)}\n`;
 				const candidatePath = join(dirname(sessionFile), "candidate.tmp");
@@ -364,7 +369,8 @@ describe("AgentSession in-place refresh", () => {
 
 	// Fix 1: keepClaim keeps the mutation journal as recovery evidence.
 	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
-		"reports which pending-work queues block session-data inspection without exposing contents", async () => {
+		"reports which pending-work queues block session-data inspection without exposing contents",
+		async () => {
 			const fixture = await createPersistedSession();
 			const internals = fixture.session as unknown as { _pendingCustomMessages: unknown[] };
 			internals._pendingCustomMessages.push({ customType: "private-test", content: "must-not-leak" });
@@ -385,7 +391,8 @@ describe("AgentSession in-place refresh", () => {
 	);
 
 	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
-		"trims a legacy default-migrated loadout by preserving the active selection snapshot", async () => {
+		"trims a legacy default-migrated loadout by preserving the active selection snapshot",
+		async () => {
 			const fixture = await createPersistedSession({ usesDefaultTools: true });
 			const { session, sessionFile, header, userEntry } = fixture;
 			const activeToolsBefore = session.getActiveToolNames().slice().sort();
@@ -414,14 +421,22 @@ describe("AgentSession in-place refresh", () => {
 						toolSelectionSnapshot: lock.toolSelectionSnapshot,
 					},
 				};
-				writeFileSync(candidatePath, `${JSON.stringify(header)}\n${JSON.stringify(userEntry)}\n${JSON.stringify(snapshotEntry)}\n`);
+				writeFileSync(
+					candidatePath,
+					`${JSON.stringify(header)}\n${JSON.stringify(userEntry)}\n${JSON.stringify(snapshotEntry)}\n`,
+				);
 				const replaced = await session.replaceSessionDataTranscript({ candidatePath, lockId: lock.lockId });
 				expect(replaced.status).toBe("replaced");
 				if (replaced.status !== "replaced") return;
-				const reloaded = await session.reloadSessionFromDisk({ expectedFingerprint: replaced.fingerprint, lockId: lock.lockId });
+				const reloaded = await session.reloadSessionFromDisk({
+					expectedFingerprint: replaced.fingerprint,
+					lockId: lock.lockId,
+				});
 				expect(reloaded.status).toBe("reloaded");
 				expect(session.getActiveToolNames().slice().sort()).toEqual(activeToolsBefore);
-				const latestSystem = [...session.sessionManager.buildSessionProjection().messages].reverse().find((message) => message.role === "system");
+				const latestSystem = [...session.sessionManager.buildSessionProjection().messages]
+					.reverse()
+					.find((message) => message.role === "system");
 				expect(latestSystem?.toolSelectionSnapshot).toEqual(lock.toolSelectionSnapshot);
 			} finally {
 				await session.releaseSessionDataAccess();
@@ -433,7 +448,8 @@ describe("AgentSession in-place refresh", () => {
 	);
 
 	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
-		"refuses provider-visible projection drift before replacing transcript bytes", async () => {
+		"refuses provider-visible projection drift before replacing transcript bytes",
+		async () => {
 			const fixture = await createPersistedSession({ usesDefaultTools: true });
 			const { session, sessionFile, header, userEntry } = fixture;
 			const originalBytes = readFileSync(sessionFile);
@@ -444,18 +460,30 @@ describe("AgentSession in-place refresh", () => {
 				if (lock.status !== "acquired") return;
 				lockId = lock.lockId;
 				const candidatePath = join(dirname(sessionFile), "projection-drift-candidate.tmp");
-				const tamperedUser = { ...userEntry, message: { ...userEntry.message, content: [{ type: "text", text: "changed content" }] } };
+				const tamperedUser = {
+					...userEntry,
+					message: { ...userEntry.message, content: [{ type: "text", text: "changed content" }] },
+				};
 				const marker = {
 					type: "message",
 					id: "projection-snapshot-1",
 					parentId: tamperedUser.id,
 					timestamp: "2026-01-01T00:00:03.000Z",
-					message: { role: "system", content: "", timestamp: 3, toolSelectionSnapshot: lock.toolSelectionSnapshot },
+					message: {
+						role: "system",
+						content: "",
+						timestamp: 3,
+						toolSelectionSnapshot: lock.toolSelectionSnapshot,
+					},
 				};
-				writeFileSync(candidatePath, `${JSON.stringify(header)}\n${JSON.stringify(tamperedUser)}\n${JSON.stringify(marker)}\n`);
+				writeFileSync(
+					candidatePath,
+					`${JSON.stringify(header)}\n${JSON.stringify(tamperedUser)}\n${JSON.stringify(marker)}\n`,
+				);
 				const refused = await session.replaceSessionDataTranscript({ candidatePath, lockId: lock.lockId });
 				expect(refused).toMatchObject({ status: "refused", code: "projection_mismatch" });
-				if (refused.status === "refused") expect(refused.message).toContain("provider-visible session projection differs");
+				if (refused.status === "refused")
+					expect(refused.message).toContain("provider-visible session projection differs");
 				await session.releaseSessionDataLock(lock.lockId);
 				lockId = undefined;
 				expect(readFileSync(sessionFile)).toEqual(originalBytes);
@@ -470,7 +498,8 @@ describe("AgentSession in-place refresh", () => {
 	);
 
 	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
-		"rejects a stale selection snapshot before replacing transcript bytes", async () => {
+		"rejects a stale selection snapshot before replacing transcript bytes",
+		async () => {
 			const fixture = await createPersistedSession({ usesDefaultTools: true });
 			const { session, sessionFile, header, userEntry } = fixture;
 			const originalBytes = readFileSync(sessionFile);
@@ -489,7 +518,10 @@ describe("AgentSession in-place refresh", () => {
 					timestamp: "2026-01-01T00:00:03.000Z",
 					message: { role: "system", content: "", timestamp: 3, toolSelectionSnapshot: staleSelection },
 				};
-				writeFileSync(candidatePath, `${JSON.stringify(header)}\n${JSON.stringify(userEntry)}\n${JSON.stringify(marker)}\n`);
+				writeFileSync(
+					candidatePath,
+					`${JSON.stringify(header)}\n${JSON.stringify(userEntry)}\n${JSON.stringify(marker)}\n`,
+				);
 				const refused = await session.replaceSessionDataTranscript({ candidatePath, lockId: lock.lockId });
 				expect(refused).toMatchObject({ status: "refused", code: "projection_mismatch" });
 				if (refused.status === "refused") expect(refused.message).toContain("selection snapshot differs");
@@ -508,7 +540,8 @@ describe("AgentSession in-place refresh", () => {
 	);
 
 	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
-		"reloads original rollback bytes without a selection snapshot after candidate refresh", async () => {
+		"reloads original rollback bytes without a selection snapshot after candidate refresh",
+		async () => {
 			const fixture = await createPersistedSession({ usesDefaultTools: true });
 			const { session, sessionFile, header, userEntry } = fixture;
 			const originalBytes = readFileSync(sessionFile);
@@ -530,21 +563,35 @@ describe("AgentSession in-place refresh", () => {
 					id: "selection-1",
 					parentId: userEntry.id,
 					timestamp: "2026-01-01T00:00:03.000Z",
-					message: { role: "system", content: "", timestamp: 3, toolSelectionSnapshot: lock.toolSelectionSnapshot },
+					message: {
+						role: "system",
+						content: "",
+						timestamp: 3,
+						toolSelectionSnapshot: lock.toolSelectionSnapshot,
+					},
 				};
 				const candidate = `${JSON.stringify(header)}\n${JSON.stringify(userEntry)}\n${JSON.stringify(selectionEntry)}\n`;
 				writeFileSync(candidatePath, candidate);
 				const replaced = await session.replaceSessionDataTranscript({ candidatePath, lockId: lock.lockId });
 				expect(replaced.status).toBe("replaced");
 				if (replaced.status !== "replaced") return;
-				const candidateReload = await session.reloadSessionFromDisk({ expectedFingerprint: replaced.fingerprint, lockId: lock.lockId });
+				const candidateReload = await session.reloadSessionFromDisk({
+					expectedFingerprint: replaced.fingerprint,
+					lockId: lock.lockId,
+				});
 				expect(candidateReload.status).toBe("reloaded");
 
 				const originalPath = join(dirname(sessionFile), "original-rollback.tmp");
 				writeFileSync(originalPath, originalBytes);
-				const rollbackReplace = await session.replaceSessionDataTranscript({ candidatePath: originalPath, lockId: lock.lockId });
+				const rollbackReplace = await session.replaceSessionDataTranscript({
+					candidatePath: originalPath,
+					lockId: lock.lockId,
+				});
 				expect(rollbackReplace).toMatchObject({ status: "replaced", fingerprint: originalFingerprint });
-				const originalReload = await session.reloadSessionFromDisk({ expectedFingerprint: originalFingerprint, lockId: lock.lockId });
+				const originalReload = await session.reloadSessionFromDisk({
+					expectedFingerprint: originalFingerprint,
+					lockId: lock.lockId,
+				});
 				expect(originalReload).toMatchObject({ status: "reloaded", fingerprint: originalFingerprint });
 				expect(session.getActiveToolNames().slice().sort()).toEqual(activeToolsBefore);
 			} finally {

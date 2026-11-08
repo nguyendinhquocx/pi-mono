@@ -1979,7 +1979,7 @@ export class SessionManager {
 					...systemMessage,
 					...(snapshot ? { toolSelectionSnapshot: snapshot } : {}),
 					...(checkpointRemoved.length > 0 ? { toolsRemoved: checkpointRemoved } : {}),
-			  }
+				}
 			: snapshot || checkpointRemoved.length > 0
 				? {
 						role: "system",
@@ -1987,7 +1987,7 @@ export class SessionManager {
 						...(snapshot ? { toolSelectionSnapshot: snapshot } : {}),
 						...(checkpointRemoved.length > 0 ? { toolsRemoved: checkpointRemoved } : {}),
 						timestamp: new Date(timestamp).getTime(),
-				  }
+					}
 				: undefined;
 		const id = generateId(this.byId);
 		const entry: CompactionEntry<T> = {
