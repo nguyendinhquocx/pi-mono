@@ -159,7 +159,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		void this.refreshModels();
 	}
 
-	private loadModelsFromSnapshot(): void {
+	private loadModelsFromSnapshot(preserveSelection?: ModelItem): void {
 		const models = this.modelRuntime.getAvailableSnapshot().map((model: Model<any>) => ({
 			provider: model.provider,
 			id: model.id,
@@ -177,6 +177,15 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		}));
 		this.activeModels = this.scope === "scoped" ? this.scopedModelItems : this.allModels;
 		this.filteredModels = this.activeModels;
+		if (preserveSelection) {
+			const preservedIndex = this.filteredModels.findIndex(
+				(item) => item.provider === preserveSelection.provider && item.id === preserveSelection.id,
+			);
+			if (preservedIndex >= 0) {
+				this.selectedIndex = preservedIndex;
+				return;
+			}
+		}
 		const currentIndex = this.filteredModels.findIndex((item) => modelsAreEqual(this.currentModel, item.model));
 		this.selectedIndex =
 			currentIndex >= 0 ? currentIndex : Math.min(this.selectedIndex, Math.max(0, this.filteredModels.length - 1));
@@ -206,7 +215,11 @@ export class ModelSelectorComponent extends Container implements Focusable {
 					this.refreshStatusSuccess = true;
 				}
 			}
-			this.loadModelsFromSnapshot();
+			// The user may already be navigating while the background refresh was
+			// in flight; keep their highlighted row instead of snapping back to
+			// the current model.
+			const previouslySelected = this.filteredModels[this.selectedIndex];
+			this.loadModelsFromSnapshot(previouslySelected);
 			this.filterModels(this.searchInput.getValue());
 			this.tui.requestRender();
 		} catch (error) {
