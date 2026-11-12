@@ -45,7 +45,7 @@ import { AuthStorage, ReadOnlyAuthStorage } from "./core/auth-storage.ts";
 import { exportFromFile } from "./core/export-html/index.ts";
 import type { InlineExtension } from "./core/extensions/types.ts";
 import { applyHttpProxySettings, configureHttpDispatcher } from "./core/http-dispatcher.ts";
-import { resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.ts";
+import { resolveCliModel, resolveModelScopeWithDiagnostics, type ScopedModel } from "./core/model-resolver.ts";
 import { ModelRuntime } from "./core/model-runtime.ts";
 import { restoreStdout, takeOverStdout } from "./core/output-guard.ts";
 import { type AppMode, resolveProjectTrusted } from "./core/project-trust.ts";
@@ -836,11 +836,22 @@ export async function main(args: string[], options?: MainOptions) {
 			})),
 		];
 
+		const isExplicitModels = parsed.models !== undefined;
 		const modelPatterns = parsed.models ?? settingsManager.getEnabledModels();
-		const scopedModels =
-			modelPatterns && modelPatterns.length > 0
-				? await resolveModelScope(modelPatterns, modelRuntime, { signal: AbortSignal.timeout(15_000) })
-				: [];
+		let scopedModels: ScopedModel[] = [];
+		if (modelPatterns && modelPatterns.length > 0) {
+			const scopeResult = await resolveModelScopeWithDiagnostics(modelPatterns, modelRuntime, {
+				signal: AbortSignal.timeout(15_000),
+			});
+			scopedModels = scopeResult.scopedModels;
+			for (const diagnostic of scopeResult.diagnostics) {
+				// Only warn about missing models if explicitly requested via CLI (--models).
+				// Models in enabledModels settings are silently skipped if currently unavailable (e.g. free tier).
+				if (isExplicitModels || diagnostic.code !== "no-match") {
+					console.warn(chalk.yellow(`Warning: ${diagnostic.message}`));
+				}
+			}
+		}
 		const {
 			options: sessionOptions,
 			cliThinkingFromModel,
