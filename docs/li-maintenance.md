@@ -62,6 +62,13 @@ Thay ID bằng tên snapshot thực tế. Source bẩn (uncommitted) → build v
 vars trước khi chạy lệnh ngoài; gọi `li` từ shell sẽ thiết lập lại chúng qua wrapper. Runtime guard
 không nên vá Li lúc `session_start`; nếu nó vẫn báo `neutralized TERMINAL_COLOR_QUERY`, build
 receipt/patch receipt không khớp bundle đang chạy. Pi global dist vẫn được runtime guard xử lý riêng.
+Build xong PHẢI re-approve T20 promotion trước khi session mới dùng: receipt mới đổi `artifactHash`,
+trong khi registry (`~/.pi/agent/session-open-leases/registry.json`) chỉ approve build cũ qua
+`approved_builds` + `t20_receipt_sha256` — bỏ bước này mọi `/trim` refuse `promotion_required`
+(vụ 12/11: rebuild `739770c39` dirty + không re-promote, gate đóng 2 ngày). Quy trình: commit/tạo
+tree sạch → `build-li.mjs` → backup `registry.json` + `t20-canary-receipt.json` thành `*.bak` →
+ghi receipt mới (decision approved, artifactHash mới, supersedes build cũ) → cập nhật
+`t20_receipt_sha256` + `approved_builds` → verify `li --version` khớp receipt.
 
 ## Cài Li side-by-side trên ProDesk Linux
 
