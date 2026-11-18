@@ -205,9 +205,27 @@ Mỗi lần xét update là thủ công, có review. Không auto-merge vào `li/
 6. **Chạy gates trên candidate:** `npm ci --ignore-scripts`, `node scripts/build-li.mjs --offline`,
    `npm run check`, `bash ./test.sh`, chạy lại test files Li (`test/li-*.test.ts`), smoke
    `li --version` + mở TUI.
-7. **Promote:** `li/stable` fast-forward tới candidate sau khi mọi gate PASS, rồi rebuild ở
-   worktree chính. Ghi receipt: default branch, base SHA, target SHA, changed paths, expected
-   conflicts/resolutions, verify results, rollback SHA.
+   - Trước `npm run check`: nếu deps đổi → regen install-lock (`node scripts/generate-coding-agent-install-lock.mjs`)
+     nếu không `check:install-lock` FAIL chắc chắn (upstream đổi deps, vd pi-schema mới).
+   - `npm run check`/`tsc`: drift `packages/ai/test` catalog-upstream (model id trong test ≠ catalog) là residual
+     đã biết — chỉ FAIL khi lỗi rơi ngoài nhóm đã biết.
+   - Smoke TUI PHẢI chạy profile cô lập: `PI_CODING_AGENT_DIR=<temp-profile>` rồi mở TUI candidate — CẤM mở TUI
+     candidate trên profile thật trước promote (upstream có thể mang migration session/config mutate
+     `~/.pi/agent` dùng chung Pi+Li; snapshot profile chỉ là recovery, không phải phòng ngừa).
+7. **Promote (thứ tự cứng, không đảo):** `li/stable` fast-forward tới candidate sau khi mọi gate PASS, rồi:
+   1. Snapshot `~/.pi` (robocopy ACL user-only) + verify độc lập counts/SHA TRƯỚC bước sau.
+   2. `LI_PROFILE_SNAPSHOT_ID=<snapshot-id>` rồi rebuild worktree chính — build-li đọc env LÚC BUILD;
+      build trước snapshot → receipt `profileSnapshotId: null`, phải build lại.
+   3. **T20 re-approve checklist (vụ 12/11: bỏ bước này gate đóng 2 ngày):** backup `registry.json` +
+      `t20-canary-receipt.json` thành `*.bak` → đọc `artifactHash` từ `li-build-receipt.json` mới → cập nhật
+      `t20-canary-receipt.json` (`artifact_sha256` mới) → `t20_receipt_sha256 = SHA256(toàn bộ nội dung canary file)`
+      → cập nhật `registry.json` (`approved_builds[].artifact_sha256` + `t20_receipt_sha256`).
+   4. Verify khớp chéo: `li --version` == receipt `artifactHash` == canary `artifact_sha256` == registry;
+      `t20_receipt_sha256` == SHA256(canary). Lệch bất kỳ cặp nào → `/trim` refuse `promotion_required`.
+   5. Diff catalog candidate vs backup — Li entries (Terra, các hide riêng) không mất.
+   Ghi receipt vào `<repo>/docs/maintenance-receipts/<date>-<target-short-sha>.md` (template skill
+   `upstream-maintenance`; sinh draft sẵn từ `scripts/upstream-merge.mjs`): default branch, base SHA, target SHA,
+   changed paths, expected conflicts/resolutions, verify results, backup IDs, rollback SHA, artifact hash.
 
 ### Conflict surface đã biết (ưu tiên soi khi merge upstream)
 
