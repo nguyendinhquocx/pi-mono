@@ -8,7 +8,7 @@
   - Li chạy base **v1.3.0** (receipt: source `46ddc71954`, build 14-11, artifact sha256 `f8d22460…`, clean).
   - Upstream thật `earendil-works/pi` main = `05fd3fbda0bb` (tag v1.5.2, 10-11). Li behind **1064 commits**; merge-base `1402973a9dbe` (thời v1.3.0).
   - Fork mirror `origin/main` = `1757f0cc6cff` — stale hơn upstream 244 commit vì sync workflow FAIL từ 11-14 (GITHUB_TOKEN thiếu `workflows` permission khi merge commit chạm workflow files — REGISTRY Known issues #1).
-  - Worktree dirty: 9 file WIP feature `session-owner-protocol` (6 modified + 3 untracked). Writer session đã xong việc, owner xác nhận — CHƯA commit.
+  - WIP `session-owner-protocol` đã commit `ee569f77d2` (9 files, 1153 insertions), docs spec commit `32f4068098`; T9 pipeline script commit `89f82904e4`. Candidate current head sau merge + T5 fix: `ecac186570`.
   - Custom delta Li: **147 files**; trong đó **70 files** nằm trong vùng upstream v1.3.0→v1.5.2 cũng sửa (conflict surface). Cơ chế guard Li đo được bị upstream đụng đúng vùng: `rejectLiSelfUpdate()` (package-manager-cli.ts, upstream +149 dòng flow self-update mới), `applyLiRuntimeEnv()` (main.ts, +120/−37), strip `LI_*` env (shell.ts, +59/−13), entry-type allowlist (session-manager.ts — upstream đổi write path #11253 + fix #11460, CHƯA thấy thêm entry type mới), TUI components (blank style/selection/locale VI đè lên fix upstream: Kitty image, highlight reuse #10971, CJK markdown, PageUp/PageDown #7629).
   - Upstream v1.5.0 có **breaking change**: tool argument validation chuyển sang `@earendil-works/pi-schema` — TypeBox ngoài JSON Schema (`Type.Refine()`, `Type.BigInt()`, `Type.Undefined()`, codecs) không còn áp dụng cho tool args. Extension closure nằm NGOÀI repo Li: `D:\pcloud\workspace\code\python\app_presets\pi\extensions\` (subagent-tab, handoff, peer-sessions, pi-osc-patch-guard, shared/resolve-runtime-cli.ts…).
   - T20 promotion: `C:\Users\quocn\.pi\agent\session-open-leases\registry.json` approved_builds pin artifact sha256 cũ; sau rebuild bắt buộc re-approve nếu không mọi `/trim` refuse `promotion_required` (vụ 12/11).
@@ -67,7 +67,7 @@
 - **Matrix resolve conflict (quyết định sẵn, không tranh từng hunk):**
   1. Nhóm guard Li (`main.ts` bootstrap, `package-manager-cli.ts` update flow, `shell.ts` env strip, `session-manager.ts` allowlist, `config.ts`, `extensions/loader.ts` + `virtual-modules.ts` bundled module map): **giữ guard Li + lấy fix/feature upstream quanh guard**. Ví dụ: thêm flow `PI_SELF_UPDATE_COMMAND` mới của upstream BÊN DƯỚI `rejectLiSelfUpdate()`. Phân nhánh `migrations.ts`: nếu upstream đã tự fix Windows basename cùng bug → **DROP Li patch**, không giữ double-fix.
   2. Nhóm TUI components (markdown, tool-execution, user-message, session-selector, tree-selector, editor…): **giữ Li style + lấy fix logic upstream**; khi fix logic nằm cùng hunk với style → tách hunk, verify bằng Li tests + test.sh nhóm TUI.
-  3. Nhóm infra/docs/workflows (`.github/`, README, package-lock): **theo upstream**, trừ workflow `sync-upstream.yml` — giữ nguyên bản hiện có của Li trong candidate; T2 là lane bảo trì CI độc lập (repo Python toolkit), KHÔNG là điều kiện biên của T4 — không đợi T2 xanh mới merge, không pull fix T2 vào candidate.
+  3. Nhóm infra/docs/workflows (`.github/`, README, package-lock): **theo upstream**, trừ workflow `sync-upstream.yml` — giữ nguyên bản hiện có của Li trong candidate. T2 là lane CI độc lập (repo Python toolkit), không phải điều kiện biên của T4.
   4. Nhóm tests: **theo upstream + giữ Li assertions platform-aware**; file `test/li-*.test.ts` không bao giờ bị upstream đụng (an toàn tuyệt đối).
   5. `package.json` / lockfile: hòa — giữ `piConfig`/`bin` Li, nhận deps mới upstream; root `workspaces` giữ glob `packages/*` + nhận entries mới upstream thêm (đối chiếu diff — vd upstream thêm `packages/chord/test/examples/...`); `install-lock/package-lock.json` nhận entry pi-schema.
   6. Nhóm provider/catalog/model list (`packages/ai/catalog/`, `generate-models.ts`, `models.json` schema, catalog output): **giữ hide/add riêng của Li** (commit `4ac7c9f58` — Terra qua openai-codex, hide entry api.openai theo owner request), **nhận structure mới models.dev v2**; verify bằng diff catalog candidate vs backup — Li entries không mất.
@@ -133,30 +133,29 @@ flowchart TD
 
 ### Task 2: Fix mirror sync (chạy nền, song song T3)
 - Acceptance:
-  - Template sync trong `toolkit_modules/tools/github_fork_sync.py` thêm `workflows: write` vào `permissions:` và chốt strategy merge-thẳng-`main` (Known issues #6 khuyến nghị); chạy `--github-fork-sync-install --update` cho pi-mono.
-  - Lưu ý rõ: output T2 không ảnh hưởng T4 merge source (T4 fetch thẳng upstream thật); mirror chỉ phục vụ data tương lai + CI.
-  - Trigger 1 run tay; run Actions xanh; `origin/main` tiến về upstream (giảm số behind so với upstream thật).
-- Reproduce: `py -3.13 D:\pcloud\workspace\code\python\quoc.py --github-fork-sync-status --user nguyendinhquocx --json` → pi-mono last run success.
+  - **Implementation đã đổi theo evidence thật**: KHÔNG thêm `workflows: write` (GitHub reject YAML bằng HTTP 422 `Unexpected value workflows` — GITHUB_TOKEN không cấp scope này). Giữ strategy preserve: merge upstream, rồi restore workflow files fork trước merge; template strategy merge-thẳng-main. Thêm flag `--repo <name>` để update đúng một fork, không deploy fleet ngoài scope.
+  - Chạy `--github-fork-sync-install --update --repo pi-mono`, trigger Actions đúng pi-mono; run `44234025683` PASS trong 24s, `origin/main` behind 263→0. Không đụng iptv/fleet.
+  - T2 không ảnh hưởng T4 merge source (fetch thẳng upstream thật); chỉ sửa mirror cho lần sau.
+- Reproduce: `py -3.13 D:\pcloud\workspace\code\python\quoc.py --github-fork-sync-status --user nguyendinhquocx --json` → pi-mono run `44234025683` success; behind 0.
 - Files: `D:\pcloud\workspace\code\python\toolkit_modules\tools\github_fork_sync.py` (pattern: hàm render template current trong file).
 
 ### Task 3: Audit TypeBox/pi-schema trên extension closure (scout, read-only)
 - Acceptance:
-  - Bảng kết quả: mọi tool registration trong `app_presets\pi\extensions\` (subagent-tab, handoff, peer-sessions, pi-osc-patch-guard, shared, còn lại) — cột file:line, params schema, có dùng `Type.Refine/BigInt/Undefined/codecs/Format.Set` không, verdict SAFE/BREAK.
-  - BREAK nào có đề xuất vá cụ thể (đổi JSON Schema thuần / compat flag).
+  - Bảng kết quả file:line / schema / construct / verdict SAFE|BREAK / đề xuất. Kết quả T3: 0 BREAK, 0 extension patch cần deploy.
 - Reproduce: `rg -n "Type\.(Refine|BigInt|Undefined|Object\(|Array\(|String\(|Number\(" D:\pcloud\workspace\code\python\app_presets\pi\extensions` + đọc context.
-- Thêm 4 mục audit:
-  - MCP compat surface: tool args của MCP tools có đi qua cùng đường validate pi-schema trong v1.5.2 không — check `packages/mcp/src/input-schema.ts` (`normalizeMcpInputSchema`) và `packages/coding-agent/src/extensions/mcp/` trong candidate: validation path đổi từ raw/ajv sang pi-schema compiled không. Không audit nội dung từng MCP server, chỉ audit đường validate.
-  - `~/.pi/agent/mcp.json` schema: list key nào có nguy cơ upstream đổi nghĩa trong v1.5.x.
-  - TypeBox→pi-schema bridge runtime: TypeBox `Type.Object({...})` output plain JSON Schema — verify `compile()` của pi-schema vẫn accept schema đó (1 unit test nhỏ với schema TypeBox qua pi-schema compile, chạy trong candidate objects store) — type-level compatible chưa đủ, runtime validation phải consistent.
-  - `Static` re-export: `packages/agent/src/types.ts` upstream import `Static` từ `@earendil-works/pi-schema` (trước từ typebox) — xác nhận re-export vẫn tương thích với extension closure import qua `@earendil-works/pi-agent-core`.
+- Thêm 4 mục audit — kết quả read-only T3:
+  - Extension tools chỉ dùng `Type.Any/Optional/Array` + JSON Schema cơ bản; không có `Refine/BigInt/Undefined/Transform/codec/Format.Set` → SAFE.
+  - Render mutation #9549: 6 custom TUI components quét, 0 mutate `render()` output in-place → SAFE.
+  - MCP tools qua chung `normalizeMcpInputSchema` (`packages/coding-agent/src/extensions/mcp/tools.ts:269`); `mcp.json` chỉ có browse stdio config, không có schema key rủi ro → SAFE.
+  - TypeBox→pi-schema bridge: loader virtual modules map `typebox`, `typebox/compile`, `typebox/value`; `Static` import type bị erase, pi-ai-schemas expose pi-schema với TypeBox-compatible JSON → SAFE theo source. **Pending T5:** runtime unit test `compile()` nhận schema TypeBox, chưa chạy.
 - Regex mở rộng: `Type.(Refine|BigInt|Undefined|Transform|Any)` + `codec` + `Format.Set` — `Type.Any()` (dùng ở pi-firecrawl `tools.ts:54,102,185`) SAFE với pi-schema nhưng vẫn ghi vào bảng để có bằng chứng đã xét.
 - Render mutation audit: upstream v1.5.0 breaking change #9549 — `render()` trả `readonly string[]`, Container cache cùng array khi children không đổi. Scan mọi custom TUI component trong extension closure (subagent-tab, pi-ask, peer-sessions, handoff, terminal-relay): chỗ nào mutate render output in-place (`push`/`splice`/`pop` trên kết quả `render()` hoặc `super.render()`) → BREAK, phải copy trước khi biến đổi.
 - Files: read-only, không sửa.
 
 ### Task 4: Candidate merge v1.5.2
 - Acceptance:
-  - Worktree `pi-mono-next` (branch `li/next` từ `li/stable`); merge `--no-ff <full-sha-of-v1.5.2>`; 70 file conflict resolve theo matrix Approach; mỗi nhóm guard Li có note resolve trong candidate receipt draft.
-  - Đo lại conflict surface **NGAY SAU T0** (số mới phải gồm cả 9 file WIP vừa commit — 3/6 file modified đã xác nhận nằm trong upstream-changed; con số 70 đo lúc WIP chưa commit chỉ là định hướng). Resolve theo matrix đã cập nhật.
+  - Candidate branch `li/next`; target v1.5.2 full SHA `05fd3fbda0bbb9a1c7a76e4bf92ab58ed77c8d94`. Surface sau T0: 72 overlap files; merge tạo 30 conflict thực, auto-merge phần còn lại. Merge commit `356a874b37`; T9 merge-in `4158515a98`; conflict resolve theo matrix, resolution nằm trong commit body.
+  - Candidate hiện tại `ecac186570`; CHƯA promote.
   - `git grep rejectLiSelfUpdate`, `git grep applyLiRuntimeEnv`, `git grep LI_UI_LANGUAGE` đều còn present trong candidate.
   - Kiểm entry types: diff session-manager candidate vs backup không mất allowlist key nào.
 - Reproduce: `git -C D:\pcloud\workspace\code\pi-mono-next log --oneline -2` (merge commit trên cùng) && `git grep -c "LI_" -- packages/coding-agent/src/main.ts`.
@@ -164,12 +163,14 @@ flowchart TD
 
 ### Task 5: Gates trên candidate
 - Acceptance:
-  - `npm ci --ignore-scripts` → `node scripts/build-li.mjs --offline` → `npm run check` PASS trong worktree candidate.
+  - `npm ci --ignore-scripts` PASS; `packages/schema` + `@earendil-works/pi-schema` resolve. Trước build chạy `npm run hydrate:model-data` (catalog JSON generated mới); sau đó regen install-lock rồi build.
   - **Trước `npm run check`**: sau khi resolve `package.json`/lockfile (dùng `npm install --package-lock-only --ignore-scripts` nếu cần), chạy `node scripts/generate-coding-agent-install-lock.mjs` regen install-lock — không regen thì `check:install-lock:coding-agent` FAIL chắc chắn vì upstream đổi deps (pi-schema mới, undici bump).
-  - `bash ./test.sh`: residual failures chỉ rơi đúng nhóm đã biết runbook (symlink EPERM, shell timeout, PM fixture, catalog drift, chord boundary); khác → resolve lại hunk ở T4.
-  - Workspace wiring pi-schema: `npm ci` resolve `@earendil-works/pi-schema` OK; `install-lock/package-lock.json` có entry; `build-li.mjs --offline` bundle chứa chunk pi-schema (grep trong dist); thiếu → wiring vỡ, resolve theo nhóm 7 matrix.
-  - `test/li-*.test.ts` PASS toàn bộ; smoke `li --version` từ candidate bundle khớp receipt candidate.
-- Reproduce: `cd D:\pcloud\workspace\code\pi-mono-next && node scripts/build-li.mjs --offline && npm run check && bash ./test.sh` (Git Bash).
+  - `node scripts/generate-coding-agent-install-lock.mjs` → `node scripts/build-li.mjs --offline` → `npm run check` PASS. Terra Li rule port sang `packages/ai/catalog/providers/openai.ts` (hide direct OpenAI) + `openai-codex.ts` (1M context); `hydrate:model-data` verify OpenAI data không có Terra, Azure Foundry/Codex vẫn có.
+  - `li --version` từ candidate receipt khớp v1.5.2; bundle 84 files / 9.5 MiB có pi-schema. Li suites 75/75 PASS; `default-tools-setting` 41/41 PASS (Li migration + upstream branch/compaction/allowlist tests); owner-protocol 5/5 PASS.
+  - Full `packages/coding-agent/test`: candidate 86 fail / 3225 pass / 79 skip; baseline v1.3.0 46 fail / 2799 pass / 66 skip → **40 failure delta trên 22 file mới**, chưa pass. Phân loại/triage đang chạy; CHƯA promote tới khi mọi delta được fix hoặc có evidence rõ là APP_NAME/platform-only. 9 `agent-session-in-place-refresh` tests bị `promotion_required` vì candidate SHA chưa T20-approved; defer rerun sau T6, không tính PASS.
+  - `bash ./test.sh` fail test `preview-packages.test.mjs`: GNU tar trên Windows báo `Cannot connect to C: resolve failed`; thử PATH Windows native thì chạm `Cannot locate npm on Windows`. Đây là harness/platform blocker mới; Linux CI cần verify trước promote.
+  - `resume-tool-loadout-smoke.ps1` không build được candidate worktree external: TypeScript type brand conflict giữa dist `packages/ai` của temp copy và candidate worktree do npm workspace resolve hai real path. Chưa bypass; cần chạy sau promote hoặc sửa harness có gate riêng.
+- Reproduce: `cd D:\pcloud\workspace\code\pi-mono-next && npm ci --ignore-scripts && npm run hydrate:model-data && node scripts/generate-coding-agent-install-lock.mjs && node scripts/build-li.mjs --offline && npm run check` (Git Bash). Full suite: `node node_modules/vitest/dist/cli.js --run --testTimeout 60000 packages/coding-agent/test/`.
 - Files: build outputs candidate.
 
 ### Task 6: Promote + rebuild + T20
@@ -188,7 +189,7 @@ flowchart TD
   - Từ cùng CWD: `li` và `pi` chạy được, cùng profile/session list, identity/version riêng; không mở cùng session file đồng thời.
   - Từ Li: `subagent_tab` spawn → child chạy Li CLI (verify qua `resolve-runtime-cli` log/pid cmdline); `li update` bị từ chối trước mọi side effect.
   - Session mới gõ tiếng Việt UI vẫn đúng; `/trim` hoạt động (T20 approved); compaction chạy trên session dài.
-- Reproduce: `powershell -NoProfile -File tests/super-parent/resume-tool-loadout-smoke.ps1 -LiRepo ..\pi-mono-li -ExtensionSource app_presets\pi\extensions` (từ Python repo).
+- Reproduce sau promote (T20 approved): `powershell -NoProfile -File tests/super-parent/resume-tool-loadout-smoke.ps1 -LiRepo ..\pi-mono-li -ExtensionSource app_presets\pi\extensions` (từ Python repo). Candidate external worktree hiện fail TypeScript branded-type resolution do hai real workspace paths — không bypass; nếu vẫn fail sau promote, mở task sửa harness.
 - Files: không sửa (verify-only).
 
 ### Task 8: ProDesk deploy + Li-first runtime
@@ -206,7 +207,8 @@ flowchart TD
   - Auto-group conflict surface: script output `conflict-matrix.json` — danh sách file conflict tự phân nhóm theo matrix (guard/catalog/new-package/infra/TUI/tests/catch-all) bằng path matching, reviewer chỉ confirm thay vì phân loại tay; kèm **guard overlap verdict** (guard file nào bị upstream đụng thêm so với lần trước — so merge-base cũ/mới).
   - Parameterize cho fleet reuse: `--guard-files <glob>` / `--custom-files <glob>` per-fork (mặc định profile Li), để kaneo/Ditto dùng lại flow không phải fork script.
   - `docs/li-maintenance.md` cập nhật: bước 6 smoke TUI profile cô lập (PI_CODING_AGENT_DIR) + bước 7 T20 checklist + vị trí receipt (Known issues #7a-c).
-  - `REGISTRY.md`: cập nhật entry pi-mono (snapshot mới, trạng thái active), đóng Known issues #1 (mirror fixed), #7 (vá xong).
+  - `REGISTRY.md`: entry pi-mono `upgrading`; Known issue #1 ghi đúng preserve-workflow fix (không thêm `workflows: write`); #7 cập nhật việc đã xong/đang chờ gate — chưa close sớm. T9 commit `89f82904e4`, script dry-run PASS; `conflict-matrix.json` nhóm 8 type + guard-overlap + catch-all, `--guard-files`/`--custom-files` per-fork. Mirror update an toàn thêm `--repo <name>`; fleet khác chưa deploy.
+  - `DRAFT-skill-patch-upstream-maintenance.md` đã tạo; skill thật CHƯA sửa (đợi owner duyệt).
   - Đề xuất patch skill `upstream-maintenance` (section pipeline fleet) ghi vào draft — chờ owner duyệt rồi mới sửa skill.
 - Reproduce: `node scripts/upstream-merge.mjs --dry-run` in đúng plan từ state hiện tại.
 - Files: `scripts/upstream-merge.mjs`, `docs/li-maintenance.md`, `D:\pcloud\workspace\knowledge\upstream-forks\REGISTRY.md`.
@@ -222,7 +224,7 @@ flowchart TD
 - Sau T0: worktree clean + test focused PASS — mới được phép vào T4.
 - Sau T3: audit bảng có BREAK chưa có plan vá → dừng chốt plan (compat 2 chiều hoặc staged apply sau T6 — xem ràng buộc vá extension trong Approach); CẤM deploy patch chỉ-tương-thích-mới lên profile thật trước promote.
 - Sau T4: diff-stat candidate (`git diff li/stable..li/next --stat`) review against conflict matrix — file ngoài surface bị đổi = sai.
-- Sau T5: gates evidence đầy đủ mới promote; FAIL → sửa hunk, không dồn lỗi.
+- Sau T5 (checkpoint hiện tại): `npm ci`, hydrate catalog, install-lock regen, build và `npm run check` PASS; Li-focused suite pass. Full suite +40 failure delta so với baseline → BLOCKED, chưa promote. Peer `li` triage read-only; parent xử regression/test expectation + rerun. 9 test T20-gated re-run sau T6.
 - Sau T7: UAT user PASS mới ProDesk deploy (production gate).
 - Trước DONE: reconcile todo + receipt + archive.
 
