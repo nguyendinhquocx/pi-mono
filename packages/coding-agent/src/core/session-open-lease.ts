@@ -99,6 +99,9 @@ export interface LeaseRegistryFile {
 	t20_receipt_path?: string;
 }
 
+export type OwnerKind = "tui" | "lix-worker" | "protocol-test";
+export type WriterState = "idle" | "running" | "handoff-pending";
+
 export interface LeaseRecord {
 	lease_id: string;
 	session_id: string;
@@ -109,6 +112,15 @@ export interface LeaseRecord {
 	build_hash: string;
 	opened_at: string;
 	lease_state: typeof LEASE_STATE_OPEN;
+	/** Owner-protocol extensions (all optional so legacy v1 records still parse). */
+	owner_epoch?: number;
+	owner_kind?: OwnerKind;
+	writer_state?: WriterState;
+	heartbeat_utc?: string;
+	owner_protocol_version?: number;
+	/** Present only while writer_state is "handoff-pending"; claiming consumes it. */
+	handoff_token?: string;
+	handoff_epoch?: number;
 }
 
 export interface LeaseClaimRecord {
@@ -519,39 +531,39 @@ function parseT20Receipt(raw: string): { ok: true; receipt: T20PromotionReceipt 
 		return { ok: false, reason: "receipt is not a JSON object" };
 	}
 	const record = parsed as Record<string, unknown>;
-	if (record["schema_version"] !== 1) return { ok: false, reason: "receipt schema_version must be 1" };
-	if (record["kind"] !== "pi-core-t20-promotion-receipt") {
+	if (record.schema_version !== 1) return { ok: false, reason: "receipt schema_version must be 1" };
+	if (record.kind !== "pi-core-t20-promotion-receipt") {
 		return { ok: false, reason: "receipt kind must be pi-core-t20-promotion-receipt" };
 	}
-	if (typeof record["decision"] !== "string" || record["decision"].length === 0) {
+	if (typeof record.decision !== "string" || record.decision.length === 0) {
 		return { ok: false, reason: "receipt decision must be a non-empty string" };
 	}
-	if (typeof record["runtime"] !== "string" || record["runtime"].length === 0) {
+	if (typeof record.runtime !== "string" || record.runtime.length === 0) {
 		return { ok: false, reason: "receipt runtime must be a non-empty string" };
 	}
-	if (typeof record["artifact_sha256"] !== "string" || !isSha256(record["artifact_sha256"])) {
+	if (typeof record.artifact_sha256 !== "string" || !isSha256(record.artifact_sha256)) {
 		return { ok: false, reason: "receipt artifact_sha256 must be lowercase hex64" };
 	}
 	if (
-		typeof record["protocol_version"] !== "number" ||
-		!Number.isFinite(record["protocol_version"]) ||
-		record["protocol_version"] !== LEASE_REGISTRY_PROTOCOL_VERSION
+		typeof record.protocol_version !== "number" ||
+		!Number.isFinite(record.protocol_version) ||
+		record.protocol_version !== LEASE_REGISTRY_PROTOCOL_VERSION
 	) {
 		return { ok: false, reason: `receipt protocol_version must be ${LEASE_REGISTRY_PROTOCOL_VERSION}` };
 	}
-	if (record["approved_at"] !== undefined && typeof record["approved_at"] !== "string") {
+	if (record.approved_at !== undefined && typeof record.approved_at !== "string") {
 		return { ok: false, reason: "receipt approved_at must be a string when present" };
 	}
 	return {
 		ok: true,
 		receipt: {
 			schema_version: 1,
-			kind: record["kind"] as string,
-			decision: record["decision"] as string,
-			runtime: record["runtime"] as string,
-			artifact_sha256: record["artifact_sha256"] as string,
-			protocol_version: record["protocol_version"] as number,
-			...(record["approved_at"] !== undefined ? { approved_at: record["approved_at"] as string } : {}),
+			kind: record.kind as string,
+			decision: record.decision as string,
+			runtime: record.runtime as string,
+			artifact_sha256: record.artifact_sha256 as string,
+			protocol_version: record.protocol_version as number,
+			...(record.approved_at !== undefined ? { approved_at: record.approved_at as string } : {}),
 		},
 	};
 }
@@ -627,7 +639,7 @@ export function parseLeaseRecord(value: unknown): LeaseRecord | null {
 	// lease_state enum carries only "open"; release deletes the file, so any
 	// other value is a corrupt/unknown record and must fail closed.
 	if (value.lease_state !== LEASE_STATE_OPEN) return null;
-	return {
+	const record: LeaseRecord = {
 		lease_id: leaseId,
 		session_id: sessionId,
 		path_hash: pathHash,
@@ -638,6 +650,51 @@ export function parseLeaseRecord(value: unknown): LeaseRecord | null {
 		opened_at: openedAt,
 		lease_state: LEASE_STATE_OPEN,
 	};
+	// Owner-protocol optional extensions: parse strictly when present, stay
+	// absent for legacy records so old runtimes keep working unchanged.
+	const ownerEpoch = value.owner_epoch;
+	if (ownerEpoch !== undefined) {
+		if (typeof ownerEpoch !== "number" || !Number.isInteger(ownerEpoch) || ownerEpoch < 1) return null;
+		record.owner_epoch = ownerEpoch;
+	}
+	const ownerKind = value.owner_kind;
+	if (ownerKind !== undefined) {
+		if (ownerKind !== "tui" && ownerKind !== "lix-worker" && ownerKind !== "protocol-test") return null;
+		record.owner_kind = ownerKind;
+	}
+	const writerState = value.writer_state;
+	if (writerState !== undefined) {
+		if (writerState !== "idle" && writerState !== "running" && writerState !== "handoff-pending") return null;
+		record.writer_state = writerState;
+	}
+	const heartbeat = value.heartbeat_utc;
+	if (heartbeat !== undefined) {
+		if (typeof heartbeat !== "string") return null;
+		record.heartbeat_utc = heartbeat;
+	}
+	const protocolVersion = value.owner_protocol_version;
+	if (protocolVersion !== undefined) {
+		if (typeof protocolVersion !== "number" || !Number.isInteger(protocolVersion) || protocolVersion < 1) return null;
+		record.owner_protocol_version = protocolVersion;
+	}
+	const handoffToken = value.handoff_token;
+	if (handoffToken !== undefined) {
+		if (typeof handoffToken !== "string" || handoffToken.length < 16) return null;
+		record.handoff_token = handoffToken;
+	}
+	const handoffEpoch = value.handoff_epoch;
+	if (handoffEpoch !== undefined) {
+		if (typeof handoffEpoch !== "number" || !Number.isInteger(handoffEpoch) || handoffEpoch < 1) return null;
+		record.handoff_epoch = handoffEpoch;
+	}
+	// A handoff token only makes sense in the handoff-pending state.
+	if (record.handoff_token !== undefined && record.writer_state !== "handoff-pending") return null;
+	if (
+		record.writer_state === "handoff-pending" &&
+		(record.handoff_token === undefined || record.handoff_epoch === undefined)
+	)
+		return null;
+	return record;
 }
 
 export function parseClaimRecord(value: unknown): LeaseClaimRecord | null {
@@ -1070,12 +1127,47 @@ export class SessionOpenLeaseRegistry {
 	// =========================================================================
 
 	/** Create the lease under the short per-identity update guard. */
-	acquireLease(input: { sessionId: string; transcriptPath: string }): RegistryOpResult<LeaseRecord> {
+	acquireLease(input: {
+		sessionId: string;
+		transcriptPath: string;
+		ownerKind?: OwnerKind;
+		ownerProtocolVersion?: number;
+	}): RegistryOpResult<LeaseRecord> {
 		if (!this.#available) {
 			return fail("registry_invalid", this.#degradationReason ?? "lease registry unavailable");
 		}
 		const { pathHash } = canonicalTranscriptIdentity(input.transcriptPath);
 		return this.withIdentityGuard(pathHash, () => {
+			// Owner-protocol single-writer enforcement: only runtimes that declare
+			// an ownerKind participate. Legacy callers (no ownerKind) keep the
+			// historical bookkeeping behavior unchanged.
+			if (input.ownerKind !== undefined) {
+				const existing = this.listLeasesForPath(pathHash);
+				if (existing.invalidRecords > 0) {
+					return fail("writer_conflict", "unreadable lease record(s) present; cannot prove single writer");
+				}
+				for (const record of existing.records) {
+					if (this.isOwnedByCurrentProcess(record)) {
+						// Idempotent reopen in the same process: adopt the lease.
+						return { ok: true, value: record };
+					}
+					const alive =
+						record.process_start_utc !== PROCESS_START_UNKNOWN &&
+						this.processInventory.isProcessAlive(record.pid, record.process_start_utc);
+					if (alive) {
+						return fail(
+							"writer_conflict",
+							`session is owned by a live writer (pid ${record.pid}); use handoff, not force-acquire`,
+						);
+					}
+					// Dead owner: OS death proof — reclaim the stale lease file.
+					try {
+						unlinkSync(join(this.#paths.leasesDir, `${record.lease_id}.json`));
+					} catch (error) {
+						return fail("io_error", `failed to reclaim dead-owner lease: ${String(error)}`);
+					}
+				}
+			}
 			const processStart = this.processInventory.getProcessStartUtc(process.pid) ?? PROCESS_START_UNKNOWN;
 			const lease: LeaseRecord = {
 				lease_id: createHash("sha256")
@@ -1091,6 +1183,14 @@ export class SessionOpenLeaseRegistry {
 				opened_at: new Date().toISOString(),
 				lease_state: LEASE_STATE_OPEN,
 			};
+			if (input.ownerKind !== undefined) {
+				lease.owner_kind = input.ownerKind;
+				lease.owner_epoch = 1;
+				lease.writer_state = "idle";
+			}
+			if (input.ownerProtocolVersion !== undefined) {
+				lease.owner_protocol_version = input.ownerProtocolVersion;
+			}
 			const filePath = join(this.#paths.leasesDir, `${lease.lease_id}.json`);
 			try {
 				writeJsonFileSync(filePath, lease);
@@ -1147,6 +1247,195 @@ export class SessionOpenLeaseRegistry {
 			records.push(parsed);
 		}
 		return { records, invalidRecords };
+	}
+
+	/** The active lease record for a path hash, or null when none exists. */
+	getLeaseForPath(pathHash: string): RegistryOpResult<LeaseRecord | null> {
+		if (!this.#available) {
+			return fail("registry_invalid", this.#degradationReason ?? "lease registry unavailable");
+		}
+		const { records, invalidRecords } = this.listLeasesForPath(pathHash);
+		if (invalidRecords > 0) return fail("registry_invalid", "unreadable lease record(s) present for path");
+		if (records.length === 0) return { ok: true, value: null };
+		if (records.length > 1) return fail("registry_invalid", "multiple open leases for one path hash");
+		return { ok: true, value: records[0] };
+	}
+
+	/** True when the given lease record is owned by THIS process (pid + start identity). */
+	isOwnedByCurrentProcess(record: LeaseRecord): boolean {
+		if (record.pid !== process.pid) return false;
+		const start = this.processInventory.getProcessStartUtc(process.pid) ?? PROCESS_START_UNKNOWN;
+		return record.process_start_utc === start;
+	}
+
+	/**
+	 * Owner handoff step 1 (current owner): mark the lease handoff-pending and
+	 * mint a one-time claim token. The lease still belongs to the caller; the
+	 * token is the only way a successor can take it, so there is no acquire
+	 * window where a third process could slip in.
+	 */
+	beginHandoff(input: { leaseId: string }): RegistryOpResult<{ token: string; handoffEpoch: number }> {
+		if (!this.#available) {
+			return fail("registry_invalid", this.#degradationReason ?? "lease registry unavailable");
+		}
+		const leasePath = join(this.#paths.leasesDir, `${input.leaseId}.json`);
+		const raw = readJsonFileSync(leasePath);
+		if (!raw.ok) return fail("registry_invalid", raw.missing ? "lease not found" : raw.message);
+		const record = parseLeaseRecord(raw.value);
+		if (!record) return fail("registry_invalid", "lease record failed schema validation");
+		if (!this.isOwnedByCurrentProcess(record)) return fail("writer_conflict", "lease is owned by another process");
+		if (record.writer_state === "handoff-pending") {
+			return fail("writer_conflict", "handoff already pending");
+		}
+		return this.withIdentityGuard(record.path_hash, () => {
+			// Re-read under the identity guard: state may have changed.
+			const fresh = readJsonFileSync(leasePath);
+			if (!fresh.ok) return fail("registry_invalid", "lease record disappeared during handoff");
+			const current = parseLeaseRecord(fresh.value);
+			if (!current) return fail("registry_invalid", "lease record failed schema validation during handoff");
+			if (current.lease_id !== record.lease_id || !this.isOwnedByCurrentProcess(current)) {
+				return fail("writer_conflict", "lease ownership changed during handoff");
+			}
+			const handoffEpoch = (current.owner_epoch ?? 1) + 1;
+			const updated: LeaseRecord = {
+				...current,
+				writer_state: "handoff-pending",
+				handoff_token: createHash("sha256")
+					.update(`${current.lease_id}:${handoffEpoch}:${process.hrtime.bigint()}`)
+					.digest("hex")
+					.slice(0, 32),
+				handoff_epoch: handoffEpoch,
+			};
+			try {
+				writeJsonFileSync(leasePath, updated, true);
+			} catch (error) {
+				return fail("io_error", `failed to record handoff intent: ${String(error)}`);
+			}
+			return { ok: true, value: { token: updated.handoff_token as string, handoffEpoch } };
+		});
+	}
+
+	/**
+	 * Owner handoff step 2 (successor): consume the token, take the lease with
+	 * a new epoch. The successor MUST reload the session from disk before its
+	 * first write; that ordering is enforced by the caller, not the registry.
+	 */
+	claimHandoff(input: {
+		pathHash: string;
+		token: string;
+		sessionId: string;
+		ownerKind: OwnerKind;
+		ownerProtocolVersion?: number;
+	}): RegistryOpResult<LeaseRecord> {
+		if (!this.#available) {
+			return fail("registry_invalid", this.#degradationReason ?? "lease registry unavailable");
+		}
+		return this.withIdentityGuard(input.pathHash, () => {
+			const existing = this.getLeaseForPath(input.pathHash);
+			if (!existing.ok) return existing;
+			if (!existing.value) return fail("writer_conflict", "no lease to hand off");
+			const record = existing.value;
+			if (record.writer_state !== "handoff-pending" || record.handoff_token !== input.token) {
+				return fail("writer_conflict", "no pending handoff matching token");
+			}
+			if (record.handoff_epoch === undefined) {
+				return fail("registry_invalid", "handoff-pending record missing epoch");
+			}
+			if (this.isOwnedByCurrentProcess(record)) {
+				return fail("writer_conflict", "cannot claim own handoff");
+			}
+			const processStart = this.processInventory.getProcessStartUtc(process.pid) ?? PROCESS_START_UNKNOWN;
+			const claimed: LeaseRecord = {
+				...record,
+				pid: process.pid,
+				process_start_utc: processStart,
+				runtime: this.runtime,
+				build_hash: this.buildHash,
+				owner_epoch: record.handoff_epoch,
+				owner_kind: input.ownerKind,
+				writer_state: "idle",
+				heartbeat_utc: new Date().toISOString(),
+			};
+			if (input.ownerProtocolVersion !== undefined) {
+				claimed.owner_protocol_version = input.ownerProtocolVersion;
+			} else {
+				delete claimed.owner_protocol_version;
+			}
+			delete claimed.handoff_token;
+			delete claimed.handoff_epoch;
+			const leasePath = join(this.#paths.leasesDir, `${record.lease_id}.json`);
+			try {
+				writeJsonFileSync(leasePath, claimed, true);
+			} catch (error) {
+				return fail("io_error", `failed to publish handoff claim: ${String(error)}`);
+			}
+			return { ok: true, value: claimed };
+		});
+	}
+
+	/** Owner handoff abort (current owner only): cancel a pending handoff. */
+	abortHandoff(input: { leaseId: string }): RegistryOpResult<LeaseRecord> {
+		if (!this.#available) {
+			return fail("registry_invalid", this.#degradationReason ?? "lease registry unavailable");
+		}
+		const leasePath = join(this.#paths.leasesDir, `${input.leaseId}.json`);
+		const raw = readJsonFileSync(leasePath);
+		if (!raw.ok) return fail("registry_invalid", raw.missing ? "lease not found" : raw.message);
+		const record = parseLeaseRecord(raw.value);
+		if (!record) return fail("registry_invalid", "lease record failed schema validation");
+		if (!this.isOwnedByCurrentProcess(record)) return fail("writer_conflict", "lease is owned by another process");
+		if (record.writer_state !== "handoff-pending") return fail("writer_conflict", "no handoff pending");
+		return this.withIdentityGuard(record.path_hash, () => {
+			const fresh = readJsonFileSync(leasePath);
+			if (!fresh.ok) return fail("registry_invalid", "lease record disappeared during handoff abort");
+			const current = parseLeaseRecord(fresh.value);
+			if (!current) return fail("registry_invalid", "lease record failed schema validation during handoff abort");
+			if (current.lease_id !== record.lease_id || !this.isOwnedByCurrentProcess(current)) {
+				return fail("writer_conflict", "lease ownership changed during handoff abort");
+			}
+			if (current.writer_state !== "handoff-pending") return fail("writer_conflict", "no handoff pending");
+			const updated: LeaseRecord = { ...current, writer_state: "idle" };
+			delete updated.handoff_token;
+			delete updated.handoff_epoch;
+			try {
+				writeJsonFileSync(leasePath, updated, true);
+			} catch (error) {
+				return fail("io_error", `failed to abort handoff: ${String(error)}`);
+			}
+			return { ok: true, value: updated };
+		});
+	}
+
+	/** Owner heartbeat: refresh heartbeat_utc (and optionally writer_state) under the identity guard. */
+	heartbeatLease(input: { leaseId: string; writerState?: WriterState }): RegistryOpResult<LeaseRecord> {
+		if (!this.#available) {
+			return fail("registry_invalid", this.#degradationReason ?? "lease registry unavailable");
+		}
+		const leasePath = join(this.#paths.leasesDir, `${input.leaseId}.json`);
+		const raw = readJsonFileSync(leasePath);
+		if (!raw.ok) return fail("registry_invalid", raw.missing ? "lease not found" : raw.message);
+		const record = parseLeaseRecord(raw.value);
+		if (!record) return fail("registry_invalid", "lease record failed schema validation");
+		if (!this.isOwnedByCurrentProcess(record)) return fail("writer_conflict", "lease is owned by another process");
+		return this.withIdentityGuard(record.path_hash, () => {
+			const fresh = readJsonFileSync(leasePath);
+			if (!fresh.ok) return fail("registry_invalid", "lease record disappeared during heartbeat");
+			const current = parseLeaseRecord(fresh.value);
+			if (!current) return fail("registry_invalid", "lease record failed schema validation during heartbeat");
+			if (current.lease_id !== record.lease_id || !this.isOwnedByCurrentProcess(current)) {
+				return fail("writer_conflict", "lease ownership changed during heartbeat");
+			}
+			const updated: LeaseRecord = { ...current, heartbeat_utc: new Date().toISOString() };
+			if (input.writerState !== undefined && current.writer_state !== "handoff-pending") {
+				updated.writer_state = input.writerState;
+			}
+			try {
+				writeJsonFileSync(leasePath, updated, true);
+			} catch (error) {
+				return fail("io_error", `failed to write heartbeat: ${String(error)}`);
+			}
+			return { ok: true, value: updated };
+		});
 	}
 
 	/**

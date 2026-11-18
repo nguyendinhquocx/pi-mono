@@ -25,6 +25,7 @@ import {
 	waitForRawStdoutBackpressure,
 	writeRawStdout,
 } from "../../core/output-guard.ts";
+import { checkOwnerProtocolVersion, OWNER_PROTOCOL_VERSION } from "../../core/session-owner-protocol.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { toJsonEvent } from "../json-event.ts";
@@ -56,6 +57,9 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
 	let unsubscribeBackpressure: (() => void) | undefined;
+	// Owner event envelope state (opt-in via owner_capability wantsEnvelope).
+	let envelopeEpoch: number | undefined;
+	let envelopeSeq = 0;
 
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
 		writeRawStdout(serializeJsonLine(obj));
@@ -72,8 +76,22 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		return { id, type: "response", command, success: true, data } as RpcResponse;
 	};
 
-	const error = (id: string | undefined, command: string, message: string, code?: string): RpcResponse => {
-		return { id, type: "response", command, success: false, error: message, ...(code ? { code } : {}) };
+	const error = (
+		id: string | undefined,
+		command: string,
+		message: string,
+		code?: string,
+		data?: unknown,
+	): RpcResponse => {
+		return {
+			id,
+			type: "response",
+			command,
+			success: false,
+			error: message,
+			...(code ? { code } : {}),
+			...(data !== undefined ? { details: data } : {}),
+		};
 	};
 
 	const errorCode = (errorValue: unknown): string | undefined => {
@@ -110,6 +128,8 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				if (timeoutId) clearTimeout(timeoutId);
 				opts?.signal?.removeEventListener("abort", onAbort);
 				pendingExtensionRequests.delete(id);
+				// Owner protocol: a settled dialog unblocks handoff (idle again).
+				session.decrementUiPending();
 			};
 
 			const onAbort = () => {
@@ -132,6 +152,8 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				},
 				reject,
 			});
+			// Owner protocol: a dialog waiting for user response is NOT idle.
+			session.incrementUiPending();
 			output({ type: "extension_ui_request", id, ...request } as RpcExtensionUIRequest);
 		});
 	}
@@ -365,7 +387,12 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
 		unsubscribe = session.subscribe((event) => {
-			output(toJsonEvent(event));
+			const jsonEvent = toJsonEvent(event);
+			if (envelopeEpoch !== undefined) {
+				output({ type: "owner_event", owner_epoch: envelopeEpoch, seq: ++envelopeSeq, event: jsonEvent });
+			} else {
+				output(jsonEvent);
+			}
 			if (event.type === "agent_settled") {
 				void checkShutdownRequested();
 			}
@@ -436,8 +463,56 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			}
 
 			case "abort": {
+				const wasRunning = session.isStreaming;
 				await session.abort();
-				return success(id, "abort");
+				// Truthful abort: the response states whether a turn was actually
+				// running; aborting an idle session is a no-op, never a fake stop.
+				return success(id, "abort", { aborted: wasRunning, wasRunning, stillRunning: session.isStreaming });
+			}
+
+			// =================================================================
+			// Owner protocol (session ownership/handoff)
+			// =================================================================
+
+			case "owner_capability": {
+				// Handshake first command from an attach client; fail closed on
+				// mismatch instead of sharing a session with an unknown runtime.
+				checkOwnerProtocolVersion(command.protocolVersion);
+				if (
+					command.ownerKind !== "tui" &&
+					command.ownerKind !== "lix-worker" &&
+					command.ownerKind !== "protocol-test"
+				) {
+					return error(id, "owner_capability", `invalid ownerKind: ${command.ownerKind}`, "invalid_request");
+				}
+				if (command.wantsEnvelope === true) {
+					// Opt-in owner event envelope: events are wrapped as
+					// {type:"owner_event", owner_epoch, seq, event} so viewers can
+					// detect epoch change (handoff) and force a snapshot resync.
+					envelopeEpoch = session.getOwnerStatus().ownerEpoch ?? 1;
+					envelopeSeq = 0;
+				}
+				return success(id, "owner_capability", {
+					protocolVersion: OWNER_PROTOCOL_VERSION,
+					accepted: true,
+					envelope: envelopeEpoch !== undefined,
+				});
+			}
+
+			case "owner_status": {
+				return success(id, "owner_status", session.getOwnerStatus());
+			}
+
+			case "owner_handoff": {
+				const result = session.beginSessionHandoff();
+				if (!result.ok) {
+					return error(id, "owner_handoff", result.message, result.code, result.pendingWork);
+				}
+				return success(id, "owner_handoff", { token: result.token, handoffEpoch: result.handoffEpoch });
+			}
+
+			case "get_turn_status": {
+				return success(id, "get_turn_status", { running: session.isStreaming });
 			}
 
 			case "clear_queue": {

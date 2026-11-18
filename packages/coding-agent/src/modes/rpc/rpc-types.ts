@@ -23,6 +23,10 @@ export type RpcCommand =
 	| { id?: string; type: "steer"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "abort" }
+	| { id?: string; type: "owner_status" }
+	| { id?: string; type: "owner_handoff" }
+	| { id?: string; type: "owner_capability"; protocolVersion: number; ownerKind: string; wantsEnvelope?: boolean }
+	| { id?: string; type: "get_turn_status" }
 	| { id?: string; type: "clear_queue" }
 	| { id?: string; type: "new_session"; parentSession?: string }
 

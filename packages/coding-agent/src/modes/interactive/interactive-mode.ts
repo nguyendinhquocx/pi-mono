@@ -2677,10 +2677,18 @@ export class InteractiveMode {
 	}
 
 	private createExtensionUIContext(): ExtensionUIContext {
+		/**
+		 * Owner protocol: a dialog waiting for the user is NOT idle — track it
+		 * on the session so handoff is refused while a response is pending.
+		 */
+		const trackedDialog = <T>(promise: Promise<T>): Promise<T> => {
+			this.session.incrementUiPending();
+			return promise.finally(() => this.session.decrementUiPending());
+		};
 		return {
-			select: (title, options, opts) => this.showExtensionSelector(title, options, opts),
-			confirm: (title, message, opts) => this.showExtensionConfirm(title, message, opts),
-			input: (title, placeholder, opts) => this.showExtensionInput(title, placeholder, opts),
+			select: (title, options, opts) => trackedDialog(this.showExtensionSelector(title, options, opts)),
+			confirm: (title, message, opts) => trackedDialog(this.showExtensionConfirm(title, message, opts)),
+			input: (title, placeholder, opts) => trackedDialog(this.showExtensionInput(title, placeholder, opts)),
 			notify: (message, type) => this.showExtensionNotify(message, type),
 			onTerminalInput: (handler) => this.addExtensionTerminalInputListener(handler),
 			setStatus: (key, text) => this.setExtensionStatus(key, text),
@@ -2701,7 +2709,7 @@ export class InteractiveMode {
 			pasteToEditor: (text) => this.editor.handleInput(`\x1b[200~${text}\x1b[201~`),
 			setEditorText: (text) => this.editor.setText(text),
 			getEditorText: () => this.editor.getExpandedText?.() ?? this.editor.getText(),
-			editor: (title, prefill) => this.showExtensionEditor(title, prefill),
+			editor: (title, prefill) => trackedDialog(this.showExtensionEditor(title, prefill)),
 			addAutocompleteProvider: (factory) => {
 				this.autocompleteProviderWrappers.push(factory);
 				this.setupAutocompleteProvider();

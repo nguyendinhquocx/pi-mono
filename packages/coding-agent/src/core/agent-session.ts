@@ -161,6 +161,13 @@ import {
 	SessionOpenLeaseRegistry,
 } from "./session-open-lease.ts";
 import {
+	OWNER_HEARTBEAT_INTERVAL_MS,
+	OWNER_PROTOCOL_VERSION,
+	type OwnerKind,
+	resolveOwnerStrictMode,
+	SessionOwnerUnavailableError,
+} from "./session-owner-protocol.ts";
+import {
 	applyToolModifiers,
 	type CacheWarmingMode,
 	DEFAULT_TOOL_NAMES,
@@ -335,6 +342,16 @@ export interface AgentSessionConfig {
 	sessionStartEvent?: SessionStartEvent;
 	/** Effective agent directory for the session-open lease registry. */
 	agentDir?: string;
+	/**
+	 * Owner-protocol enforcement: "strict" refuses writes when the lease
+	 * registry cannot prove exclusive ownership (required for runtimes that
+	 * participate in cross-client ownership: LiX worker, RPC attach, tests).
+	 * Also enabled via PI_SESSION_OWNER_STRICT=1. Default keeps the legacy
+	 * degrade behavior for plain local TUI usage.
+	 */
+	writerEnforcement?: "strict";
+	/** Declared owner kind recorded on the lease (owner protocol bookkeeping). */
+	ownerKind?: OwnerKind;
 }
 
 export interface ExtensionBindings {
@@ -642,6 +659,10 @@ export class AgentSession {
 	private _sessionAccessGuard: TranscriptWriteGuard | undefined;
 	private _sessionAccessUnguarded = true;
 	private _sessionAccessFailure: string | undefined;
+	private _ownerStrict = false;
+	private _ownerKind: OwnerKind = "tui";
+	private _uiPendingCount = 0;
+	private _ownerHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
 	private _heldSessionDataLock: HeldSessionDataLock | undefined;
 	private _sessionDataAdmissionLocked = false;
 
@@ -660,6 +681,8 @@ export class AgentSession {
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
 		this._agentDir = config.agentDir ?? "";
+		this._ownerStrict = resolveOwnerStrictMode(config.writerEnforcement);
+		this._ownerKind = config.ownerKind ?? "tui";
 		this._modelRuntime = config.modelRuntime;
 		if (this._agentDir) {
 			const buildHash = getRuntimeBuildHash();
@@ -3778,20 +3801,141 @@ export class AgentSession {
 			!sessionFile ||
 			!existsSync(sessionFile)
 		) {
+			if (this._ownerStrict && registry && !registry.available) {
+				throw new SessionOwnerUnavailableError(
+					`strict writer mode requires the lease registry: ${registry.degradationReason ?? "unavailable"}`,
+				);
+			}
 			return;
 		}
 		if (this._sessionOpenLease?.session_id === this.sessionManager.getSessionId()) return;
+		const { pathHash } = canonicalTranscriptIdentity(sessionFile);
 		const acquired = registry.acquireLease({
 			sessionId: this.sessionManager.getSessionId(),
 			transcriptPath: sessionFile,
+			ownerKind: this._ownerKind,
+			ownerProtocolVersion: OWNER_PROTOCOL_VERSION,
 		});
 		if (!acquired.ok) {
+			// A handoff successor claims the lease via the registry BEFORE opening
+			// the session; adopt that record instead of failing. Any other failure
+			// is a real conflict.
+			const adopted = registry.getLeaseForPath(pathHash);
+			if (adopted.ok && adopted.value && registry.isOwnedByCurrentProcess(adopted.value)) {
+				this._sessionOpenLease = adopted.value;
+				this._sessionAccessUnguarded = true;
+				this._startOwnerHeartbeat();
+				return;
+			}
+			if (this._ownerStrict) {
+				throw new SessionOwnerUnavailableError(`cannot acquire session owner lease: ${acquired.message}`);
+			}
 			this._sessionAccessUnguarded = true;
 			this._sessionAccessFailure = acquired.message;
 			return;
 		}
 		this._sessionOpenLease = acquired.value;
 		this._sessionAccessUnguarded = true;
+		this._startOwnerHeartbeat();
+	}
+
+	/**
+	 * Strict owners refresh their lease heartbeat periodically so viewers can
+	 * distinguish "tool running quietly" from "owner died" without relying on
+	 * JSONL mtime heuristics. Non-strict owners never start a timer.
+	 */
+	private _startOwnerHeartbeat(): void {
+		if (!this._ownerStrict || this._ownerHeartbeatTimer || !this._leaseRegistry) return;
+		const leaseId = this._sessionOpenLease?.lease_id;
+		if (!leaseId) return;
+		this._ownerHeartbeatTimer = setInterval(() => {
+			if (!this._sessionOpenLease || !this._leaseRegistry) return;
+			this._leaseRegistry.heartbeatLease({
+				leaseId: this._sessionOpenLease.lease_id,
+				writerState: this._isAgentRunActive ? "running" : "idle",
+			});
+		}, OWNER_HEARTBEAT_INTERVAL_MS);
+		this._ownerHeartbeatTimer.unref?.();
+	}
+
+	/** Owner-protocol status snapshot for RPC/handoff consumers. */
+	getOwnerStatus(): {
+		protocolVersion: number;
+		strict: boolean;
+		ownerKind: OwnerKind;
+		leaseId: string | undefined;
+		ownerEpoch: number | undefined;
+		writerState: string | undefined;
+		pid: number;
+		idleForHandoff: boolean;
+		pendingWork: Record<string, number | boolean>;
+		uiPendingCount: number;
+	} {
+		return {
+			protocolVersion: OWNER_PROTOCOL_VERSION,
+			strict: this._ownerStrict,
+			ownerKind: this._ownerKind,
+			leaseId: this._sessionOpenLease?.lease_id,
+			ownerEpoch: this._sessionOpenLease?.owner_epoch,
+			writerState: this._isAgentRunActive ? "running" : (this._sessionOpenLease?.writer_state ?? "idle"),
+			pid: process.pid,
+			idleForHandoff: this.isIdleForHandoff(),
+			pendingWork: this._pendingSessionWorkDetails(),
+			uiPendingCount: this._uiPendingCount,
+		};
+	}
+
+	/**
+	 * Handoff idle: no pending session work AND no pending UI request.
+	 * A dialog waiting for a response means NOT idle (its response would be
+	 * orphaned on the old owner if the lease moved).
+	 */
+	isIdleForHandoff(): boolean {
+		return !this._hasPendingSessionWork() && this._uiPendingCount === 0;
+	}
+
+	incrementUiPending(): void {
+		this._uiPendingCount++;
+	}
+
+	decrementUiPending(): void {
+		if (this._uiPendingCount > 0) this._uiPendingCount--;
+	}
+
+	/**
+	 * Two-step handoff (owner side): verify idle, then mark the lease
+	 * handoff-pending and mint the successor token. The lease still belongs to
+	 * this runtime until a successor claims it; afterwards this runtime must
+	 * not write again (releaseSessionDataAccess on shutdown).
+	 */
+	beginSessionHandoff():
+		| { ok: true; token: string; handoffEpoch: number }
+		| { ok: false; code: string; message: string; pendingWork?: Record<string, number | boolean> } {
+		const registry = this._leaseRegistry;
+		const lease = this._sessionOpenLease;
+		if (!registry || !lease) {
+			return { ok: false, code: "owner_unavailable", message: "no owner lease to hand off" };
+		}
+		if (!this.isIdleForHandoff()) {
+			return {
+				ok: false,
+				code: "handoff_refused",
+				message: this._pendingSessionWorkMessage("handoff refused"),
+				pendingWork: { ...this._pendingSessionWorkDetails(), pending_ui: this._uiPendingCount },
+			};
+		}
+		const pending = registry.beginHandoff({ leaseId: lease.lease_id });
+		if (!pending.ok) {
+			return { ok: false, code: pending.code, message: pending.message };
+		}
+		return { ok: true, token: pending.value.token, handoffEpoch: pending.value.handoffEpoch };
+	}
+
+	private _stopOwnerHeartbeat(): void {
+		if (this._ownerHeartbeatTimer) {
+			clearInterval(this._ownerHeartbeatTimer);
+			this._ownerHeartbeatTimer = undefined;
+		}
 	}
 
 	private _pendingSessionWorkDetails(): Record<string, number | boolean> {
@@ -3852,6 +3996,11 @@ export class AgentSession {
 		this._acquireSessionOpenLeaseIfNeeded();
 		const registry = this._leaseRegistry;
 		if (!registry || !registry.available) {
+			if (this._ownerStrict) {
+				throw new SessionOwnerUnavailableError(
+					`strict writer mode requires the lease registry: ${registry?.degradationReason ?? "unavailable"}`,
+				);
+			}
 			this._markSessionAccessUnguarded(registry?.degradationReason ?? "session-open lease registry unavailable");
 			// Degraded mode already appends without an OS guard; converge the
 			// deferred startup repairs instead of silently keeping a stale file.
@@ -3868,6 +4017,12 @@ export class AgentSession {
 			) {
 				throw new SessionDataLockedError();
 			}
+			if (this._ownerStrict) {
+				throw new SessionOwnerUnavailableError(
+					claim.ok ? "owner lease missing while strict" : `owner lease unavailable: ${claim.message}`,
+					pathHash,
+				);
+			}
 			this._markSessionAccessUnguarded(claim.ok ? "session-open lease could not be acquired" : claim.message);
 			this.sessionManager.applyDeferredStartupRepairs();
 			return;
@@ -3875,6 +4030,9 @@ export class AgentSession {
 
 		const existingClaim = registry.readClaim(pathHash);
 		if (!existingClaim.ok) {
+			if (this._ownerStrict) {
+				throw new SessionOwnerUnavailableError(`owner claim unavailable: ${existingClaim.message}`, pathHash);
+			}
 			this._markSessionAccessUnguarded(existingClaim.message);
 			this.sessionManager.applyDeferredStartupRepairs();
 			return;
@@ -4671,6 +4829,7 @@ export class AgentSession {
 	}
 
 	async releaseSessionDataAccess(): Promise<void> {
+		this._stopOwnerHeartbeat();
 		if (this._heldSessionDataLock) await this.releaseSessionDataLock(this._heldSessionDataLock.lockId);
 		const guard = this._sessionAccessGuard;
 		this._sessionAccessGuard = undefined;
