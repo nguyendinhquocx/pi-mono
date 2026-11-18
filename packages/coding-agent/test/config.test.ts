@@ -3,6 +3,7 @@ import { tmpdir } from "os";
 import { delimiter, join } from "path";
 import { afterEach, describe, expect, test } from "vitest";
 import {
+	APP_NAME,
 	detectInstallChange,
 	detectInstallMethod,
 	findNodePackageDir,
@@ -279,7 +280,7 @@ describe("detectInstallMethod", () => {
 		});
 	});
 
-	test("self-update respects configured npmCommand", () => {
+	test.skipIf(APP_NAME !== "pi")("self-update respects configured npmCommand", () => {
 		const { prefix } = createNpmPrefixInstall();
 
 		const command = getSelfUpdateCommand("@earendil-works/pi-coding-agent", ["npm", "--prefix", prefix]);
@@ -299,7 +300,7 @@ describe("detectInstallMethod", () => {
 		});
 	});
 
-	test("self-update treats empty npmCommand as unset", () => {
+	test.skipIf(APP_NAME !== "pi")("self-update treats empty npmCommand as unset", () => {
 		const { prefix } = createNpmPrefixInstall();
 
 		const command = getSelfUpdateCommand("@earendil-works/pi-coding-agent", []);
@@ -336,7 +337,7 @@ describe("detectInstallMethod", () => {
 		);
 	});
 
-	test("self-updates bun global installs from bun pm bin", () => {
+	test.skipIf(APP_NAME !== "pi")("self-updates bun global installs from bun pm bin", () => {
 		createBunGlobalInstall();
 
 		const command = getSelfUpdateCommand("@earendil-works/pi-coding-agent");
@@ -349,7 +350,7 @@ describe("detectInstallMethod", () => {
 		});
 	});
 
-	test("self-updates renamed pnpm global installs by removing the old package first", () => {
+	test.skipIf(APP_NAME !== "pi")("self-updates renamed pnpm global installs by removing the old package first", () => {
 		createPnpmGlobalInstall();
 
 		const command = getSelfUpdateCommand("@mariozechner/pi-coding-agent", undefined, "@new-scope/pi");
@@ -375,7 +376,7 @@ describe("detectInstallMethod", () => {
 		});
 	});
 
-	test("self-updates pnpm v11 global installs resolved through the store", () => {
+	test.skipIf(APP_NAME !== "pi")("self-updates pnpm v11 global installs resolved through the store", () => {
 		const temp = mkdtempSync(join(tmpdir(), "pi-pnpm11-"));
 		const binDir = join(temp, "bin");
 		const root = join(temp, "Library", "pnpm", "global", "v11");
@@ -418,7 +419,7 @@ describe("detectInstallMethod", () => {
 		});
 	});
 
-	test("self-updates renamed yarn global installs by removing the old package first", () => {
+	test.skipIf(APP_NAME !== "pi")("self-updates renamed yarn global installs by removing the old package first", () => {
 		createYarnGlobalInstall();
 
 		const command = getSelfUpdateCommand("@mariozechner/pi-coding-agent", undefined, "@new-scope/pi");
@@ -443,7 +444,7 @@ describe("detectInstallMethod", () => {
 		});
 	});
 
-	test("self-updates renamed bun global installs by removing the old package first", () => {
+	test.skipIf(APP_NAME !== "pi")("self-updates renamed bun global installs by removing the old package first", () => {
 		createBunGlobalInstall();
 
 		const command = getSelfUpdateCommand("@mariozechner/pi-coding-agent", undefined, "@new-scope/pi");
@@ -469,7 +470,7 @@ describe("detectInstallMethod", () => {
 		});
 	});
 
-	test("does not self-update when npm install path is not writable", () => {
+	test.skipIf(APP_NAME !== "pi")("does not self-update when npm install path is not writable", () => {
 		const { packageDir } = createNpmPrefixInstall();
 		chmodSync(packageDir, 0o500);
 

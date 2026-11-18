@@ -46,10 +46,10 @@ async function runNewSessionOverRpc(agentDir: string, projectDir: string): Promi
 	return stderr;
 }
 
-describe("model scope warnings on session replacement", () => {
-	// #11264: the runtime factory runs again on /new, /resume and /fork. It printed the model scope warnings
-	// with console.warn, which drew over the interactive TUI. They are now startup diagnostics, reported once.
-	it("reports unmatched enabledModels patterns once at startup, not again on new_session", async () => {
+describe("Li model scope warnings on session replacement", () => {
+	// Li deliberately skips no-match diagnostics from enabledModels settings (free-tier catalogs can omit them).
+	// Explicit CLI --models diagnostics remain visible; startup and /new must stay silent for settings entries.
+	it("silently skips unmatched enabledModels patterns on startup and new_session", async () => {
 		const tempRoot = mkdtempSync(join(tmpdir(), "pi-model-scope-replacement-"));
 		tempDirs.push(tempRoot);
 		const agentDir = join(tempRoot, "agent");
@@ -80,6 +80,6 @@ describe("model scope warnings on session replacement", () => {
 
 		const stderr = await runNewSessionOverRpc(agentDir, projectDir);
 
-		expect(stderr.match(/No models match pattern "github-copilot\/missing-model"/g)).toHaveLength(1);
+		expect(stderr).not.toContain('No models match pattern "github-copilot/missing-model"');
 	}, 60_000);
 });

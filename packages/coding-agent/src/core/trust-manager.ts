@@ -205,6 +205,9 @@ export function hasTrustRequiringProjectResources(cwd: string): boolean {
 		if (!pathsEqual(agentsSkillsDir, userAgentsSkillsDir) && existsSync(agentsSkillsDir)) {
 			return true;
 		}
+		// Do not walk above the user's home: an unrelated ancestor may contain user-global
+		// resources that must never make this project require trust.
+		if (pathsEqual(currentDir, homeDir)) return false;
 
 		const parentDir = dirname(currentDir);
 		if (parentDir === currentDir) {

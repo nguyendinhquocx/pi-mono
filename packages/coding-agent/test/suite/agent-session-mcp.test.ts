@@ -1265,6 +1265,22 @@ describe("AgentSession MCP tools after resume and reload", () => {
 		await vi.waitFor(() =>
 			expect(second.harness.session.getAllTools().some((tool) => tool.name === "mcp__docs__search")).toBe(true),
 		);
+		console.log(
+			"MCP-DEBUG",
+			JSON.stringify(
+				second.harness.sessionManager
+					.getBranch()
+					.filter((e: any) => e.type === "message" && e.message.role === "system")
+					.map((e: any) => ({
+						added: e.message.toolsAdded?.map((x: any) => x.name),
+						removed: e.message.toolsRemoved?.map((x: any) => x.name),
+						snapshot: e.message.toolSelectionSnapshot,
+					})),
+				null,
+				0,
+			),
+			second.harness.session.getActiveToolNames(),
+		);
 		expect(second.harness.session.getActiveToolNames()).toContain("mcp__docs__search");
 		expect(second.harness.session.getActiveToolNames()).not.toContain("loader");
 	});

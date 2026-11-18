@@ -110,12 +110,12 @@ describe("pi mcp", () => {
 			const signedOut = await run(["list"], radius, undefined, async () => undefined);
 			expect(signedOut.exitCode).toBe(1);
 			expect(signedOut.output).toContain("radius: needs sign-in (codemode, global)");
-			expect(signedOut.output).toContain("  sign in with: /login radius in pi");
+			expect(signedOut.output).toContain(`  sign in with: /login radius in ${APP_NAME}`);
 
 			for (const command of ["login", "logout"]) {
 				expect(await run([command, "radius"], radius)).toMatchObject({
 					exitCode: 1,
-					output: `MCP server "radius" uses the credentials of provider "radius". Run "pi auth ${command} radius".`,
+					output: `MCP server "radius" uses the credentials of provider "radius". Run "${APP_NAME} auth ${command} radius".`,
 				});
 			}
 		} finally {

@@ -25,9 +25,9 @@ function writeSettings(agentDir: string, enabledModels: string[]): void {
 }
 
 describe("RPC diagnostics after session replacement", () => {
-	// The runtime factory runs again on every new_session, but only the startup diagnostics were reported, so a
-	// problem that first appeared on replacement went nowhere. Found while fixing #11264.
-	it("writes a diagnostic that first appears on new_session to stderr once", async () => {
+	// Li intentionally filters no-match diagnostics originating only from enabledModels settings;
+	// this verifies /new does not turn that silent-skip policy into stderr spam.
+	it("keeps missing enabledModels patterns silent across new_session", async () => {
 		const tempRoot = mkdtempSync(join(tmpdir(), "pi-rpc-replacement-diagnostics-"));
 		tempDirs.push(tempRoot);
 		const agentDir = join(tempRoot, "agent");
@@ -86,7 +86,7 @@ describe("RPC diagnostics after session replacement", () => {
 		child.stdin.end();
 		await exited;
 
-		expect(stderr.match(/Warning: No models match pattern "github-copilot\/missing-model"/g)).toHaveLength(1);
+		expect(stderr).not.toContain('No models match pattern "github-copilot/missing-model"');
 		expect(stdout).not.toContain("No models match pattern");
 	}, 60_000);
 });

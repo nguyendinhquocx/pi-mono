@@ -42,6 +42,10 @@ describe("model selector", () => {
 			],
 		});
 		const currentModel = harness.getModel("current-model")!;
+		const available = harness.session.modelRuntime.getAvailableSnapshot();
+		vi.spyOn(harness.session.modelRuntime, "getAvailableSnapshot").mockReturnValue(
+			available.filter((model) => model.provider === currentModel.provider),
+		);
 		const selector = new ModelSelectorComponent(
 			createFakeTui(),
 			currentModel,
@@ -104,14 +108,13 @@ describe("model selector", () => {
 			models: Array.from({ length: 12 }, (_, index) => ({ id: `model-${String(index).padStart(2, "0")}` })),
 		});
 		const onSelect = vi.fn();
-		const selector = new ModelSelectorComponent(
-			createFakeTui(),
-			undefined,
-			harness.session.modelRuntime,
-			[],
-			onSelect,
-			() => {},
+		const runtime = harness.session.modelRuntime;
+		const provider = harness.getModel("model-00")!.provider;
+		const available = runtime.getAvailableSnapshot();
+		vi.spyOn(runtime, "getAvailableSnapshot").mockReturnValue(
+			available.filter((model) => model.provider === provider),
 		);
+		const selector = new ModelSelectorComponent(createFakeTui(), undefined, runtime, [], onSelect, () => {});
 
 		selector.handleInput("\x16"); // Ctrl+V
 		selector.handleInput("\x16");
@@ -182,8 +185,14 @@ describe("model selector", () => {
 				models: [{ id: "alpha-1" }, { id: "alpha-2" }, { id: "alpha-3" }, { id: "beta-1" }],
 			});
 			harness = activeHarness;
+			const runtime = activeHarness.session.modelRuntime;
+			const provider = activeHarness.getModel("alpha-1")!.provider;
+			const available = runtime.getAvailableSnapshot();
+			vi.spyOn(runtime, "getAvailableSnapshot").mockReturnValue(
+				available.filter((model) => model.provider === provider),
+			);
 			const { promise, resolve } = Promise.withResolvers<ModelsRefreshResult>();
-			vi.spyOn(activeHarness.session.modelRuntime, "refresh").mockReturnValue(promise);
+			vi.spyOn(runtime, "refresh").mockReturnValue(promise);
 			const selector = new ModelSelectorComponent(
 				createFakeTui(),
 				activeHarness.getModel("alpha-1"),

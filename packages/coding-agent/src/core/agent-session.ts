@@ -1859,9 +1859,21 @@ export class AgentSession {
 		// Extensions often add one tool via getActiveTools() + [name]. Preserve selected-but-
 		// unavailable restore intent for that additive change; a replacement that drops any
 		// currently active tool replaces the old snapshot intent too.
-		const unavailableSelection = preservesCurrentLoadout
-			? [...this._selectedToolNames].filter((name) => !this._toolRegistry.has(name))
-			: [];
+		const deactivatesRestoredTool = previousActive.some(
+			(name) => !toolNames.includes(name) && this._restoredToolNames.has(name),
+		);
+		const unavailableSelection = [
+			...new Set([
+				...(preservesCurrentLoadout
+					? [...this._selectedToolNames].filter((name) => !this._toolRegistry.has(name))
+					: []),
+				// If an extension only removes its own newly registered tool, preserve other transcript tools
+				// still waiting for MCP registration. Replacing a restored tool loadout drops those pending names.
+				...(!deactivatesRestoredTool
+					? [...this._pendingToolNames].filter((name) => this._restoredToolNames.has(name))
+					: []),
+			]),
+		];
 		this._selectedToolNames = new Set([...toolNames, ...unavailableSelection]);
 		if (this._lateActivationToolNames) {
 			this._lateActivationToolNames = new Set(this._selectedToolNames);
@@ -1871,11 +1883,7 @@ export class AgentSession {
 			[...toolNames, ...unavailableSelection].filter((name) => !this._toolRegistry.has(name)),
 		);
 		this._setActiveTools(toolNames);
-		// A restored tool explicitly removed by the caller must not remain pending for late registration.
-		const active = new Set(this.getActiveToolNames());
-		for (const name of previousActive) {
-			if (!active.has(name) && this._restoredToolNames.has(name)) this._pendingToolNames.delete(name);
-		}
+		if (deactivatesRestoredTool) this._pendingToolNames.clear();
 	}
 	private _setActiveTools(toolNames: string[]): void {
 		const tools = this._applyToolLoadout(toolNames);

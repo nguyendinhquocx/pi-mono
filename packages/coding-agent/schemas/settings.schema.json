@@ -254,6 +254,20 @@
           ],
           "description": "Li-only transcript style: blank removes user/tool/custom-message/diff backgrounds; current restores them.",
           "default": "blank"
+        },
+        "language": {
+          "anyOf": [
+            {
+              "type": "string",
+              "const": "en"
+            },
+            {
+              "type": "string",
+              "const": "vi"
+            }
+          ],
+          "description": "Li-only UI language. \"en\" keeps the default English interface; \"vi\" switches Li static UI copy to Vietnamese. Pi ignores this key.",
+          "default": "en"
         }
       }
     },

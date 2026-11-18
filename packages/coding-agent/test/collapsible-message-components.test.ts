@@ -95,7 +95,7 @@ describe("collapsible message components", () => {
 			{
 				kind: "compaction summary",
 				messageType: "summary",
-				header: "Compacted from 1,234 tokens",
+				header: `Compacted from ${new Intl.NumberFormat().format(1234)} tokens`,
 				create: () =>
 					new CompactionSummaryMessageComponent(
 						{ role: "compactionSummary", summary: "details", tokensBefore: 1234, timestamp: Date.now() },

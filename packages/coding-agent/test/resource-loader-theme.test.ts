@@ -31,7 +31,7 @@ describe("DefaultResourceLoader theme color mode", () => {
 		mkdirSync(cwd, { recursive: true });
 
 		themeJson = JSON.parse(
-			readFileSync(join(process.cwd(), "src", "modes", "interactive", "theme", "dark.json"), "utf-8"),
+			readFileSync(new URL("../src/modes/interactive/theme/dark.json", import.meta.url), "utf-8"),
 		) as TestThemeJson;
 		themeJson.name = "capability-test";
 		themeJson.colors.userMessageBg = "#3c3544";
