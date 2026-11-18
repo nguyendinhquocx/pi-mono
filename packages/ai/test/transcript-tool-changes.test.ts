@@ -1,7 +1,16 @@
 import { Type } from "typebox";
 import { describe, expect, test } from "vitest";
 import { getModel, streamSimple } from "../src/compat.ts";
-import type { Api, AssistantMessage, Context, Message, Model, SystemMessage, Tool, ToolSelectionSnapshot } from "../src/types.ts";
+import type {
+	Api,
+	AssistantMessage,
+	Context,
+	Message,
+	Model,
+	SystemMessage,
+	Tool,
+	ToolSelectionSnapshot,
+} from "../src/types.ts";
 import {
 	getLatestToolSelectionSnapshot,
 	getTranscriptKnownToolNames,

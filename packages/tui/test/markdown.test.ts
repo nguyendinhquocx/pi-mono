@@ -87,7 +87,7 @@ describe("Markdown component", () => {
 			assert.ok(text.includes("sơ đồ"), `Missing alt text in: ${text}`);
 			assert.ok(text.includes("img.png"), `Missing image path in: ${text}`);
 		});
-		});
+	});
 
 	describe("Block reuse", () => {
 		afterEach(() => resetCapabilitiesCache());

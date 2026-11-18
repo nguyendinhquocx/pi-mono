@@ -6068,7 +6068,7 @@ export class InteractiveMode {
 							withSession: options?.withSession,
 							projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
 						});
-						if (!result.cancelled) this.showStatus(`Resumed session in ${error.issue.fallbackCwd}`);
+						if (!result.cancelled) this.showStatus(liCopy().status.resumedIn(error.issue.fallbackCwd));
 						return result;
 					}
 					case "fork":
@@ -6099,7 +6099,7 @@ export class InteractiveMode {
 			fs.rmSync(forkPath, { force: true });
 			return result;
 		}
-		this.showStatus(`Forked into new session ${fork.getSessionId()} in ${cwd}`);
+		this.showStatus(liCopy().status.forkedInto(fork.getSessionId(), cwd));
 		return result;
 	}
 
@@ -6879,7 +6879,9 @@ export class InteractiveMode {
 				switch (await this.promptForMissingSessionCwd(error)) {
 					case "continue": {
 						const result = await this.runtimeHost.importFromJsonl(inputPath, error.issue.fallbackCwd);
-						this.showStatus(result.cancelled ? liCopy().status.importCancelled : liCopy().status.sessionImported(inputPath));
+						this.showStatus(
+							result.cancelled ? liCopy().status.importCancelled : liCopy().status.sessionImported(inputPath),
+						);
 						return;
 					}
 					case "fork": {
@@ -6888,7 +6890,7 @@ export class InteractiveMode {
 						return;
 					}
 					case undefined:
-						this.showStatus(liCopy().status.importCancelled); return; cancelled");
+						this.showStatus(liCopy().status.importCancelled);
 						return;
 				}
 			}

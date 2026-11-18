@@ -81,10 +81,7 @@ const PI_ASK_SOURCE = "D:/pcloud/workspace/code/python/app_presets/pi/extensions
 const APPROVAL_SOURCE = "D:/pcloud/workspace/code/python/app_presets/pi/extensions/pi-terminal-relay/approval.ts";
 
 /** Copy shown only under APP_NAME !== "li": Pi-only strings, never localized. */
-const PI_ONLY_STATUS_ALLOWLIST = new Map<string, string>([
-	["Resumed session", "Pi-only resume copy"],
-	["Resumed session in current cwd", "Pi-only resume copy"],
-]);
+const PI_ONLY_STATUS_ALLOWLIST = new Map<string, string>([["Resumed session", "Pi-only resume copy"]]);
 
 /**
  * Capture the full argument expression of every showStatus( call, honoring

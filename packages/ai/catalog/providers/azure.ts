@@ -1,6 +1,11 @@
 import type { Model, ModelCost } from "../../src/types.ts";
-import { type ChatModel, defineProvider, mergeCompat } from "../define.ts";
-import { enableOpenAiGrammarTools } from "../families/openai.ts";
+import { type ChatModel, defineProvider, mergeCompat, modelsDevModels } from "../define.ts";
+import {
+	enableOpenAiGrammarTools,
+	OPENAI_LONG_CONTEXT_INPUT_THRESHOLD,
+	OPENAI_STANDARD_COSTS,
+	withOpenAiLongContextPricing,
+} from "../families/openai.ts";
 
 // Azure Foundry deploys these with larger context windows than OpenAI's own short-tier defaults.
 // See models-sold-directly-by-azure docs.
@@ -40,6 +45,23 @@ export default defineProvider({
 	id: "azure",
 	models: (ctx) => [
 		...openAiModels(ctx.providerModels("openai")),
+		// Azure Foundry serves gpt-6.1-terra even though Li hides it from direct api.openai
+		// (owner request keeps direct-OpenAI catalog clean; Azure clone re-derives it from models.dev).
+		...openAiModels(
+			modelsDevModels(ctx, "openai", {
+				api: "openai-responses",
+				baseUrl: "https://api.openai.com/v1",
+				protocol: "responses",
+				include: (source) => source.id === "gpt-6.1-terra",
+				map: (model) => ({
+					...model,
+					provider: "openai",
+					contextWindow: OPENAI_LONG_CONTEXT_INPUT_THRESHOLD,
+					maxTokens: 128000,
+					cost: withOpenAiLongContextPricing(OPENAI_STANDARD_COSTS["gpt-6.1-terra"]),
+				}),
+			}),
+		),
 		...ctx
 			.providerModels("deepseek")
 			.filter((model) => model.id === "deepseek-v4-pro")

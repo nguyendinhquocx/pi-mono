@@ -20,7 +20,9 @@ import {
 const BASE_URL = "https://api.openai.com/v1";
 
 // models.dev lists this alias, but it is not accepted by OpenAI APIs.
-const UNSUPPORTED_MODEL_IDS = new Set(["gpt-5.6"]);
+// gpt-6.1-terra is intentionally hidden from api.openai; exposed only via openai-codex with its 1M
+// context window and long-context pricing (owner request, SPEC-2026-11-18 keeps Li commit 4ac7c9f58).
+const UNSUPPORTED_MODEL_IDS = new Set(["gpt-5.6", "gpt-6.1-terra"]);
 
 // Keep direct OpenAI requests in the short-context pricing tier by default. Users can opt into the
 // larger context through model overrides, so retain long-context cost metadata on the capped models.
@@ -101,7 +103,7 @@ const CLASSIFIER_MODELS: ClassifierModel<"openai-decisions">[] = [
 	},
 ];
 
-function correctUpstream(model: ChatModel): ChatModel {
+export function correctUpstream(model: ChatModel): ChatModel {
 	if (SHORT_CONTEXT_CAPPED_MODEL_IDS.has(model.id)) {
 		model.contextWindow = OPENAI_LONG_CONTEXT_INPUT_THRESHOLD;
 		model.maxTokens = 128000;

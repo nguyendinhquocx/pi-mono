@@ -17,7 +17,8 @@ const MODELS = [
 	{ id: "gpt-6.2-astra", name: "GPT-6.2 Astra", contextWindow: 272000 },
 	{ id: "gpt-6.2-sol", name: "GPT-6.2 Sol", contextWindow: 500000 },
 	{ id: "gpt-6.1-sol", name: "GPT-6.1 Sol", contextWindow: 500000 },
-	{ id: "gpt-6.1-terra", name: "GPT-6.1 Terra", contextWindow: 500000 },
+	// Li: Terra exposes its 1M context through Codex (long-context pricing), not through api.openai.
+	{ id: "gpt-6.1-terra", name: "GPT-6.1 Terra", contextWindow: 1000000 },
 	{ id: "gpt-6-astra", name: "GPT-6 Astra", contextWindow: 272000 },
 	{ id: "gpt-6-sol", name: "GPT-6 Sol", contextWindow: 272000 },
 	{ id: "gpt-6-luna", name: "GPT-6 Luna", contextWindow: 272000 },

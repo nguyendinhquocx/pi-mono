@@ -219,6 +219,8 @@ export interface LiUiCopy {
 		reloaded: (savedTrust: boolean) => string;
 		sessionExported: (filePath: string) => string;
 		sessionImported: (inputPath: string) => string;
+		resumedIn: (cwd: string) => string;
+		forkedInto: (sessionId: string, cwd: string) => string;
 		importCancelled: string;
 		copiedLastMessage: string;
 	};
@@ -472,7 +474,7 @@ const EN_COPY: LiUiCopy = {
 		thinking: { description: "Set thinking level" },
 		"scoped-models": { description: "Enable/disable models for Ctrl+P cycling" },
 		export: { description: "Export session (HTML default, or specify path: .html/.jsonl)" },
-		import: { description: "Import and resume a session from a JSONL file" },
+		import: { description: "Import a JSONL session, preserving its ID and working directory" },
 		share: { description: "Share session via a Radius artifact or a GitHub gist" },
 		bug: { description: "Report a bug to the Pi developers" },
 		copy: { description: "Copy last agent message to clipboard" },
@@ -487,7 +489,7 @@ const EN_COPY: LiUiCopy = {
 		logout: { description: "Remove provider authentication" },
 		new: { description: "Start a new session" },
 		compact: { description: "Manually compact the session context" },
-		resume: { description: "Resume a different session" },
+		resume: { description: "Resume another session" },
 		reload: { description: "Reload keybindings, extensions, skills, prompts, themes, and context files" },
 		quit: { description: `Quit ${APP_NAME}` },
 	},
@@ -594,6 +596,8 @@ const EN_COPY: LiUiCopy = {
 				: "Reloaded keybindings, extensions, skills, prompts, themes, and context files",
 		sessionExported: (filePath) => `Session exported to: ${filePath}`,
 		sessionImported: (inputPath) => `Session imported from: ${inputPath}`,
+		resumedIn: (cwd) => `Resumed session in ${cwd}`,
+		forkedInto: (sessionId, cwd) => `Forked into new session ${sessionId} in ${cwd}`,
 		importCancelled: "Import cancelled",
 		copiedLastMessage: "Copied last agent message to clipboard",
 	},
@@ -844,7 +848,7 @@ const VI_COPY: LiUiCopy = {
 		thinking: { description: "Đặt mức suy nghĩ" },
 		"scoped-models": { description: "Bật/tắt model cho việc xoay vòng Ctrl+P" },
 		export: { description: "Export session (mặc định HTML, hoặc chỉ định path: .html/.jsonl)" },
-		import: { description: "Import và resume session từ file JSONL" },
+		import: { description: "Nhập session JSONL, giữ nguyên ID và thư mục làm việc" },
 		share: { description: "Chia sẻ session qua Radius artifact hoặc GitHub gist" },
 		bug: { description: "Báo bug cho đội phát triển Pi" },
 		copy: { description: "Copy message agent cuối vào clipboard" },
@@ -966,6 +970,8 @@ const VI_COPY: LiUiCopy = {
 				: "Đã nạp lại keybindings, extensions, skills, prompts, themes và context files",
 		sessionExported: (filePath) => `Đã export session ra: ${filePath}`,
 		sessionImported: (inputPath) => `Đã import session từ: ${inputPath}`,
+		resumedIn: (cwd) => `Đã resume session trong ${cwd}`,
+		forkedInto: (sessionId, cwd) => `Đã fork sang session mới ${sessionId} tại ${cwd}`,
 		importCancelled: "Đã hủy import",
 		copiedLastMessage: "Đã copy message agent cuối vào clipboard",
 	},

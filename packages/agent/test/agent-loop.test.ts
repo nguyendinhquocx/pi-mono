@@ -260,7 +260,7 @@ describe("agentLoop with AgentMessage", () => {
 				{
 					name: "read",
 					description: "read tool",
-					parameters: Type.Object({}),
+					parameters: {},
 					label: "read",
 					execute: async () => {
 						throw new Error("not executed");

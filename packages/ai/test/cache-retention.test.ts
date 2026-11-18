@@ -240,6 +240,7 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 	});
 
 	describe("OpenAI Responses Provider", () => {
+		// Li hides gpt-6.1-terra from api.openai (owner request — see catalog/providers/openai.ts).
 		it.each([
 			"gpt-5.6-luna",
 			"gpt-5.6-sol",
@@ -247,7 +248,6 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 			"gpt-6-astra",
 			"gpt-6-luna",
 			"gpt-6-sol",
-			"gpt-6.1-terra",
 			"gpt-6.2-astra",
 			"gpt-6.2-sol",
 		] as const)("does not enable cache warming from the documented TTL alone for %s", (modelId) => {

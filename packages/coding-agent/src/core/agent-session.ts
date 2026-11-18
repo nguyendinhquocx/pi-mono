@@ -1880,7 +1880,7 @@ export class AgentSession {
 		// that only deactivates tools outside the restored loadout, such as an extension's own tool that
 		// the restore or reload activated as newly registered.
 		const active = new Set(this.getActiveToolNames());
-		if (previous.some((name) => !active.has(name) && this._restoredToolNames.has(name))) {
+		if (previousActive.some((name) => !active.has(name) && this._restoredToolNames.has(name))) {
 			this._pendingToolNames.clear();
 		}
 	}
@@ -2248,21 +2248,6 @@ export class AgentSession {
 		);
 		// Ignores names that are not registered.
 		this._setActiveTools(names);
-	}
-
-	/**
-	 * Effective fresh-session default selection for migration: the `defaultTools` setting with
-	 * modifiers, plus every registered extension/custom tool that activates on registration.
-	 * Never the whole registry: `defaultActive:false` tools only become candidates through an
-	 * explicit setting entry.
-	 */
-	private _defaultCandidateNames(): string[] {
-		if (!this._usesDefaultTools) return [];
-		const settingNames = applyToolModifiers(
-			this.settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES,
-			this._defaultToolModifiers,
-		);
-		return [...new Set([...settingNames, ...this._registeredDefaultExtensionToolNames])];
 	}
 
 	private _currentToolSelectionSnapshot(): ToolSelectionSnapshot {
@@ -5689,7 +5674,7 @@ export class AgentSession {
 		targetId: string,
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
-this._throwIfSessionDataLocked();
+		this._throwIfSessionDataLocked();
 		if (this.isStreaming || this._promptPreflightCount > 0) {
 			throw new Error("Wait for the current response to finish before navigating the session tree.");
 		}

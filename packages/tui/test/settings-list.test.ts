@@ -56,7 +56,7 @@ describe("SettingsList", () => {
 		assert.deepStrictEqual(changes, [{ id: "tui-mode", value: "fullscreen" }]);
 	});
 
-it("keeps default English strings when no copy override is passed", () => {
+	it("keeps default English strings when no copy override is passed", () => {
 		const list = new SettingsList(
 			[],
 			10,
@@ -138,7 +138,7 @@ it("keeps default English strings when no copy override is passed", () => {
 		assert.ok(plain.render(80).some((line) => line.includes("Enter/Space đổi · Esc thoát")));
 	});
 
-it("moves by one visible page with selection page keys (#7629)", () => {
+	it("moves by one visible page with selection page keys (#7629)", () => {
 		const list = new SettingsList(
 			Array.from({ length: 12 }, (_, index) => ({
 				id: `setting-${index}`,
@@ -157,5 +157,6 @@ it("moves by one visible page with selection page keys (#7629)", () => {
 		list.handleInput("\x1b[6~");
 		assert.match(list.render(80).join("\n"), /> Setting 11/);
 		list.handleInput("\x1b[5~");
-		assert.match(list.render(80).join("\n"), /> Setting 6/);	});
+		assert.match(list.render(80).join("\n"), /> Setting 6/);
+	});
 });

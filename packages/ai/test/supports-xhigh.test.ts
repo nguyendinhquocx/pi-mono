@@ -102,7 +102,9 @@ describe("getSupportedThinkingLevels", () => {
 		expect(getSupportedThinkingLevels(model!)).toContain("xhigh");
 	});
 
-	it.each(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-terra"] as const)(
+	// Li hides gpt-6.1-terra from api.openai (owner request — exposed only via openai-codex,
+	// see catalog/providers/openai.ts UNSUPPORTED_MODEL_IDS).
+	it.each(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-sol", "gpt-6-luna"] as const)(
 		"includes xhigh and max for OpenAI %s models",
 		(modelId) => {
 			const model = getModel("openai", modelId);
@@ -127,8 +129,9 @@ describe("getSupportedThinkingLevels", () => {
 	});
 
 	// GPT-6.1 Terra accepts reasoning.effort "none" but, like GPT-6.1 Sol, rejects "minimal".
+	// Li hides gpt-6.1-terra from api.openai; the Azure and Codex variants still expose it.
 	it("supports off but not minimal for GPT-6.1 Terra", () => {
-		for (const provider of ["openai", "azure", "openai-codex"] as const) {
+		for (const provider of ["azure", "openai-codex"] as const) {
 			const model = getModel(provider, "gpt-6.1-terra");
 			expect(model).toBeDefined();
 			expect(model!.thinkingLevelMap?.off).toBe("none");
@@ -140,8 +143,9 @@ describe("getSupportedThinkingLevels", () => {
 		["gpt-6-sol", { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 }, 272000],
 		["gpt-6-luna", { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 }, 272000],
 		// Codex serves GPT-6.1 Sol with a 500K default context window (#10840)
+		// Li hides gpt-6.1-terra from api.openai — its Codex metadata (1M context + long-context
+		// tiers) is asserted by the dedicated Codex Terra test above.
 		["gpt-6.1-sol", { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 }, 500000],
-		["gpt-6.1-terra", { input: 1, output: 5, cacheRead: 0.05, cacheWrite: 1.25 }, 500000],
 		["gpt-6.2-astra", { input: 8, output: 40, cacheRead: 0.4, cacheWrite: 10 }, 272000],
 		["gpt-6.2-sol", { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 }, 500000],
 	] as const)("includes official metadata for OpenAI and Codex %s", (modelId, cost, codexContextWindow) => {
@@ -183,12 +187,14 @@ describe("getSupportedThinkingLevels", () => {
 				output: 5,
 				cacheRead: 0.05,
 				cacheWrite: 1.25,
+				tiers: [{ inputTokensAbove: 272000, input: 2, output: 7.5, cacheRead: 0.1, cacheWrite: 2.5 }],
 			},
 			contextWindow: 1_000_000,
 			maxTokens: 128_000,
 		});
 		expect(getSupportedThinkingLevels(model!)).toContain("xhigh");
 		expect(getSupportedThinkingLevels(model!)).toContain("max");
+	});
 	it.each([
 		"gpt-6-astra",
 		"gpt-6-luna",
