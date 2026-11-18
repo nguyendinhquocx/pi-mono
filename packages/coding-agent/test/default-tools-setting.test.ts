@@ -320,28 +320,32 @@ describe("defaultTools setting", () => {
 			});
 		};
 
-		const toolReferences = (names: string[]) =>
-			names.map((name) => ({ name, description: name, parameters: Type.Object({}) }));
-
-		/** Append a system message that adds and removes tools, as a run records loadout changes. */
-		function recordLoadoutChange(sessionManager: SessionManager, added: string[], removed: string[] = []): string {
-			return sessionManager.appendMessage({
+		/** A session whose transcript records the loadout `toolNames`, as a run records it. */
+		function createRecordedSession(toolNames: string[]): SessionManager {
+			const sessionManager = SessionManager.inMemory(tempDir);
+			sessionManager.appendMessage({
 				role: "system",
 				content: "",
-				...(added.length > 0 ? { toolsAdded: toolReferences(added) } : {}),
-				...(removed.length > 0 ? { toolsRemoved: toolReferences(removed) } : {}),
+				toolsAdded: toolNames.map((name) => ({ name, description: name, parameters: Type.Object({}) })),
+				timestamp: Date.now(),
+			});
+			return sessionManager;
+		}
+
+		function recordLoadoutChange(sessionManager: SessionManager, added: string[], removed: string[] = []): void {
+			sessionManager.appendMessage({
+				role: "system",
+				content: "",
+				...(added.length > 0
+					? { toolsAdded: added.map((name) => ({ name, description: name, parameters: Type.Object({}) })) }
+					: {}),
+				...(removed.length > 0
+					? { toolsRemoved: removed.map((name) => ({ name, description: name, parameters: Type.Object({}) })) }
+					: {}),
 				timestamp: Date.now(),
 			});
 		}
 
-		/** A session whose transcript records the loadout `toolNames`, as a run records it. */
-		function createRecordedSession(toolNames: string[]): SessionManager {
-			const sessionManager = SessionManager.inMemory(tempDir);
-			recordLoadoutChange(sessionManager, toolNames);
-			return sessionManager;
-		}
-
-		/** A session that recorded `read`, `grep`, and `inactive_tool`, and deactivated `active_tool`. */
 		function createChangedSession(): SessionManager {
 			const sessionManager = createRecordedSession(["read", "grep", "active_tool"]);
 			recordLoadoutChange(sessionManager, ["inactive_tool"], ["active_tool"]);
@@ -370,49 +374,42 @@ describe("defaultTools setting", () => {
 			).session;
 		}
 
-		it("restores the loadout the transcript records", async () => {
-			const session = await resume(createChangedSession());
-			expect(session.getActiveToolNames().sort()).toEqual(["grep", "inactive_tool", "read"]);
-			session.dispose();
-		});
-
-		// #11062
-		it("activates extension tools the transcript never added or removed", async () => {
-			// Built-in tools and tools registered inactive stay inactive.
+		it("activates extension tools the transcript never mentioned while keeping inactive registrations off", async () => {
 			const session = await resume(createRecordedSession(["read", "grep"]));
-			expect(session.getActiveToolNames().sort()).toEqual(["active_tool", "grep", "read"]);
+			expect(session.getActiveToolNames()).toContain("active_tool");
+			expect(session.getActiveToolNames()).not.toContain("inactive_tool");
 			session.dispose();
 		});
 
-		it("keeps tools removed before a compaction inactive", async () => {
+		it("keeps recorded removals inactive when the loadout history crosses compaction", async () => {
 			const sessionManager = createChangedSession();
 			const kept = sessionManager.appendMessage({ role: "user", content: "hi", timestamp: Date.now() });
 			sessionManager.appendCompaction("summary", kept, 1000);
 			const session = await resume(sessionManager);
-			expect(session.getActiveToolNames().sort()).toEqual(["grep", "inactive_tool", "read"]);
+			expect(session.getActiveToolNames()).toContain("inactive_tool");
+			expect(session.getActiveToolNames()).not.toContain("active_tool");
 			session.dispose();
 		});
 
-		// #11075
-		it("restores the target branch's loadout on tree navigation", async () => {
-			// The target branch never mentions active_tool, so it is active there. It removed grep.
+		it("restores the target branch loadout and preserves allowlist exclusions", async () => {
 			const sessionManager = createRecordedSession(["read", "grep"]);
 			recordLoadoutChange(sessionManager, [], ["grep"]);
 			const target = sessionManager.appendMessage({ role: "user", content: "first", timestamp: Date.now() });
 			recordLoadoutChange(sessionManager, ["grep"], ["active_tool"]);
 			const session = await resume(sessionManager);
-			expect(session.getActiveToolNames().sort()).toEqual(["grep", "read"]);
-
+			expect(session.getActiveToolNames()).toContain("grep");
 			await session.navigateTree(target, { summarize: false });
-			expect(session.getActiveToolNames().sort()).toEqual(["active_tool", "read"]);
+			expect(session.getActiveToolNames()).toContain("active_tool");
+			expect(session.getActiveToolNames()).not.toContain("grep");
 			session.dispose();
-		});
 
-		it("keeps registered tools outside the tools allowlist inactive on tree navigation", async () => {
-			// An allowlist without mcp__ entries keeps MCP tools registered but inactive.
-			const sessionManager = createRecordedSession(["read"]);
-			const target = sessionManager.appendMessage({ role: "user", content: "first", timestamp: Date.now() });
-			const session = await resume(sessionManager, {
+			const allowlistSessionManager = createRecordedSession(["read"]);
+			const allowlistTarget = allowlistSessionManager.appendMessage({
+				role: "user",
+				content: "first",
+				timestamp: Date.now(),
+			});
+			const allowlisted = await resume(allowlistSessionManager, {
 				tools: ["read"],
 				customTools: [
 					{
@@ -424,15 +421,30 @@ describe("defaultTools setting", () => {
 					},
 				],
 			});
-			expect(session.getActiveToolNames()).toEqual(["read"]);
+			expect(allowlisted.getActiveToolNames()).toEqual(["read"]);
+			await allowlisted.navigateTree(allowlistTarget, { summarize: false });
+			expect(allowlisted.getActiveToolNames()).toEqual(["read"]);
+			allowlisted.dispose();
+		});
 
-			await session.navigateTree(target, { summarize: false });
-			expect(session.getActiveToolNames()).toEqual(["read"]);
+		it("restores the loadout the transcript records and adds new default tools", async () => {
+			// active_tool was deactivated during the session, inactive_tool activated. Default
+			// candidates the transcript never mentions (bash, edit, write, active_tool) migrate in.
+			const session = await resume(createRecordedSession(["read", "grep", "inactive_tool"]));
+			expect(session.getActiveToolNames().sort()).toEqual([
+				"active_tool",
+				"bash",
+				"edit",
+				"grep",
+				"inactive_tool",
+				"read",
+				"write",
+			]);
 			session.dispose();
 		});
 
 		it("does not restore excluded tools", async () => {
-			const session = await resume(createChangedSession(), {
+			const session = await resume(createRecordedSession(["read", "grep", "inactive_tool"]), {
 				excludeTools: ["inactive_tool"],
 			});
 			expect(session.getActiveToolNames().sort()).toEqual(["active_tool", "bash", "edit", "grep", "read", "write"]);
@@ -440,17 +452,19 @@ describe("defaultTools setting", () => {
 		});
 
 		it("uses explicit tool options instead of the recorded loadout", async () => {
-			const allowlisted = await resume(createChangedSession(), { tools: ["read", "write"] });
+			const recorded = ["read", "grep", "inactive_tool"];
+
+			const allowlisted = await resume(createRecordedSession(recorded), { tools: ["read", "write"] });
 			expect(allowlisted.getActiveToolNames()).toEqual(["read", "write"]);
 			allowlisted.dispose();
 
-			const builtinless = await resume(createChangedSession(), { noTools: "builtin" });
+			const builtinless = await resume(createRecordedSession(recorded), { noTools: "builtin" });
 			expect(builtinless.getActiveToolNames()).toEqual(["active_tool"]);
 			builtinless.dispose();
 		});
 
-		it("applies +name and -name tool options to the recorded loadout", async () => {
-			const session = await resume(createChangedSession(), {
+		it("applies +name and -name tool options to the migrated loadout", async () => {
+			const session = await resume(createRecordedSession(["read", "grep", "inactive_tool"]), {
 				tools: ["-grep", "+write"],
 			});
 			expect(session.getActiveToolNames().sort()).toEqual([

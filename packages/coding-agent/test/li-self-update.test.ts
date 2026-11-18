@@ -30,7 +30,7 @@ vi.mock("../src/core/package-manager.ts", () => ({
 		}
 	},
 	isOfflineModeEnabled: () => false,
-	getActiveManagedInstallRoot: () => undefined
+	getActiveManagedInstallRoot: () => undefined,
 }));
 
 vi.mock("../src/core/model-runtime.ts", () => ({

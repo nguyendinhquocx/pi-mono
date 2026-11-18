@@ -38,6 +38,8 @@ import {
 	getCurrentSystemMessage,
 	getCurrentTools,
 	getLatestToolSelectionSnapshot,
+	getTranscriptKnownToolNames,
+	hasToolStateDeltas,
 	retryDelayMs,
 	type ToolSelectionSnapshot,
 } from "@earendil-works/pi-ai";
@@ -1845,12 +1847,6 @@ export class AgentSession {
 		return this._toolDefinitions.get(name)?.definition;
 	}
 
-	/**
-	 * Set active tools by name.
-	 * Only tools in the registry can be enabled. Unknown and hidden tool names are ignored.
-	 * Also rebuilds the system prompt to reflect the new tool set.
-	 * Changes take effect on the next agent turn.
-	 */
 	setActiveToolsByName(toolNames: string[]): void {
 		this._throwIfSessionDataLocked();
 		const previousActive = this.getActiveToolNames();
@@ -1875,16 +1871,12 @@ export class AgentSession {
 			[...toolNames, ...unavailableSelection].filter((name) => !this._toolRegistry.has(name)),
 		);
 		this._setActiveTools(toolNames);
-		// A loadout that deactivates a tool of the restored one replaces it, and its pending tools are
-		// dropped. One that only adds tools, like activating tool_search, keeps them, and so does one
-		// that only deactivates tools outside the restored loadout, such as an extension's own tool that
-		// the restore or reload activated as newly registered.
+		// A restored tool explicitly removed by the caller must not remain pending for late registration.
 		const active = new Set(this.getActiveToolNames());
-		if (previousActive.some((name) => !active.has(name) && this._restoredToolNames.has(name))) {
-			this._pendingToolNames.clear();
+		for (const name of previousActive) {
+			if (!active.has(name) && this._restoredToolNames.has(name)) this._pendingToolNames.delete(name);
 		}
 	}
-
 	private _setActiveTools(toolNames: string[]): void {
 		const tools = this._applyToolLoadout(toolNames);
 		for (const tool of tools) this._pendingToolNames.delete(tool.name);
@@ -1937,6 +1929,9 @@ export class AgentSession {
 	 * ones are appended, so reordering the same names does not change the prompt (#11495).
 	 */
 	private _applyToolLoadout(toolNames: string[]): AgentTool[] {
+		// Preserve logical selection intent across registry/exposure filtering, as Li snapshots
+		// must remember selected-but-unavailable extension tools for later registration.
+		this._selectedToolNames = new Set([...this._selectedToolNames, ...toolNames]);
 		const requested = new Set(toolNames);
 		const kept = this.getActiveToolNames().filter((name) => requested.has(name));
 		const tools = [...new Set([...kept, ...requested])].flatMap((name) => {
@@ -2213,41 +2208,80 @@ export class AgentSession {
 	private _restoreToolsFromTranscript(modifiers: readonly string[] = []): void {
 		this._pendingToolNames.clear();
 		this._restoredToolNames.clear();
-		// All system messages on the branch, including those before a compaction. Compaction snapshots
-		// are derived from these, so replaying them gives the current loadout.
+		const messages = this.sessionManager.buildSessionContext().messages;
 		const systemMessages = this.sessionManager
 			.getBranch()
 			.flatMap((entry) => (entry.type === "message" && entry.message.role === "system" ? [entry.message] : []));
-		// No recorded loadout: keep the current tools.
-		if (systemMessages.length === 0) return;
-		// Tools the branch ever added or removed. Removed tools stay inactive.
-		const mentioned = new Set(
-			systemMessages
-				.flatMap((message) => [...(message.toolsAdded ?? []), ...(message.toolsRemoved ?? [])])
-				.map((tool) => tool.name),
+		const snapshot = getLatestToolSelectionSnapshot(systemMessages);
+		const current = getCurrentSystemMessage(systemMessages);
+		if (!snapshot && !current && messages.length === 0) return;
+		this._selectedToolNames = new Set();
+		const knownNames = getTranscriptKnownToolNames(systemMessages);
+		const previouslySelectedNames = new Set(
+			systemMessages.flatMap((message) => message.toolSelectionSnapshot?.selectedNames ?? []),
 		);
-		// Extension tools the branch never mentioned were registered after it recorded its loadout, so
-		// they are activated like newly registered tools. Built-in tools follow `defaultTools` instead.
-		const newTools = [...this._toolRegistry.keys()].filter(
-			(name) =>
-				!mentioned.has(name) && !this._baseToolDefinitions.has(name) && this._isActivatedOnRegistration(name),
+		const candidates = this._defaultCandidateNames().filter(
+			(name) => !knownNames.has(name) && !previouslySelectedNames.has(name),
 		);
-		// The recorded loadout plus the new tools, with `--tools +name`/`-name` applied.
-		const names = applyToolModifiers(
-			[...getCurrentTools(systemMessages).map((tool) => tool.name), ...newTools],
-			modifiers,
-		);
-		// Recorded tools that are not registered yet, such as MCP tools of servers still connecting, are
-		// activated when they register. Excluded tools never register, so they are not kept pending.
-		this._pendingToolNames = new Set(names.filter((name) => this._isAllowedTool(name)));
+		const deltaHistory = hasToolStateDeltas(systemMessages);
+
+		let baseNames: string[];
+		if (snapshot) {
+			this._toolSelectionSource = snapshot.source;
+			if (snapshot.source === "explicit") {
+				// Recorded explicit selection: keep the names exactly, never merge defaults.
+				this._lateMergeDefaults = false;
+				baseNames = [...snapshot.selectedNames];
+			} else if (snapshot.selectedNames.length > 0) {
+				this._lateMergeDefaults = true;
+				baseNames = [...snapshot.selectedNames, ...candidates];
+			} else if (deltaHistory) {
+				// An empty default selection backed by tool history stays empty: the transcript
+				// records a real selection that ended empty, so never merge unknown candidates.
+				this._lateMergeDefaults = false;
+				baseNames = [];
+			} else {
+				// Without any delta the empty selection only marks default mode, so current
+				// defaults apply silently.
+				this._lateMergeDefaults = true;
+				baseNames = candidates;
+			}
+		} else {
+			// Legacy transcript without a snapshot: replay deltas when present; if there
+			// are none, keep the existing conservative default migration but do it silently.
+			const replayed = getCurrentTools(systemMessages).map((tool) => tool.name);
+			if (!deltaHistory) {
+				this._lateMergeDefaults = true;
+				baseNames = candidates;
+			} else if (replayed.length === 0) {
+				this._lateMergeDefaults = false;
+				baseNames = [];
+			} else {
+				this._lateMergeDefaults = true;
+				baseNames = [...replayed, ...candidates];
+			}
+		}
+		const names = applyToolModifiers(baseNames, modifiers);
+		// Keep upstream late-registration semantics for names actually recorded on this branch.
 		this._restoredToolNames = new Set(
 			applyToolModifiers(
 				getCurrentTools(systemMessages).map((tool) => tool.name),
 				modifiers,
 			),
 		);
-		// Ignores names that are not registered.
+		this._lateActivationToolNames = new Set(names);
+		this._lateKnownToolNames = new Set([...knownNames, ...previouslySelectedNames]);
+		this._pendingToolNames = new Set(names.filter((name) => this._isAllowedTool(name)));
 		this._setActiveTools(names);
+	}
+
+	private _defaultCandidateNames(): string[] {
+		if (!this._usesDefaultTools) return [];
+		const settingNames = applyToolModifiers(
+			this.settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES,
+			this._defaultToolModifiers,
+		);
+		return [...new Set([...settingNames, ...this._registeredDefaultExtensionToolNames])];
 	}
 
 	private _currentToolSelectionSnapshot(): ToolSelectionSnapshot {
