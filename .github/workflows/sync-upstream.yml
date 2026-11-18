@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: write
-  workflows: write
 
 jobs:
   sync:
@@ -48,11 +47,11 @@ jobs:
             done
             git commit --no-edit --no-verify || true
           fi
-          # Preserve fork's own sync workflow (toolkit-injected; upstream không có file này)
-          git rm -rf .github/workflows/sync-upstream.yml 2>/dev/null || true
-          git checkout "$PRE_MERGE" -- .github/workflows/sync-upstream.yml 2>/dev/null || true
-          git add .github/workflows/sync-upstream.yml 2>/dev/null || true
-          git diff --cached --quiet HEAD || git commit -m "chore: preserve fork sync workflow" --no-verify || true
+          # Preserve .github/workflows/ về pre-merge state (GITHUB_TOKEN restriction — xem comment đầu template)
+          git rm -r -q --ignore-unmatch .github/workflows 2>/dev/null || true
+          git checkout "$PRE_MERGE" -- .github/workflows 2>/dev/null || true
+          git add .github/workflows 2>/dev/null || true
+          git diff --cached --quiet HEAD || git commit -m "chore: preserve fork workflows (pre-merge state)" --no-verify || true
           git push origin "$FORK_BRANCH"
           echo "Sync completed: $FORK_BRANCH merged with upstream/$UPSTREAM_BRANCH."
           echo "All done."
