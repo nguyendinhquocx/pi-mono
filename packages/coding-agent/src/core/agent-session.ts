@@ -30,14 +30,14 @@ import {
 	type BeforeToolCallResult,
 	type PrepareNextTurnContext,
 	runToolCall,
+	type StreamFn,
 	type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import {
 	contentText,
 	getCurrentSystemMessage,
+	getCurrentTools,
 	getLatestToolSelectionSnapshot,
-	getTranscriptKnownToolNames,
-	hasToolStateDeltas,
 	retryDelayMs,
 	type ToolSelectionSnapshot,
 } from "@earendil-works/pi-ai";
@@ -51,6 +51,7 @@ import type {
 	TextContent,
 	ToolResultMessage,
 	Usage,
+	UserMessage,
 } from "@earendil-works/pi-ai/compat";
 import {
 	clampThinkingLevel,
@@ -199,6 +200,18 @@ import {
 	VIRTUAL_MODEL_STATE_ENTRY,
 	type VirtualModelStateData,
 } from "./virtual-models.ts";
+
+/**
+ * Stream functions that resolve auth through a given ModelRuntime themselves, such as the one
+ * createAgentSession installs. Summaries sent through them must not pass pre-resolved credentials:
+ * the runtime would take them as an explicit API key instead of the stored OAuth login (#11520).
+ */
+const runtimeStreamFunctions = new WeakMap<StreamFn, ModelRuntime>();
+
+/** Mark `streamFn` as resolving auth through `modelRuntime` on its own. */
+export function markRuntimeStreamFunction(streamFn: StreamFn, modelRuntime: ModelRuntime): void {
+	runtimeStreamFunctions.set(streamFn, modelRuntime);
+}
 
 // ============================================================================
 // Skill Block Parsing
@@ -528,6 +541,22 @@ function getRuntimeBuildHash(): string {
 // AgentSession Class
 // ============================================================================
 
+/**
+ * Index of the model to cycle to, or undefined when there is nothing to switch to.
+ * When the current model is not in the list (currentIndex -1), forward picks the first
+ * entry and backward the last, so a one-entry list still selects its only model.
+ */
+function getNextCycleIndex(
+	currentIndex: number,
+	length: number,
+	direction: "forward" | "backward",
+): number | undefined {
+	if (length === 0) return undefined;
+	if (currentIndex === -1) return direction === "forward" ? 0 : length - 1;
+	if (length === 1) return undefined;
+	return direction === "forward" ? (currentIndex + 1) % length : (currentIndex - 1 + length) % length;
+}
+
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -539,6 +568,7 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
+	private _promptPreflightCount = 0;
 	private _agentRunAbortRequested = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
@@ -547,6 +577,8 @@ export class AgentSession {
 	private _steeringMessages: string[] = [];
 	/** Tracks pending follow-up messages for UI display. Removed when delivered. */
 	private _followUpMessages: string[] = [];
+	/** Queued user messages whose images are normalized when they are delivered. */
+	private _queuedMessagesWithImages = new WeakSet<AgentMessage>();
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
 	/** Context-only custom messages queued during a run, flushed once the current turn's tool results are in. */
@@ -579,7 +611,6 @@ export class AgentSession {
 	private _entryIdsByMessage = new WeakMap<object, string>();
 	private readonly _boundaryDispatchedMessages = new WeakSet<object>();
 	private _lastAssistantMessage: AssistantMessage | undefined;
-	private _lastAssistantToolResults: AgentMessage[] = [];
 	private _lastActivityOutcome: AgentActivityOutcome = "completed";
 	private _isBeforeSettle = false;
 	private _abortDuringBeforeSettle = false;
@@ -595,9 +626,11 @@ export class AgentSession {
 	/**
 	 * Tools of the restored or reloaded loadout that are not registered yet, such as tools of MCP
 	 * servers that are still connecting. They are activated when they are registered, and dropped when
-	 * `setActiveToolsByName()` deactivates a tool or the next agent run starts.
+	 * `setActiveToolsByName()` deactivates a tool of that loadout or the next agent run starts.
 	 */
 	private _pendingToolNames = new Set<string>();
+	/** The restored or reloaded loadout that `_pendingToolNames` belongs to. */
+	private _restoredToolNames = new Set<string>();
 	private _usesDefaultTools: boolean;
 	private _defaultToolModifiers: string[];
 	/** Logical tool selection recorded before registry availability, allowlist, and exposure filters. */
@@ -636,6 +669,8 @@ export class AgentSession {
 	private _extensionShutdownHandler?: ShutdownHandler;
 	private _extensionErrorListener?: ExtensionErrorListener;
 	private _extensionErrorUnsubscriber?: () => void;
+	// Set by bindExtensions(): reload() restarts extensions only if the host started them.
+	private _extensionsBound = false;
 
 	private _modelRuntime: ModelRuntime;
 	private _cacheWarmer?: Pick<CacheWarmer, "cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed">;
@@ -802,6 +837,9 @@ export class AgentSession {
 		if (this.agent.streamFunction === streamSimple) {
 			return { ...(await this._getRequiredRequestAuth(model, signal)), thinkingLevel };
 		}
+		if (runtimeStreamFunctions.get(this.agent.streamFunction) === this._modelRuntime) {
+			return { model, thinkingLevel };
+		}
 
 		try {
 			const result = await this._modelRuntime.getAuth(model, { signal });
@@ -830,22 +868,47 @@ export class AgentSession {
 		return model?.provider === message.provider && model.id === message.model ? model : undefined;
 	}
 
-	/**
-	 * Record the selection on the current branch when the branch implies another one, so a resume
-	 * restores it. Tree navigation can leave the latest `model_change` on another branch; responses
-	 * cannot record a virtual selection because they name physical models. Responses do record a
-	 * physical selection unless the branch holds a virtual one; checking a physical selection against
-	 * responses would record it on every prompt while `prepareRequest` redirects to another model.
-	 */
+	/** Record the live model and thinking level on the current branch, so a resume restores them. */
 	private _recordSelection(): void {
+		const branch = this.sessionManager.getBranch();
+		this._recordModelSelection(branch);
+		this._recordThinkingLevel(branch);
+	}
+
+	/**
+	 * Record the model on the current branch when the branch implies another one. Tree navigation
+	 * can leave the latest `model_change` on another branch; responses cannot record a virtual
+	 * selection because they name physical models. Responses do record a physical selection unless
+	 * the branch holds a virtual one; checking a physical selection against responses would record
+	 * it on every prompt while `prepareRequest` redirects to another model.
+	 */
+	private _recordModelSelection(branch: SessionEntry[]): void {
 		const model = this.model;
 		if (!model) return;
 		const getModel = (provider: string, modelId: string) => this._modelRuntime.getModel(provider, modelId);
-		const recorded = getBranchSelection(this.sessionManager.getBranch(), getModel);
+		const recorded = getBranchSelection(branch, getModel);
 		if (!recorded || (recorded.provider === model.provider && recorded.modelId === model.id)) return;
 		const recordedModel = getModel(recorded.provider, recorded.modelId);
 		if (!isVirtualModel(model) && !(recordedModel && isVirtualModel(recordedModel))) return;
 		this.sessionManager.appendModelChange(model.provider, model.id);
+	}
+
+	/**
+	 * Record the thinking level on the current branch when the branch implies another one (#11451).
+	 * Tree navigation can leave the latest `thinking_level_change` on another branch. The recorded
+	 * level is compared after clamping to the current model, so a level clamped on resume (e.g.
+	 * `xhigh` running as `high`) is not recorded over the requested one.
+	 */
+	private _recordThinkingLevel(branch: SessionEntry[]): void {
+		const recorded = branch.findLast((entry) => entry.type === "thinking_level_change");
+		if (!recorded) return;
+		const recordedLevel = recorded.thinkingLevel as ThinkingLevel;
+		const availableLevels = this.getAvailableThinkingLevels();
+		const effective = availableLevels.includes(recordedLevel)
+			? recordedLevel
+			: this._clampThinkingLevel(recordedLevel, availableLevels);
+		if (effective === this.thinkingLevel) return;
+		this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
 	}
 
 	/** The model whose limits apply to the conversation. */
@@ -1363,20 +1426,24 @@ export class AgentSession {
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempted = false;
 			const messageText = contentText(event.message.content, "");
-			if (messageText) {
-				// Check steering queue first
-				const steeringIndex = this._steeringMessages.indexOf(messageText);
-				if (steeringIndex !== -1) {
-					this._steeringMessages.splice(steeringIndex, 1);
+			// Check steering queue first
+			const steeringIndex = this._steeringMessages.indexOf(messageText);
+			if (steeringIndex !== -1) {
+				this._steeringMessages.splice(steeringIndex, 1);
+				this._emitQueueUpdate();
+			} else {
+				// Check follow-up queue
+				const followUpIndex = this._followUpMessages.indexOf(messageText);
+				if (followUpIndex !== -1) {
+					this._followUpMessages.splice(followUpIndex, 1);
 					this._emitQueueUpdate();
-				} else {
-					// Check follow-up queue
-					const followUpIndex = this._followUpMessages.indexOf(messageText);
-					if (followUpIndex !== -1) {
-						this._followUpMessages.splice(followUpIndex, 1);
-						this._emitQueueUpdate();
-					}
 				}
+			}
+			// Normalize queued images at delivery, before events and persistence see the message,
+			// so they get the same resize as idle prompts with the current model's limits (#11738).
+			if (this._queuedMessagesWithImages.has(event.message)) {
+				this._queuedMessagesWithImages.delete(event.message);
+				await this._normalizeQueuedMessageImages(event.message);
 			}
 		}
 
@@ -1436,7 +1503,6 @@ export class AgentSession {
 		// extension and listener dispatch above also picks up messages that turn_end
 		// handlers queued.
 		if (event.type === "turn_end") {
-			this._lastAssistantToolResults = event.toolResults;
 			this._flushPendingCustomMessages();
 		}
 	};
@@ -1480,7 +1546,24 @@ export class AgentSession {
 		return undefined;
 	}
 
-	private _omitRecoveryAttempt(message: AssistantMessage, toolResults: AgentMessage[] = []): void {
+	/**
+	 * Persistently omit a failed attempt and its tool results from model context. Results are
+	 * found in the projected context, so the pair stays together whether the attempt comes from
+	 * the current run or a resumed session. An unpaired result fails the next request (#11227).
+	 */
+	private _omitRecoveryAttempt(message: AssistantMessage): void {
+		const toolCallIds = new Set(message.content.flatMap((block) => (block.type === "toolCall" ? [block.id] : [])));
+		// A context edit replaces the projected copy, so match it by source entry as well.
+		const entryId = this._findPersistedMessageEntryId(message);
+		const messages = this.agent.state.messages;
+		const index = messages.findIndex(
+			(m) => m === message || (entryId !== undefined && this._entryIdsByMessage.get(m) === entryId),
+		);
+		const toolResults: AgentMessage[] = [];
+		for (const m of index < 0 ? [] : messages.slice(index + 1)) {
+			if (m.role === "assistant") break;
+			if (m.role === "toolResult" && toolCallIds.has(m.toolCallId)) toolResults.push(m);
+		}
 		const targets = [message, ...toolResults];
 		const targetIds = targets.map((target) => this._findPersistedMessageEntryId(target));
 		const unresolvedProjectedTarget = targets.some(
@@ -1792,6 +1875,14 @@ export class AgentSession {
 			[...toolNames, ...unavailableSelection].filter((name) => !this._toolRegistry.has(name)),
 		);
 		this._setActiveTools(toolNames);
+		// A loadout that deactivates a tool of the restored one replaces it, and its pending tools are
+		// dropped. One that only adds tools, like activating tool_search, keeps them, and so does one
+		// that only deactivates tools outside the restored loadout, such as an extension's own tool that
+		// the restore or reload activated as newly registered.
+		const active = new Set(this.getActiveToolNames());
+		if (previous.some((name) => !active.has(name) && this._restoredToolNames.has(name))) {
+			this._pendingToolNames.clear();
+		}
 	}
 
 	private _setActiveTools(toolNames: string[]): void {
@@ -1841,14 +1932,14 @@ export class AgentSession {
 	 * the registered, non-hidden ones; they are declared to the model. Active tools with a
 	 * `prepareLoadout` hook can change the declared descriptions and hide declarations from
 	 * requests (see {@link _installHiddenDeclarationsProjection}).
+	 *
+	 * The active tools are a set: tools that stay active keep their current order and newly active
+	 * ones are appended, so reordering the same names does not change the prompt (#11495).
 	 */
 	private _applyToolLoadout(toolNames: string[]): AgentTool[] {
-		// Internal refreshes and prompt preparation can only see the active, provider-declarable
-		// set. Keep the logical selection union so unavailable, excluded, or hidden selected names
-		// remain in the transcript snapshot. The public setActiveToolsByName() resets intent before
-		// reaching here when the owner/extension deliberately changes it.
-		this._selectedToolNames = new Set([...this._selectedToolNames, ...toolNames]);
-		const tools = [...new Set(toolNames)].flatMap((name) => {
+		const requested = new Set(toolNames);
+		const kept = this.getActiveToolNames().filter((name) => requested.has(name));
+		const tools = [...new Set([...kept, ...requested])].flatMap((name) => {
 			const tool = this._toolRegistry.get(name);
 			return tool && this._getToolExposure(name) !== "hidden" && this._isActivatable(name) ? [tool] : [];
 		});
@@ -2121,62 +2212,41 @@ export class AgentSession {
 	 */
 	private _restoreToolsFromTranscript(modifiers: readonly string[] = []): void {
 		this._pendingToolNames.clear();
-		const messages = this.sessionManager.buildSessionContext().messages;
-		const snapshot = getLatestToolSelectionSnapshot(messages);
-		const current = getCurrentSystemMessage(messages);
-		if (!snapshot && !current && messages.length === 0) return;
-		this._selectedToolNames = new Set();
-		const knownNames = getTranscriptKnownToolNames(messages);
-		const previouslySelectedNames = new Set(
-			messages.flatMap((message) =>
-				message.role === "system" ? (message.toolSelectionSnapshot?.selectedNames ?? []) : [],
+		this._restoredToolNames.clear();
+		// All system messages on the branch, including those before a compaction. Compaction snapshots
+		// are derived from these, so replaying them gives the current loadout.
+		const systemMessages = this.sessionManager
+			.getBranch()
+			.flatMap((entry) => (entry.type === "message" && entry.message.role === "system" ? [entry.message] : []));
+		// No recorded loadout: keep the current tools.
+		if (systemMessages.length === 0) return;
+		// Tools the branch ever added or removed. Removed tools stay inactive.
+		const mentioned = new Set(
+			systemMessages
+				.flatMap((message) => [...(message.toolsAdded ?? []), ...(message.toolsRemoved ?? [])])
+				.map((tool) => tool.name),
+		);
+		// Extension tools the branch never mentioned were registered after it recorded its loadout, so
+		// they are activated like newly registered tools. Built-in tools follow `defaultTools` instead.
+		const newTools = [...this._toolRegistry.keys()].filter(
+			(name) =>
+				!mentioned.has(name) && !this._baseToolDefinitions.has(name) && this._isActivatedOnRegistration(name),
+		);
+		// The recorded loadout plus the new tools, with `--tools +name`/`-name` applied.
+		const names = applyToolModifiers(
+			[...getCurrentTools(systemMessages).map((tool) => tool.name), ...newTools],
+			modifiers,
+		);
+		// Recorded tools that are not registered yet, such as MCP tools of servers still connecting, are
+		// activated when they register. Excluded tools never register, so they are not kept pending.
+		this._pendingToolNames = new Set(names.filter((name) => this._isAllowedTool(name)));
+		this._restoredToolNames = new Set(
+			applyToolModifiers(
+				getCurrentTools(systemMessages).map((tool) => tool.name),
+				modifiers,
 			),
 		);
-		const candidates = this._defaultCandidateNames().filter(
-			(name) => !knownNames.has(name) && !previouslySelectedNames.has(name),
-		);
-		const deltaHistory = hasToolStateDeltas(messages);
-
-		let baseNames: string[];
-		if (snapshot) {
-			this._toolSelectionSource = snapshot.source;
-			if (snapshot.source === "explicit") {
-				// Recorded explicit selection: keep the names exactly, never merge defaults.
-				this._lateMergeDefaults = false;
-				baseNames = [...snapshot.selectedNames];
-			} else if (snapshot.selectedNames.length > 0) {
-				this._lateMergeDefaults = true;
-				baseNames = [...snapshot.selectedNames, ...candidates];
-			} else if (deltaHistory) {
-				// An empty default selection backed by tool history stays empty: the transcript
-				// records a real selection that ended empty, so never merge unknown candidates.
-				this._lateMergeDefaults = false;
-				baseNames = [];
-			} else {
-				// Without any delta the empty selection only marks default mode, so current
-				// defaults apply silently.
-				this._lateMergeDefaults = true;
-				baseNames = candidates;
-			}
-		} else {
-			// Legacy transcript without a snapshot: replay deltas when present; if there
-			// are none, keep the existing conservative default migration but do it silently.
-			const replayed = (current?.toolsAdded ?? []).map((tool) => tool.name);
-			if (!deltaHistory) {
-				this._lateMergeDefaults = true;
-				baseNames = candidates;
-			} else if (replayed.length === 0) {
-				this._lateMergeDefaults = false;
-				baseNames = [];
-			} else {
-				this._lateMergeDefaults = true;
-				baseNames = [...replayed, ...candidates];
-			}
-		}
-		const names = applyToolModifiers(baseNames, modifiers);
-		this._lateActivationToolNames = new Set(names);
-		this._lateKnownToolNames = new Set([...knownNames, ...previouslySelectedNames]);
-		this._pendingToolNames = new Set(names.filter((name) => this._isAllowedTool(name)));
+		// Ignores names that are not registered.
 		this._setActiveTools(names);
 	}
 
@@ -2385,9 +2455,7 @@ export class AgentSession {
 
 	private async _handlePostAgentRun(): Promise<boolean> {
 		const message = this._lastAssistantMessage;
-		const toolResults = this._lastAssistantToolResults;
 		this._lastAssistantMessage = undefined;
-		this._lastAssistantToolResults = [];
 		if (this._agentRunAbortRequested) {
 			this._finishCancelledRetry();
 			return false;
@@ -2414,7 +2482,7 @@ export class AgentSession {
 			this._retryAttempt = 0;
 		}
 
-		if (await this._checkCompaction(message, true, toolResults)) {
+		if (await this._checkCompaction(message)) {
 			return !this._agentRunAbortRequested;
 		}
 
@@ -2518,11 +2586,31 @@ export class AgentSession {
 			}
 		}
 
-		if (this._compactionAbortController !== undefined) {
+		if (this._compactionAbortController !== undefined || this._branchSummaryAbortController !== undefined) {
 			throw new Error(
 				"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.",
 			);
 		}
+
+		// Reserve the context through async input hooks and auth checks so tree navigation cannot
+		// start meanwhile (#9154). _startRun marks the run active synchronously, so there is no gap.
+		this._promptPreflightCount++;
+		let trigger: BeforeAgentStartTrigger | undefined;
+		try {
+			trigger = await this._preparePrompt(text, options);
+		} finally {
+			this._promptPreflightCount--;
+		}
+		if (trigger) await this._startRun(trigger, () => preflightResult?.("started"));
+	}
+
+	/**
+	 * Run input hooks, expand templates, queue while streaming, and validate model and auth.
+	 * Returns the run trigger, or undefined when the prompt was handled or queued.
+	 */
+	private async _preparePrompt(text: string, options?: PromptOptions): Promise<BeforeAgentStartTrigger | undefined> {
+		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
+		const preflightResult = options?.preflightResult;
 
 		// Emit input event for extension interception (before skill/template expansion)
 		const processedInput = await this._runInputHandlers(
@@ -2533,7 +2621,7 @@ export class AgentSession {
 		);
 		if (!processedInput) {
 			preflightResult?.("handled");
-			return;
+			return undefined;
 		}
 		const { text: currentText, images: currentImages } = processedInput;
 
@@ -2557,7 +2645,7 @@ export class AgentSession {
 				await this._queueSteer(expandedText, currentImages);
 			}
 			preflightResult?.("queued");
-			return;
+			return undefined;
 		}
 
 		// Validate model
@@ -2580,9 +2668,7 @@ export class AgentSession {
 			throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
 		}
 
-		await this._startRun({ messageType: "user", prompt: expandedText, images: currentImages }, () =>
-			preflightResult?.("started"),
-		);
+		return { messageType: "user", prompt: expandedText, images: currentImages };
 	}
 
 	/**
@@ -2719,11 +2805,9 @@ export class AgentSession {
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.steer({
-			role: "user",
-			content,
-			timestamp: Date.now(),
-		});
+		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
+		if (images?.length) this._queuedMessagesWithImages.add(message);
+		this.agent.steer(message);
 	}
 
 	/**
@@ -2736,7 +2820,24 @@ export class AgentSession {
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.followUp({ role: "user", content, timestamp: Date.now() });
+		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
+		if (images?.length) this._queuedMessagesWithImages.add(message);
+		this.agent.followUp(message);
+	}
+
+	/** Replace a queued user message's images in place with normalized ones, appending hints to its text. */
+	private async _normalizeQueuedMessageImages(message: UserMessage): Promise<void> {
+		if (typeof message.content === "string") return;
+		const [first, ...rest] = message.content;
+		if (first?.type !== "text") return;
+		const images = rest.filter((block): block is ImageContent => block.type === "image");
+		const normalized = await this._normalizePromptImages(images);
+		const text = normalized.hints.length > 0 ? `${first.text}\n\n${normalized.hints.join("\n")}` : first.text;
+		message.content = [
+			{ type: "text", text },
+			...rest.filter((block) => block.type !== "image"),
+			...normalized.images,
+		];
 	}
 
 	/**
@@ -3017,14 +3118,10 @@ export class AgentSession {
 		const scopedModels = this._scopedModels.filter((scoped) =>
 			availableIds.has(`${scoped.model.provider}\0${scoped.model.id}`),
 		);
-		if (scopedModels.length <= 1) return undefined;
-
 		const currentModel = this.model;
-		let currentIndex = scopedModels.findIndex((sm) => modelsAreEqual(sm.model, currentModel));
-
-		if (currentIndex === -1) currentIndex = 0;
-		const len = scopedModels.length;
-		const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
+		const currentIndex = scopedModels.findIndex((sm) => modelsAreEqual(sm.model, currentModel));
+		const nextIndex = getNextCycleIndex(currentIndex, scopedModels.length, direction);
+		if (nextIndex === undefined) return undefined;
 		const next = scopedModels[nextIndex];
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(next.model, next.thinkingLevel);
 
@@ -3053,14 +3150,10 @@ export class AgentSession {
 		options: ModelMutationOptions,
 	): Promise<ModelCycleResult | undefined> {
 		const availableModels = this._modelRuntime.getAvailableSnapshot();
-		if (availableModels.length <= 1) return undefined;
-
 		const currentModel = this.model;
-		let currentIndex = availableModels.findIndex((m) => modelsAreEqual(m, currentModel));
-
-		if (currentIndex === -1) currentIndex = 0;
-		const len = availableModels.length;
-		const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
+		const currentIndex = availableModels.findIndex((m) => modelsAreEqual(m, currentModel));
+		const nextIndex = getNextCycleIndex(currentIndex, availableModels.length, direction);
+		if (nextIndex === undefined) return undefined;
 		const nextModel = availableModels[nextIndex];
 
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(nextModel);
@@ -3429,11 +3522,7 @@ export class AgentSession {
 	 * @param skipAbortedCheck If false, include aborted messages (for pre-prompt check). Default: true
 	 * @returns Whether the post-run loop should call `agent.continue()` for overflow recovery or queued messages
 	 */
-	private async _checkCompaction(
-		assistantMessage: AssistantMessage,
-		skipAbortedCheck = true,
-		toolResults: AgentMessage[] = [],
-	): Promise<boolean> {
+	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings(this.model);
 		if (!settings.enabled) return false;
 
@@ -3525,7 +3614,7 @@ export class AgentSession {
 
 			// Persistently omit the selected final attempt before post-run recovery compaction.
 			this._overflowRecoveryAttempted = true;
-			this._omitRecoveryAttempt(assistantMessage, toolResults);
+			this._omitRecoveryAttempt(assistantMessage);
 			const retry = await this._runAutoCompaction("overflow", willRetry);
 			if (retry) this._failedResponse = assistantMessage;
 			return retry;
@@ -4859,6 +4948,7 @@ export class AgentSession {
 			this._extensionErrorListener = bindings.onError;
 		}
 
+		this._extensionsBound = true;
 		this._applyExtensionBindings(this._extensionRunner);
 		await this._ensureSessionAccessGuard();
 		await this._extensionRunner.emit(this._sessionStartEvent);
@@ -5282,6 +5372,13 @@ export class AgentSession {
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
 		this._throwIfSessionDataLocked();
+		if (this.isStreaming) {
+			throw new Error("Wait for the current response to finish before reloading.");
+		}
+		if (this.isCompacting) {
+			throw new Error("Wait for compaction to finish before reloading.");
+		}
+
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();
 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
@@ -5307,18 +5404,14 @@ export class AgentSession {
 		}
 		// Tools the new extensions register later, such as MCP tools, are pending until then.
 		for (const name of this.getActiveToolNames()) this._pendingToolNames.add(name);
+		this._restoredToolNames = new Set(this.getActiveToolNames());
 		this._buildRuntime({
 			activeToolNames: [...this.getActiveToolNames(), ...addedDefaultTools],
 			flagValues: previousFlagValues,
 			includeAllExtensionTools: true,
 		});
 
-		const hasBindings =
-			this._extensionUIContext ||
-			this._extensionCommandContextActions ||
-			this._extensionShutdownHandler ||
-			this._extensionErrorListener;
-		if (hasBindings) {
+		if (this._extensionsBound) {
 			await options?.beforeSessionStart?.();
 			await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
 			this._extensionRunner.reportUnhandledMcpServers();
@@ -5596,8 +5689,8 @@ export class AgentSession {
 		targetId: string,
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
-		this._throwIfSessionDataLocked();
-		if (this.isStreaming) {
+this._throwIfSessionDataLocked();
+		if (this.isStreaming || this._promptPreflightCount > 0) {
 			throw new Error("Wait for the current response to finish before navigating the session tree.");
 		}
 		if (this.isCompacting) {
@@ -5647,7 +5740,8 @@ export class AgentSession {
 		};
 
 		// Set up abort controller for summarization
-		this._branchSummaryAbortController = new AbortController();
+		const abortController = new AbortController();
+		this._branchSummaryAbortController = abortController;
 
 		try {
 			let extensionSummary: { summary: string; details?: unknown; usage?: Usage } | undefined;
@@ -5658,7 +5752,7 @@ export class AgentSession {
 				const result = (await this._extensionRunner.emit({
 					type: "session_before_tree",
 					preparation,
-					signal: this._branchSummaryAbortController.signal,
+					signal: abortController.signal,
 				})) as SessionBeforeTreeResult | undefined;
 
 				if (result?.cancel) {
@@ -5687,7 +5781,7 @@ export class AgentSession {
 			let summaryDetails: unknown;
 			let summaryUsage: Usage | undefined;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
-				const signal = this._branchSummaryAbortController.signal;
+				const signal = abortController.signal;
 				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
 				const result = await generateBranchSummary(entriesToSummarize, {
 					...(await this._getSummarizationRequestAuth(this.model!, signal)),
@@ -5772,7 +5866,8 @@ export class AgentSession {
 			// its tuning when the owner moves the leaf (SPEC-2026-11-06 r6 C4).
 			this._restoreToolsFromTranscript(this._defaultToolModifiers);
 
-			// Emit session_tree event
+			// The selected context is installed; session_tree handlers may now prompt or navigate again.
+			this._branchSummaryAbortController = undefined;
 			await this._extensionRunner.emit({
 				type: "session_tree",
 				newLeafId: this.sessionManager.getLeafId(),
@@ -5785,7 +5880,10 @@ export class AgentSession {
 
 			return { editorText, cancelled: false, summaryEntry };
 		} finally {
-			this._branchSummaryAbortController = undefined;
+			// A navigation started from session_tree owns the controller now; do not clear it.
+			if (this._branchSummaryAbortController === abortController) {
+				this._branchSummaryAbortController = undefined;
+			}
 			this._resolveIdleWaitIfIdle();
 		}
 	}
@@ -5975,9 +6073,9 @@ export class AgentSession {
 	// =========================================================================
 
 	/**
-	 * Get text content of last assistant message.
+	 * Get text content of the last assistant reply.
 	 * Useful for /copy command.
-	 * @returns Text content, or undefined if no assistant message exists
+	 * @returns Text content, or undefined if no assistant message exists or the last reply has no text
 	 */
 	getLastAssistantText(): string | undefined {
 		const lastAssistant = this.messages
@@ -5986,8 +6084,9 @@ export class AgentSession {
 			.find((m) => {
 				if (m.role !== "assistant") return false;
 				const msg = m as AssistantMessage;
-				// Skip aborted messages with no content
-				if (msg.stopReason === "aborted" && msg.content.length === 0) return false;
+				// Skip messages without text from a turn that did not end normally: aborted, failed or only
+				// calling tools (#12119). A reply that ended normally stays the last reply even without text.
+				if (msg.stopReason !== "stop" && !msg.content.some((c) => c.type === "text" && c.text.trim())) return false;
 				return true;
 			});
 

@@ -5,10 +5,13 @@
 
 import {
 	type AssistantMessage,
+	type ClientIdentity,
 	EventStream,
 	getCurrentTools,
 	getToolStateChanges,
+	mergeClientIdentity,
 	normalizeContext,
+	PI_ATTRIBUTION,
 	type SystemMessage,
 	type ToolResultMessage,
 	type ToolStateChanges,
@@ -30,6 +33,12 @@ import type {
 } from "./types.ts";
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
+
+/**
+ * Request identity of agent loops: pi-ai's defaults with provider attribution to pi. `AgentLoopConfig.identity`
+ * overrides it field by field.
+ */
+export const DEFAULT_AGENT_IDENTITY: ClientIdentity = { attribution: PI_ATTRIBUTION };
 
 /**
  * Start an agent loop with a new prompt message.
@@ -403,6 +412,7 @@ async function streamAssistantResponse(
 	const response = await streamFunction(config.model, llmContext, {
 		...config,
 		apiKey: resolvedApiKey,
+		identity: mergeClientIdentity(DEFAULT_AGENT_IDENTITY, config.identity),
 		signal,
 	});
 	// Record the requested level, whichever stream function answered.
@@ -571,10 +581,6 @@ async function executeToolCallsSequential(
 		await emitToolResultMessage(toolResultMessage, emit);
 		finalizedCalls.push(finalized);
 		messages.push(toolResultMessage);
-
-		if (signal?.aborted) {
-			break;
-		}
 	}
 
 	return {
@@ -610,9 +616,6 @@ async function executeToolCallsParallel(
 			} satisfies FinalizedToolCallOutcome;
 			await emitToolExecutionEnd(finalized, emit);
 			finalizedCalls.push(finalized);
-			if (signal?.aborted) {
-				break;
-			}
 			continue;
 		}
 
@@ -638,9 +641,6 @@ async function executeToolCallsParallel(
 			await emitToolExecutionEnd(finalized, emit);
 			return finalized;
 		});
-		if (signal?.aborted) {
-			break;
-		}
 	}
 
 	const orderedFinalizedCalls = await Promise.all(
@@ -713,6 +713,15 @@ async function prepareToolCall(
 	signal: AbortSignal | undefined,
 	tools: readonly AgentTool<any>[] = currentContext.tools ?? [],
 ): Promise<PreparedToolCall | ImmediateToolCallOutcome> {
+	// Once aborted, skip preparation and the hooks; callers still record this result, so no call
+	// is left without one (#9986).
+	if (signal?.aborted) {
+		return {
+			kind: "immediate",
+			result: createErrorToolResult("Operation aborted"),
+			isError: true,
+		};
+	}
 	const tool = tools.find((t) => t.name === toolCall.name);
 	if (!tool) {
 		return {
@@ -753,13 +762,6 @@ async function prepareToolCall(
 					isError: true,
 				};
 			}
-		}
-		if (signal?.aborted) {
-			return {
-				kind: "immediate",
-				result: createErrorToolResult("Operation aborted"),
-				isError: true,
-			};
 		}
 		return {
 			kind: "prepared",
@@ -805,8 +807,9 @@ export interface RunToolCallOptions extends ToolCallHooks {
  * messages. Tools that call other tools use this so the hooks (for example permission checks)
  * apply to those calls too.
  *
- * Never rejects for tool failures: unknown tools, validation errors, blocked calls, and thrown
- * errors come back as `isError: true`.
+ * Never rejects for tool failures: an aborted `signal`, unknown tools, validation errors, blocked
+ * calls, and thrown errors come back as `isError: true`. An aborted `signal` is checked first,
+ * before the hooks run.
  */
 export async function runToolCall(toolCall: AgentToolCall, options: RunToolCallOptions): Promise<AgentToolCallOutcome> {
 	const { assistantMessage, context, signal } = options;

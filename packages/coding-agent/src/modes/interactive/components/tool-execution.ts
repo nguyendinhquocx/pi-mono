@@ -19,7 +19,7 @@ import { formatToolCallWithArgs, getTextOutput as getRenderedTextOutput } from "
 import { ensurePngTranscoder } from "../../../utils/image-convert.ts";
 import { theme } from "../theme/theme.ts";
 import { isLiToolOutputBlank } from "../tool-output-style.ts";
-import { keyHint } from "./keybinding-hints.ts";
+import { keyHint, keyText } from "./keybinding-hints.ts";
 
 const FALLBACK_PREVIEW_LINES = 10;
 
@@ -55,6 +55,8 @@ export class ToolExecutionComponent extends Container {
 	private cwd: string;
 	private executionStarted = false;
 	private argsComplete = false;
+	/** `updateArgs()` ran since the last display update; the next render applies it. */
+	private argsPending = false;
 	private result?: {
 		content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
 		isError: boolean;
@@ -141,6 +143,8 @@ export class ToolExecutionComponent extends Container {
 			isError: this.result?.isError ?? false,
 			durationMs: this.isPartial ? undefined : this.result?.durationMs,
 			outputPad: this.outputPad,
+			keyText,
+			keyHint,
 		};
 	}
 
@@ -172,9 +176,14 @@ export class ToolExecutionComponent extends Container {
 		});
 	}
 
+	/**
+	 * Show new partial arguments. Applied at the next render, so a call streaming many argument deltas between two
+	 * frames runs its renderer once per frame, not once per delta (#9265).
+	 */
 	updateArgs(args: any): void {
 		this.args = args;
-		this.updateDisplay();
+		this.argsPending = true;
+		this.ui.requestRender();
 	}
 
 	markExecutionStarted(): void {
@@ -229,7 +238,8 @@ export class ToolExecutionComponent extends Container {
 		this.updateDisplay();
 	}
 
-	override render(width: number): string[] {
+	override render(width: number): readonly string[] {
+		if (this.argsPending) this.updateDisplay();
 		if (this.hideComponent) {
 			return [];
 		}
@@ -244,7 +254,8 @@ export class ToolExecutionComponent extends Container {
 			const lines: string[] = [];
 			if (contentLines.length > 0) {
 				lines.push("");
-				lines.push(...contentLines);
+				// Append in a loop: spreading hundreds of thousands of wrapped lines exceeds V8's argument limit.
+				for (const line of contentLines) lines.push(line);
 			}
 			for (let i = 0; i < this.imageComponents.length; i++) {
 				const spacer = this.imageSpacers[i];
@@ -273,8 +284,12 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private updateDisplay(): void {
-		const bgToken = this.isPartial ? "toolPendingBg" : this.result?.isError ? "toolErrorBg" : "toolSuccessBg";
-		const bgFn = (text: string) => (isLiToolOutputBlank() ? text : theme.bg(bgToken, text));
+		this.argsPending = false;
+		const bgFn = this.isPartial
+			? (text: string) => (isLiToolOutputBlank() ? text : theme.bg("toolPendingBg", text))
+			: this.result?.isError
+				? (text: string) => (isLiToolOutputBlank() ? text : theme.bg("toolErrorBg", text))
+				: (text: string) => (isLiToolOutputBlank() ? text : theme.bg("toolSuccessBg", text));
 
 		let hasContent = false;
 		this.hideComponent = false;
