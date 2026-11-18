@@ -3,13 +3,6 @@ name: Issue Gate
 on:
   issues:
     types: [opened]
-  # Gate an issue by hand, e.g. when its run on opening never started.
-  workflow_dispatch:
-    inputs:
-      issue:
-        description: Issue number
-        required: true
-        type: number
 
 jobs:
   check-contributor:
@@ -114,13 +107,13 @@ jobs:
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: issue.number,
+              issue_number: context.issue.number,
               body: message,
             });
 
             await github.rest.issues.update({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: issue.number,
+              issue_number: context.issue.number,
               state: 'closed',
             });
