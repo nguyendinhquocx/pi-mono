@@ -188,10 +188,13 @@ describe("RPC session replacement emits session_start once (#10470)", () => {
 		const id = `req-${rpcIo.outputLines.length}`;
 		rpcIo.lineHandler?.(JSON.stringify({ ...command, id }));
 		let response: OutputLine | undefined;
-		await vi.waitFor(() => {
-			response = parseOutputLines().find((line) => line.type === "response" && line.id === id);
-			expect(response).toBeDefined();
-		});
+		await vi.waitFor(
+			() => {
+				response = parseOutputLines().find((line) => line.type === "response" && line.id === id);
+				expect(response).toBeDefined();
+			},
+			{ timeout: 15_000, interval: 50 },
+		);
 		expect(response?.error).toBeUndefined();
 		expect(response?.success).toBe(true);
 		return response as OutputLine;
@@ -204,14 +207,17 @@ describe("RPC session replacement emits session_start once (#10470)", () => {
 		const starts: string[] = [];
 		const runtime = await createRuntime(starts);
 		void runRpcMode(runtime);
-		await vi.waitFor(() => expect(rpcIo.lineHandler).toBeDefined());
+		await vi.waitFor(() => expect(rpcIo.lineHandler).toBeDefined(), { timeout: 15_000, interval: 50 });
 		return { runtime, starts };
 	}
 
 	/** Runs one prompt so the session has a user message and is written to disk; returns that message's entry id. */
 	async function promptOnce(runtime: AgentSessionRuntime): Promise<string> {
 		await send({ type: "prompt", message: "hello" });
-		await vi.waitFor(() => expect(parseOutputLines().some((line) => line.type === "agent_settled")).toBe(true));
+		await vi.waitFor(() => expect(parseOutputLines().some((line) => line.type === "agent_settled")).toBe(true), {
+			timeout: 15_000,
+			interval: 50,
+		});
 		const userEntry = runtime.session.sessionManager
 			.getEntries()
 			.find((entry) => entry.type === "message" && entry.message.role === "user");

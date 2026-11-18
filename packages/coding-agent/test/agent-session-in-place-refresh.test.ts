@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { APP_NAME } from "../src/config.ts";
+import { APP_NAME, VERSION } from "../src/config.ts";
 import { AgentSession, SessionDataLockedError } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
@@ -77,7 +77,7 @@ async function createPersistedSession(options?: {
 		join(runtimePackageDir, "dist", "li-build-receipt.json"),
 		`${JSON.stringify({
 			packageName: "@earendil-works/pi-coding-agent",
-			baseVersion: "1.3.0",
+			baseVersion: VERSION,
 			gitDirty: false,
 			gitDirtyPathCount: 0,
 			artifactAlgorithm: "sha256",
