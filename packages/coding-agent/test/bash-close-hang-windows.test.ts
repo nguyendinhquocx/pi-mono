@@ -77,8 +77,17 @@ describe.skipIf(process.platform !== "win32")("Windows child-process close handl
 		mkdirSync(testDir, { recursive: true });
 	});
 
-	afterEach(() => {
-		rmSync(testDir, { recursive: true, force: true });
+	afterEach(async () => {
+		// Windows can keep the just-killed child's inherited pipe handles alive briefly.
+		for (let attempt = 0; ; attempt++) {
+			try {
+				rmSync(testDir, { recursive: true, force: true });
+				return;
+			} catch (error) {
+				if (attempt >= 10 || !((error as NodeJS.ErrnoException).code === "EBUSY")) throw error;
+				await new Promise((resolve) => setTimeout(resolve, 50));
+			}
+		}
 	});
 
 	it("executeBash resolves after the shell exits even if inherited stdio handles stay open", async () => {
