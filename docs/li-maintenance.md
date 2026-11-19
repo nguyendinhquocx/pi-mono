@@ -187,6 +187,26 @@ Li vẫn dùng shared `~/.pi/agent`; chỉ mở interactive sau khi snapshot PAS
 
 ## Quy trình xét update upstream (compare → candidate → promote)
 
+### Bước 0 — Dual-channel upstream check (2026-11-19, SPEC-2026-11-19)
+
+Trước khi vào các bước dưới, chạy checker hai kênh (read-only, không fetch, không đụng refs):
+
+```
+node scripts/upstream-check.mjs          # report human: release + main hai khối riêng
+node scripts/upstream-check.mjs --json   # cho agent đọc
+```
+
+- Release channel = tag chính thức (tag chỉ gắn cho kênh release); main channel = full SHA snapshot
+  — tuyệt đối không in `vX.Y.Z` cạnh SHA của main (erratum v1.5.2 = tag, tích hợp 05fd là main snapshot).
+- Cursor/decisions đọc từ `docs/upstream-decisions/ledger.json` (schema: `scripts/upstream-decisions.schema.json`).
+- Policy mặc định: target để lập plan là **release tag**. Main được soi để phát hiện fix sớm;
+  owner chọn full release / full main snapshot / backport chọn lọc — lựa chọn không tự tạo quyền merge.
+- Sau owner chốt: ghi quyết định vào ledger bằng
+  `node scripts/upstream-check.mjs --record --decision-file <file.json>`
+  (tự validate + cập nhật cursors + sinh receipt draft trong `docs/maintenance-receipts/`; commit tay).
+- `reviewed_skipped` PHẢI có `revisit_condition` — skipped ≠ integrated (cherry-pick/backport không
+  tiến merge-base, cursor ancestry không tự avance).
+
 Mỗi lần xét update là thủ công, có review. Không auto-merge vào `li/stable`.
 
 1. **Xác nhận default branch fork vẫn là `main`:**
@@ -201,6 +221,10 @@ Mỗi lần xét update là thủ công, có review. Không auto-merge vào `li/
    Không có gì đáng lấy → ghi no-op, giữ Li nguyên.
 4. **Pin full target SHA** (không dùng `latest`, không dùng branch mutable). Đọc release
    notes/changelog + diff từ base Li: `git diff li/stable..origin/main -- <changed paths>`.
+   Sinh plan/matrix/receipt draft tự động: `node scripts/upstream-merge.mjs --target <sha|tag>
+   --channel <release-tag|main-snapshot|selected-backports> [--backports <sha,...>]` — channel
+   BẮT BUỘC khi có --target; `--dry-run` không fetch/không thêm remote; main-snapshot yêu cầu
+   full SHA 40; selected-backports không merge ancestry (cherry-pick + ledger riêng).
 5. **Merge vào candidate `li/next`** (tạo từ `li/stable`):
    ```
    git worktree add ..\pi-mono-next li/next   (nếu chưa có)

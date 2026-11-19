@@ -1,0 +1,74 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "upstream-decisions.schema.json",
+  "title": "Li upstream decision ledger",
+  "description": "Index machine-readable cho quyết định upstream (SPEC-2026-11-19-li-dual-channel-upstream-check). Validator chạy trong scripts/upstream-check.mjs (validateLedger) — schema này là tài liệu tham chiếu cùng quy tắc.",
+  "type": "object",
+  "required": ["schema_version", "cursors", "decisions"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "cursors": {
+      "type": "object",
+      "properties": {
+        "last_reviewed_release": {
+          "type": ["object", "null"],
+          "required": ["sha", "reviewed_at"],
+          "properties": {
+            "tag": { "type": ["string", "null"], "pattern": "^v\\d+\\.\\d+\\.\\d+$" },
+            "sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+            "reviewed_at": { "type": "string" }
+          }
+        },
+        "last_reviewed_main": {
+          "type": ["object", "null"],
+          "required": ["sha", "reviewed_at"],
+          "properties": {
+            "sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+            "reviewed_at": { "type": "string" }
+          }
+        },
+        "last_integrated_target": {
+          "type": ["object", "null"],
+          "required": ["sha", "channel", "integrated_at"],
+          "properties": {
+            "sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+            "channel": { "enum": ["release-tag", "main-snapshot", "selected-backports"] },
+            "tag": { "type": ["string", "null"] },
+            "integrated_at": { "type": "string" },
+            "receipt_ref": { "type": ["string", "null"] }
+          }
+        }
+      }
+    },
+    "decisions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "base_sha", "channel", "status", "reason", "reviewer"],
+        "properties": {
+          "id": { "type": "string" },
+          "base_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+          "channel": { "enum": ["release-tag", "main-snapshot", "selected-backports"] },
+          "target_sha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+          "tag": { "type": ["string", "null"] },
+          "status": { "enum": ["integrated", "reviewed_skipped", "backport_planned", "backported"] },
+          "reason": { "type": "string", "minLength": 1 },
+          "included": { "type": "array", "items": { "type": "string" } },
+          "skipped": { "type": "array", "items": { "type": "string" } },
+          "revisit_condition": { "type": ["string", "null"] },
+          "reviewer": { "type": "string", "minLength": 1 },
+          "test_refs": { "type": "array", "items": { "type": "string" } },
+          "receipt_ref": { "type": ["string", "null"] },
+          "reviewed_at": { "type": "string" }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "status": { "const": "reviewed_skipped" } } },
+            "then": { "required": ["revisit_condition"] }
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-11-19T00:00:00Z",
+  "cursors": {
+    "last_reviewed_release": {
+      "tag": "v1.5.2",
+      "sha": "b4afdddf44e059c67ccf5097e5317d913521b470",
+      "reviewed_at": "2026-11-18T00:00:00Z"
+    },
+    "last_reviewed_main": {
+      "sha": "5a14e69c067d40dfbff4f2fff7d3b34c897e2dc9",
+      "reviewed_at": "2026-11-19T00:00:00Z"
+    },
+    "last_integrated_target": {
+      "sha": "05fd3fbda0bbb9a1c7a76e4bf92ab58ed77c8d94",
+      "channel": "main-snapshot",
+      "tag": null,
+      "integrated_at": "2026-11-18T00:00:00Z",
+      "receipt_ref": "docs/maintenance-receipts/2026-11-18-v152-a38d8cc93d.md"
+    }
+  },
+  "decisions": [
+    {
+      "id": "d-20261118-integrated-05fd",
+      "base_sha": "044bc7f80d0e0e4e6f79b74a7ce76c19b1de789f",
+      "channel": "main-snapshot",
+      "target_sha": "05fd3fbda0bbb9a1c7a76e4bf92ab58ed77c8d94",
+      "status": "integrated",
+      "reason": "v1.5.2 pipeline T0-T10: owner chốt target main snapshot (312 commits sau release tag v1.5.2); đã test/deploy full gates",
+      "included": [],
+      "skipped": [],
+      "revisit_condition": null,
+      "reviewer": "owner",
+      "test_refs": [
+        "npm run check",
+        "bash test.sh",
+        "test/li-*.test.ts",
+        "T7 UAT 6 mục",
+        "T8 ProDesk smoke"
+      ],
+      "receipt_ref": "docs/maintenance-receipts/2026-11-18-v152-a38d8cc93d.md",
+      "reviewed_at": "2026-11-18T00:00:00Z"
+    },
+    {
+      "id": "d-20261119-skip-main-20",
+      "base_sha": "2f8aec7c593166a5654209e4335a30c0c097d8f8",
+      "channel": "main-snapshot",
+      "target_sha": "5a14e69c067d40dfbff4f2fff7d3b34c897e2dc9",
+      "status": "reviewed_skipped",
+      "reason": "owner chọn keep_tested: giữ snapshot 05fd đã test/deploy, defer +20 commits main sau target",
+      "included": [],
+      "skipped": ["5a14e69c..upstream main tip +20 commits sau 05fd (không liệt kê từng commit — xem upstream log khi revisit)"],
+      "revisit_condition": "release tag mới xuất hiện, hoặc owner yêu cầu backport commit cụ thể, hoặc check kế tiếp thấy fix quan trọng",
+      "reviewer": "owner",
+      "test_refs": [],
+      "receipt_ref": "docs/maintenance-receipts/2026-11-18-v152-a38d8cc93d.md",
+      "reviewed_at": "2026-11-19T00:00:00Z"
+    }
+  ]
+}
