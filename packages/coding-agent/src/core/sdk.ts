@@ -17,6 +17,7 @@ import { ModelRuntime } from "./model-runtime.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
 import { getDefaultSessionDir, SessionManager } from "./session-manager.ts";
+import { type OwnerKind, resolveOwnerStrictMode } from "./session-owner-protocol.ts";
 import {
 	applyToolModifiers,
 	DEFAULT_TOOL_NAMES,
@@ -103,6 +104,10 @@ export interface CreateAgentSessionOptions {
 	settingsManager?: SettingsManager;
 	/** Session start event metadata for extension runtime startup. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Refuse writes unless this process owns the session lease. */
+	writerEnforcement?: "strict";
+	/** Owner protocol identity recorded in the lease registry. */
+	ownerKind?: OwnerKind;
 }
 
 /** Result from createAgentSession */
@@ -439,18 +444,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// This stream resolves auth through modelRuntime, so summaries must not pre-resolve it (#11520).
 	markRuntimeStreamFunction(agent.streamFunction, modelRuntime);
 
-	// Restore missing settings metadata for older sessions.
-	if (hasExistingSession) {
-		if (!hasThinkingEntry) {
+	const appendStartupMetadata = (): void => {
+		if (hasExistingSession) {
+			if (!hasThinkingEntry) sessionManager.appendThinkingLevelChange(thinkingLevel);
+		} else {
+			if (model) sessionManager.appendModelChange(model.provider, model.id);
 			sessionManager.appendThinkingLevelChange(thinkingLevel);
 		}
-	} else {
-		// Save initial model and thinking level for new sessions so they can be restored on resume
-		if (model) {
-			sessionManager.appendModelChange(model.provider, model.id);
-		}
-		sessionManager.appendThinkingLevelChange(thinkingLevel);
-	}
+	};
+	const ownerStrict = resolveOwnerStrictMode(options.writerEnforcement);
+	if (!ownerStrict) appendStartupMetadata();
 
 	const session = new AgentSession({
 		agent,
@@ -470,7 +473,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		excludedToolNames,
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
+		writerEnforcement: options.writerEnforcement,
+		ownerKind: options.ownerKind,
 	});
+
+	// Strict owners acquire the lease before startup metadata mutates an existing transcript.
+	// Keep the legacy ordering untouched when cross-process enforcement is disabled.
+	if (ownerStrict) appendStartupMetadata();
 
 	const extensionsResult = resourceLoader.getExtensions();
 

@@ -1,5 +1,5 @@
 import { spawnSync } from "child_process";
-import { createHash, randomUUID } from "crypto";
+import { createHash, randomBytes, randomUUID } from "crypto";
 import {
 	closeSync,
 	existsSync,
@@ -118,8 +118,10 @@ export interface LeaseRecord {
 	writer_state?: WriterState;
 	heartbeat_utc?: string;
 	owner_protocol_version?: number;
-	/** Present only while writer_state is "handoff-pending"; claiming consumes it. */
+	/** Legacy raw token, accepted only to parse old pending records during migration. */
 	handoff_token?: string;
+	/** Hash of the one-time token; raw token is returned only to the begin caller. */
+	handoff_token_hash?: string;
 	handoff_epoch?: number;
 }
 
@@ -296,6 +298,10 @@ export function canonicalTranscriptIdentityPath(path: string): string {
 /** Lowercase SHA-256 hex of the UTF-8 canonical identity. */
 export function hashCanonicalIdentity(identity: string): string {
 	return createHash("sha256").update(identity, "utf8").digest("hex");
+}
+
+function hashHandoffToken(token: string): string {
+	return createHash("sha256").update(token, "utf8").digest("hex").slice(0, 32);
 }
 
 export interface CanonicalTranscriptIdentity {
@@ -677,21 +683,32 @@ export function parseLeaseRecord(value: unknown): LeaseRecord | null {
 		if (typeof protocolVersion !== "number" || !Number.isInteger(protocolVersion) || protocolVersion < 1) return null;
 		record.owner_protocol_version = protocolVersion;
 	}
-	const handoffToken = value.handoff_token;
-	if (handoffToken !== undefined) {
-		if (typeof handoffToken !== "string" || handoffToken.length < 16) return null;
-		record.handoff_token = handoffToken;
+	const legacyHandoffToken = value.handoff_token;
+	if (legacyHandoffToken !== undefined) {
+		if (typeof legacyHandoffToken !== "string" || legacyHandoffToken.length < 16) return null;
+		record.handoff_token = legacyHandoffToken;
 	}
+	const handoffTokenHash = value.handoff_token_hash;
+	if (handoffTokenHash !== undefined) {
+		if (typeof handoffTokenHash !== "string" || !/^[a-f0-9]{32}$/.test(handoffTokenHash)) return null;
+		record.handoff_token_hash = handoffTokenHash;
+	}
+	if (record.handoff_token !== undefined && record.handoff_token_hash !== undefined) return null;
 	const handoffEpoch = value.handoff_epoch;
 	if (handoffEpoch !== undefined) {
 		if (typeof handoffEpoch !== "number" || !Number.isInteger(handoffEpoch) || handoffEpoch < 1) return null;
 		record.handoff_epoch = handoffEpoch;
 	}
 	// A handoff token only makes sense in the handoff-pending state.
-	if (record.handoff_token !== undefined && record.writer_state !== "handoff-pending") return null;
+	if (
+		(record.handoff_token !== undefined || record.handoff_token_hash !== undefined) &&
+		record.writer_state !== "handoff-pending"
+	)
+		return null;
 	if (
 		record.writer_state === "handoff-pending" &&
-		(record.handoff_token === undefined || record.handoff_epoch === undefined)
+		((record.handoff_token === undefined && record.handoff_token_hash === undefined) ||
+			record.handoff_epoch === undefined)
 	)
 		return null;
 	return record;
@@ -1297,21 +1314,20 @@ export class SessionOpenLeaseRegistry {
 				return fail("writer_conflict", "lease ownership changed during handoff");
 			}
 			const handoffEpoch = (current.owner_epoch ?? 1) + 1;
+			const token = randomBytes(32).toString("hex");
 			const updated: LeaseRecord = {
 				...current,
 				writer_state: "handoff-pending",
-				handoff_token: createHash("sha256")
-					.update(`${current.lease_id}:${handoffEpoch}:${process.hrtime.bigint()}`)
-					.digest("hex")
-					.slice(0, 32),
+				handoff_token_hash: hashHandoffToken(token),
 				handoff_epoch: handoffEpoch,
 			};
+			delete updated.handoff_token;
 			try {
 				writeJsonFileSync(leasePath, updated, true);
 			} catch (error) {
 				return fail("io_error", `failed to record handoff intent: ${String(error)}`);
 			}
-			return { ok: true, value: { token: updated.handoff_token as string, handoffEpoch } };
+			return { ok: true, value: { token, handoffEpoch } };
 		});
 	}
 
@@ -1335,8 +1351,15 @@ export class SessionOpenLeaseRegistry {
 			if (!existing.ok) return existing;
 			if (!existing.value) return fail("writer_conflict", "no lease to hand off");
 			const record = existing.value;
-			if (record.writer_state !== "handoff-pending" || record.handoff_token !== input.token) {
+			const tokenMatches =
+				record.handoff_token_hash !== undefined
+					? record.handoff_token_hash === hashHandoffToken(input.token)
+					: record.handoff_token === input.token;
+			if (record.writer_state !== "handoff-pending" || !tokenMatches) {
 				return fail("writer_conflict", "no pending handoff matching token");
+			}
+			if (record.session_id !== input.sessionId) {
+				return fail("writer_conflict", "handoff session id does not match the lease");
 			}
 			if (record.handoff_epoch === undefined) {
 				return fail("registry_invalid", "handoff-pending record missing epoch");
@@ -1362,6 +1385,7 @@ export class SessionOpenLeaseRegistry {
 				delete claimed.owner_protocol_version;
 			}
 			delete claimed.handoff_token;
+			delete claimed.handoff_token_hash;
 			delete claimed.handoff_epoch;
 			const leasePath = join(this.#paths.leasesDir, `${record.lease_id}.json`);
 			try {
@@ -1396,6 +1420,7 @@ export class SessionOpenLeaseRegistry {
 			if (current.writer_state !== "handoff-pending") return fail("writer_conflict", "no handoff pending");
 			const updated: LeaseRecord = { ...current, writer_state: "idle" };
 			delete updated.handoff_token;
+			delete updated.handoff_token_hash;
 			delete updated.handoff_epoch;
 			try {
 				writeJsonFileSync(leasePath, updated, true);

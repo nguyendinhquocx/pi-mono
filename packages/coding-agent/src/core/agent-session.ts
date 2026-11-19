@@ -151,6 +151,7 @@ import {
 	type SessionEntry,
 	SessionManager,
 	type SessionProjection,
+	type SessionWriteGateRefusal,
 	type StagedSessionReload,
 } from "./session-manager.ts";
 import {
@@ -444,6 +445,16 @@ export class SessionDataLockedError extends Error {
 	}
 }
 
+/** Typed refusal while a successor is expected to claim the session lease. */
+export class SessionHandoffPendingError extends Error {
+	readonly code = "handoff_pending" as const;
+
+	constructor() {
+		super("Session handoff is pending. Cancel it or let the successor claim before writing.");
+		this.name = "SessionHandoffPendingError";
+	}
+}
+
 interface HeldSessionDataLock {
 	lockId: string;
 	pathHash: string;
@@ -699,6 +710,10 @@ export class AgentSession {
 	private _ownerStrict = false;
 	private _ownerKind: OwnerKind = "tui";
 	private _uiPendingCount = 0;
+	private _promptAdmissionCount = 0;
+	private _handoffAdmissionLocked = false;
+	private _pendingHandoffToken: string | undefined;
+	private _detachedOwnerLease: LeaseRecord | undefined;
 	private _ownerHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
 	private _heldSessionDataLock: HeldSessionDataLock | undefined;
 	private _sessionDataAdmissionLocked = false;
@@ -706,11 +721,7 @@ export class AgentSession {
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
-		this.sessionManager.setWriteGate(() =>
-			this._sessionDataAdmissionLocked
-				? "session_data_locked: in-place session refresh owns transcript writes"
-				: undefined,
-		);
+		this.sessionManager.setWriteGate(() => this._sessionWriteGateRefusal());
 		this._installAgentSessionDataAdmissionGuards();
 		this.settingsManager = config.settingsManager;
 		this._scopedModels = config.scopedModels ?? [];
@@ -1455,6 +1466,13 @@ export class AgentSession {
 
 		// Handle session persistence
 		if (event.type === "message_end") {
+			const existingSessionFile = this.sessionManager.getSessionFile();
+			if (this.sessionManager.isPersisted() && existingSessionFile && existsSync(existingSessionFile)) {
+				// Revalidate before mutating the in-memory tree: a cached OS shared guard
+				// alone cannot detect that another process claimed the lease between appends.
+				this._acquireSessionOpenLeaseIfNeeded();
+				await this._ensureSessionAccessGuard();
+			}
 			let entryId: string | undefined;
 			// Check if this is a custom message from extensions
 			if (event.message.role === "custom") {
@@ -2595,40 +2613,47 @@ export class AgentSession {
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
 		this._throwIfSessionDataLocked();
-		await this._ensureSessionAccessGuard();
-		if (this._isEmittingAgentSettled) {
-			this._deferredSettledActions.push(async () => await this.prompt(text, options));
-			return;
-		}
-		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
-		const preflightResult = options?.preflightResult;
-		// Handle extension commands first (execute immediately, even during streaming)
-		// Extension commands manage their own LLM interaction via pi.sendMessage()
-		if (expandPromptTemplates && text.startsWith("/")) {
-			const handled = await this._tryExecuteExtensionCommand(text);
-			if (handled) {
-				// Extension command executed, no prompt to send
-				preflightResult?.("handled");
+		// Reserve admission before the first await; otherwise a handoff can pass its
+		// idle check while this prompt is still validating the cached owner guard.
+		this._promptAdmissionCount++;
+		try {
+			await this._ensureSessionAccessGuard();
+			this._throwIfSessionDataLocked();
+			if (this._isEmittingAgentSettled) {
+				this._deferredSettledActions.push(async () => await this.prompt(text, options));
 				return;
 			}
-		}
+			const expandPromptTemplates = options?.expandPromptTemplates ?? true;
+			const preflightResult = options?.preflightResult;
+			// Handle extension commands first (execute immediately, even during streaming)
+			// Extension commands manage their own LLM interaction via pi.sendMessage()
+			if (expandPromptTemplates && text.startsWith("/")) {
+				const handled = await this._tryExecuteExtensionCommand(text);
+				if (handled) {
+					preflightResult?.("handled");
+					return;
+				}
+			}
 
-		if (this._compactionAbortController !== undefined || this._branchSummaryAbortController !== undefined) {
-			throw new Error(
-				"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.",
-			);
-		}
+			if (this._compactionAbortController !== undefined || this._branchSummaryAbortController !== undefined) {
+				throw new Error(
+					"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.",
+				);
+			}
 
-		// Reserve the context through async input hooks and auth checks so tree navigation cannot
-		// start meanwhile (#9154). _startRun marks the run active synchronously, so there is no gap.
-		this._promptPreflightCount++;
-		let trigger: BeforeAgentStartTrigger | undefined;
-		try {
-			trigger = await this._preparePrompt(text, options);
+			// Reserve context through async input hooks and auth checks so tree navigation cannot
+			// start meanwhile (#9154). _startRun marks the run active synchronously.
+			this._promptPreflightCount++;
+			let trigger: BeforeAgentStartTrigger | undefined;
+			try {
+				trigger = await this._preparePrompt(text, options);
+			} finally {
+				this._promptPreflightCount--;
+			}
+			if (trigger) await this._startRun(trigger, () => preflightResult?.("started"));
 		} finally {
-			this._promptPreflightCount--;
+			this._promptAdmissionCount--;
 		}
-		if (trigger) await this._startRun(trigger, () => preflightResult?.("started"));
 	}
 
 	/**
@@ -3943,6 +3968,7 @@ export class AgentSession {
 				this._startOwnerHeartbeat();
 				return;
 			}
+			if (acquired.code === "writer_conflict") throw new SessionDataLockedError();
 			if (this._ownerStrict) {
 				throw new SessionOwnerUnavailableError(`cannot acquire session owner lease: ${acquired.message}`);
 			}
@@ -3983,18 +4009,40 @@ export class AgentSession {
 		ownerEpoch: number | undefined;
 		writerState: string | undefined;
 		pid: number;
+		sessionId: string;
+		pathHash: string | undefined;
+		isOwner: boolean;
 		idleForHandoff: boolean;
 		pendingWork: Record<string, number | boolean>;
 		uiPendingCount: number;
 	} {
+		let lease = this._detachedOwnerLease ?? this._sessionOpenLease;
+		let isOwner = !this._detachedOwnerLease;
+		let writerState = this._handoffAdmissionLocked ? "handoff-pending" : this._isAgentRunActive ? "running" : "idle";
+		if (lease && this._leaseRegistry) {
+			const current = this._leaseRegistry.getLeaseForPath(lease.path_hash);
+			if (current.ok && current.value?.lease_id === lease.lease_id) {
+				lease = current.value;
+				isOwner = this._leaseRegistry.isOwnedByCurrentProcess(lease);
+				writerState = lease.writer_state ?? "idle";
+			} else {
+				isOwner = false;
+				writerState = "owner_unavailable";
+			}
+		}
+		if (isOwner && this._handoffAdmissionLocked) writerState = "handoff-pending";
+		if (isOwner && this._isAgentRunActive) writerState = "running";
 		return {
 			protocolVersion: OWNER_PROTOCOL_VERSION,
 			strict: this._ownerStrict,
-			ownerKind: this._ownerKind,
-			leaseId: this._sessionOpenLease?.lease_id,
-			ownerEpoch: this._sessionOpenLease?.owner_epoch,
-			writerState: this._isAgentRunActive ? "running" : (this._sessionOpenLease?.writer_state ?? "idle"),
-			pid: process.pid,
+			ownerKind: lease?.owner_kind ?? this._ownerKind,
+			leaseId: lease?.lease_id,
+			ownerEpoch: lease?.owner_epoch,
+			writerState,
+			pid: lease?.pid ?? process.pid,
+			sessionId: this.sessionManager.getSessionId(),
+			pathHash: lease?.path_hash,
+			isOwner,
 			idleForHandoff: this.isIdleForHandoff(),
 			pendingWork: this._pendingSessionWorkDetails(),
 			uiPendingCount: this._uiPendingCount,
@@ -4032,7 +4080,10 @@ export class AgentSession {
 		if (!registry || !lease) {
 			return { ok: false, code: "owner_unavailable", message: "no owner lease to hand off" };
 		}
-		if (!this.isIdleForHandoff()) {
+		if (this._handoffAdmissionLocked) {
+			return { ok: false, code: "writer_conflict", message: "handoff already pending" };
+		}
+		if (this._sessionDataAdmissionLocked || !this.isIdleForHandoff()) {
 			return {
 				ok: false,
 				code: "handoff_refused",
@@ -4040,11 +4091,70 @@ export class AgentSession {
 				pendingWork: { ...this._pendingSessionWorkDetails(), pending_ui: this._uiPendingCount },
 			};
 		}
+		// Close local admission before the registry CAS so no concurrent prompt can
+		// start between the idle check and publishing handoff-pending.
+		this._handoffAdmissionLocked = true;
 		const pending = registry.beginHandoff({ leaseId: lease.lease_id });
 		if (!pending.ok) {
+			this._handoffAdmissionLocked = false;
 			return { ok: false, code: pending.code, message: pending.message };
 		}
+		this._pendingHandoffToken = pending.value.token;
+		this._sessionOpenLease = {
+			...lease,
+			writer_state: "handoff-pending",
+			handoff_epoch: pending.value.handoffEpoch,
+		};
 		return { ok: true, token: pending.value.token, handoffEpoch: pending.value.handoffEpoch };
+	}
+
+	/** Cancel a pending handoff and restore owner admission. */
+	cancelSessionHandoff(): { ok: true } | { ok: false; code: string; message: string } {
+		const registry = this._leaseRegistry;
+		const lease = this._sessionOpenLease;
+		if (!registry || !lease) return { ok: false, code: "owner_unavailable", message: "no owner lease to cancel" };
+		const cancelled = registry.abortHandoff({ leaseId: lease.lease_id });
+		if (!cancelled.ok) return { ok: false, code: cancelled.code, message: cancelled.message };
+		this._sessionOpenLease = cancelled.value;
+		this._pendingHandoffToken = undefined;
+		this._handoffAdmissionLocked = false;
+		return { ok: true };
+	}
+
+	/** Confirm a successor already claimed the lease, then detach this TUI as a writer. */
+	async confirmSessionHandoffClaim(input: {
+		token: string;
+		sessionId: string;
+	}): Promise<{ ok: true; ownerEpoch: number; ownerPid: number } | { ok: false; code: string; message: string }> {
+		const registry = this._leaseRegistry;
+		const previousLease = this._sessionOpenLease;
+		if (!registry || !previousLease || !this._pendingHandoffToken) {
+			return { ok: false, code: "writer_conflict", message: "no handoff is pending in this TUI" };
+		}
+		if (input.sessionId !== this.sessionManager.getSessionId() || input.token !== this._pendingHandoffToken) {
+			return { ok: false, code: "writer_conflict", message: "handoff token or session id does not match" };
+		}
+		const current = registry.getLeaseForPath(previousLease.path_hash);
+		if (!current.ok) return { ok: false, code: current.code, message: current.message };
+		if (!current.value || current.value.session_id !== input.sessionId) {
+			return { ok: false, code: "writer_conflict", message: "successor lease is not present for this session" };
+		}
+		if (
+			registry.isOwnedByCurrentProcess(current.value) ||
+			current.value.owner_epoch !== previousLease.handoff_epoch
+		) {
+			return { ok: false, code: "writer_conflict", message: "successor has not claimed the pending lease" };
+		}
+		this._handoffAdmissionLocked = true;
+		this._pendingHandoffToken = undefined;
+		this._detachedOwnerLease = current.value;
+		this._sessionOpenLease = undefined;
+		this._stopOwnerHeartbeat();
+		const guard = this._sessionAccessGuard;
+		this._sessionAccessGuard = undefined;
+		this._sessionAccessUnguarded = true;
+		if (guard) await guard.release();
+		return { ok: true, ownerEpoch: current.value.owner_epoch ?? 0, ownerPid: current.value.pid };
 	}
 
 	private _stopOwnerHeartbeat(): void {
@@ -4068,6 +4178,7 @@ export class AgentSession {
 			emitting_settled: this._isEmittingAgentSettled,
 			retrying: this._retryAbortController !== undefined,
 			failed_response: this._failedResponse !== undefined,
+			prompt_admission: this._promptAdmissionCount > 0,
 		};
 	}
 
@@ -4085,8 +4196,72 @@ export class AgentSession {
 		return `${prefix}: session has pending work (${summary})`;
 	}
 
+	private _sessionWriteGateRefusal(): string | SessionWriteGateRefusal | undefined {
+		if (this._handoffAdmissionLocked) {
+			return {
+				code: "handoff_pending",
+				message: "Session handoff is pending; transcript writes are frozen until cancel or successor claim.",
+			};
+		}
+		if (this._sessionDataAdmissionLocked) {
+			return "session_data_locked: in-place session refresh owns transcript writes";
+		}
+		if (!this._ownerStrict) return undefined;
+		const registry = this._leaseRegistry;
+		if (!registry || !registry.available) {
+			return {
+				code: "owner_unavailable",
+				message: registry?.degradationReason ?? "strict owner lease registry is unavailable",
+			};
+		}
+		const sessionFile = this.sessionManager.getSessionFile();
+		if (!this.sessionManager.isPersisted() || !sessionFile || !existsSync(sessionFile)) return undefined;
+		const { pathHash } = canonicalTranscriptIdentity(sessionFile);
+		const current = registry.getLeaseForPath(pathHash);
+		if (!current.ok || !current.value) {
+			return { code: "owner_unavailable", message: current.ok ? "session owner lease is missing" : current.message };
+		}
+		if (current.value.writer_state === "handoff-pending") {
+			return {
+				code: "handoff_pending",
+				message: "Session handoff is pending; transcript writes are frozen until cancel or successor claim.",
+			};
+		}
+		if (
+			current.value.session_id !== this.sessionManager.getSessionId() ||
+			!registry.isOwnedByCurrentProcess(current.value) ||
+			this._sessionOpenLease?.lease_id !== current.value.lease_id
+		) {
+			return { code: "writer_conflict", message: "session writer lease is held by another process" };
+		}
+		return undefined;
+	}
+
 	private _throwIfSessionDataLocked(): void {
+		if (this._handoffAdmissionLocked) throw new SessionHandoffPendingError();
 		if (this._sessionDataAdmissionLocked) throw new SessionDataLockedError();
+	}
+
+	private _assertCurrentOwnerLease(pathHash: string): void {
+		if (!this._ownerStrict) return;
+		const registry = this._leaseRegistry;
+		if (!registry || !registry.available) {
+			throw new SessionOwnerUnavailableError(
+				`strict writer mode requires the lease registry: ${registry?.degradationReason ?? "unavailable"}`,
+				pathHash,
+			);
+		}
+		const current = registry.getLeaseForPath(pathHash);
+		if (!current.ok) throw new SessionOwnerUnavailableError(`owner lease unavailable: ${current.message}`, pathHash);
+		if (!current.value) throw new SessionOwnerUnavailableError("owner lease is missing", pathHash);
+		if (current.value.writer_state === "handoff-pending") throw new SessionHandoffPendingError();
+		if (
+			current.value.session_id !== this.sessionManager.getSessionId() ||
+			!registry.isOwnedByCurrentProcess(current.value) ||
+			this._sessionOpenLease?.lease_id !== current.value.lease_id
+		) {
+			throw new SessionDataLockedError();
+		}
 	}
 
 	private _markSessionAccessUnguarded(message: string): void {
@@ -4103,9 +4278,11 @@ export class AgentSession {
 	private async _ensureSessionAccessGuard(): Promise<void> {
 		const sessionFile = this.sessionManager.getSessionFile();
 		if (!this.sessionManager.isPersisted() || !sessionFile || !existsSync(sessionFile)) return;
+		const { pathHash } = canonicalTranscriptIdentity(sessionFile);
+		if (this._ownerStrict) this._assertCurrentOwnerLease(pathHash);
 		if (this._sessionAccessGuard?.isHeld) {
-			// The guard was already acquired in an earlier call; still converge any
-			// startup repairs that were deferred at open time.
+			// Strict/bridge owners re-read the registry above; cached process-local guards
+			// cannot survive a successor claim just because the OS shared lock is still held.
 			this.sessionManager.applyDeferredStartupRepairs();
 			return;
 		}
@@ -4123,7 +4300,6 @@ export class AgentSession {
 			this.sessionManager.applyDeferredStartupRepairs();
 			return;
 		}
-		const { pathHash } = canonicalTranscriptIdentity(sessionFile);
 		if (!this._sessionOpenLease) {
 			const claim = registry.readClaim(pathHash);
 			if (

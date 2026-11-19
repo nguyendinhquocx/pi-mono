@@ -66,6 +66,7 @@ import {
 	UnknownSessionEntryTypeError,
 	UnsupportedSessionVersionError,
 } from "./core/session-manager.ts";
+import { claimSessionHandoffFromEnv, resolveOwnerStrictMode } from "./core/session-owner-protocol.ts";
 import { collectSettingsDiagnostics, deduplicateDiagnostics } from "./core/settings-diagnostics.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
@@ -709,6 +710,14 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	let appMode = resolveAppMode(parsed, process.stdin.isTTY, process.stdout.isTTY);
+	const interactiveCommand = appMode === "interactive" && !parsed.help && parsed.listModels === undefined;
+	const handoffClaimRequested = interactiveCommand && Boolean(process.env.PI_SESSION_OWNER_CLAIM);
+	const ownerBridgeEnabled =
+		interactiveCommand && (isTruthyEnvFlag(process.env.PI_SESSION_OWNER_BRIDGE) || handoffClaimRequested);
+	const interactiveHandoffClaim = interactiveCommand
+		? claimSessionHandoffFromEnv(process.env, { ownerKind: "tui" })
+		: undefined;
+	const ownerProtocolStrict = ownerBridgeEnabled || interactiveHandoffClaim !== undefined || resolveOwnerStrictMode();
 	const shouldTakeOverStdout = appMode !== "interactive" && !isPlainRuntimeMetadataCommand(parsed);
 	if (shouldTakeOverStdout) {
 		takeOverStdout();
@@ -947,6 +956,14 @@ export async function main(args: string[], options?: MainOptions) {
 			excludeTools: sessionOptions.excludeTools,
 			noTools: sessionOptions.noTools,
 			customTools: sessionOptions.customTools,
+			writerEnforcement: ownerProtocolStrict ? "strict" : undefined,
+			ownerKind: ownerProtocolStrict
+				? appMode === "interactive"
+					? "tui"
+					: appMode === "rpc"
+						? "lix-worker"
+						: undefined
+				: undefined,
 		});
 		const cliThinkingOverride = parsed.thinking !== undefined || cliThinkingFromModel;
 		if (created.session.model && cliThinkingOverride) {
@@ -1071,6 +1088,8 @@ export async function main(args: string[], options?: MainOptions) {
 			verbose: parsed.verbose,
 			tuiMode: parsed.tuiMode,
 			initialThemeSetting: parsed.useTheme,
+			ownerBridgeEnabled,
+			handoffClaimed: interactiveHandoffClaim ? { ownerEpoch: interactiveHandoffClaim.owner_epoch ?? 1 } : undefined,
 		});
 		if (startupBenchmark) {
 			await interactiveMode.init();

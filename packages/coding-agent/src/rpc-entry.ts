@@ -12,7 +12,8 @@ process.emitWarning = (() => {}) as typeof process.emitWarning;
 // Owner handoff successor path: claim the pending lease BEFORE the runtime
 // builds its AgentSession, otherwise the still-alive previous owner's lease
 // record blocks session open (SessionDataLockedError).
-claimSessionHandoffFromEnv();
+const handoffClaim = claimSessionHandoffFromEnv(process.env, { ownerKind: "lix-worker" });
+if (handoffClaim) process.env.PI_SESSION_OWNER_STRICT = "1";
 
 configureHttpDispatcher();
 

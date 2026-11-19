@@ -24,11 +24,14 @@ Extensions, prompt templates, and skills can add commands. The command menu in P
 | `/resume` | Resume another session |
 | `/name [name]` | Set the session display name, or show the current name when omitted |
 | `/session` | Show current session information and statistics |
+| `/handoff <begin|cancel|claim|status>` | Inspect or transfer the session writer |
 | `/tree` | Navigate the session tree |
 | `/fork` | Create a new session from an earlier user message |
 | `/clone` | Duplicate the current session at its current position |
 | `/compact [instructions]` | Compact the current context, optionally with custom instructions |
 | `/import <path>` | Import a JSONL session, preserving its ID and working directory |
+
+`PI_SESSION_OWNER_BRIDGE=1` opts an interactive TUI into the loopback-only owner bridge and strict writer-lease enforcement. `/handoff` manages a transfer; a successor claim is consumed before its `AgentSession` starts.
 
 ## Export and share
 

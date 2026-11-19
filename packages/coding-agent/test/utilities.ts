@@ -176,6 +176,10 @@ export interface TestSessionOptions {
 	systemPrompt?: string;
 	/** Custom settings overrides */
 	settingsOverrides?: Record<string, unknown>;
+	/** Install the cross-process session owner lease for focused protocol tests. */
+	ownerProtocol?: boolean;
+	/** Seed a persisted transcript before constructing AgentSession. */
+	initialMessages?: string[];
 }
 
 /**
@@ -265,7 +269,12 @@ export async function createTestSession(options: TestSessionOptions = {}): Promi
 		streamFn: streamSimple,
 	});
 
-	const sessionManager = options.inMemory ? SessionManager.inMemory() : SessionManager.create(tempDir);
+	const sessionManager = options.inMemory
+		? SessionManager.inMemory()
+		: SessionManager.create(tempDir, options.ownerProtocol ? tempDir : undefined);
+	for (const text of options.initialMessages ?? []) {
+		sessionManager.appendMessage({ role: "user", content: text, timestamp: Date.now() });
+	}
 	const settingsManager = SettingsManager.create(tempDir, tempDir);
 
 	if (options.settingsOverrides) {
@@ -282,6 +291,9 @@ export async function createTestSession(options: TestSessionOptions = {}): Promi
 		cwd: tempDir,
 		modelRuntime: getModelRuntime(modelRegistry),
 		resourceLoader: createTestResourceLoader(),
+		agentDir: options.ownerProtocol ? tempDir : undefined,
+		writerEnforcement: options.ownerProtocol ? "strict" : undefined,
+		ownerKind: options.ownerProtocol ? "tui" : undefined,
 	});
 
 	// Must subscribe to enable session persistence

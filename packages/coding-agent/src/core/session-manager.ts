@@ -85,12 +85,19 @@ export class SessionTranscriptParseError extends Error {
 }
 
 /** Raised when a mutation is refused because a session-data lock gates writes. */
-export class SessionWriteGatedError extends Error {
-	readonly code = "session_data_locked" as const;
+export type SessionWriteGateCode = "session_data_locked" | "handoff_pending" | "writer_conflict" | "owner_unavailable";
+export type SessionWriteGateRefusal = { code: SessionWriteGateCode; message: string };
 
-	constructor(message = "session data lock is held; transcript writes are refused") {
+export class SessionWriteGatedError extends Error {
+	readonly code: SessionWriteGateCode;
+
+	constructor(
+		message = "session data lock is held; transcript writes are refused",
+		code: SessionWriteGateCode = "session_data_locked",
+	) {
 		super(message);
 		this.name = "SessionWriteGatedError";
+		this.code = code;
 	}
 }
 
@@ -1606,7 +1613,7 @@ export class SessionManager {
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
 	/** In-process admission gate installed synchronously by AgentSession locks. */
-	private writeGate: (() => string | undefined) | undefined;
+	private writeGate: (() => string | SessionWriteGateRefusal | undefined) | undefined;
 	/**
 	 * Startup repairs (trailing-newline append, legacy migration rewrite) that
 	 * were detected while loading the transcript but NOT yet written. Opening a
@@ -2179,18 +2186,19 @@ export class SessionManager {
 	 * await/native guard acquisition so persistence and all append paths fail
 	 * closed throughout the mutation transaction.
 	 */
-	setWriteGate(gate: (() => string | undefined) | undefined): void {
+	setWriteGate(gate: (() => string | SessionWriteGateRefusal | undefined) | undefined): void {
 		this.writeGate = gate;
 	}
 
 	/** Check whether the current write gate refuses new mutations. */
-	checkWriteGate(): string | undefined {
+	checkWriteGate(): string | SessionWriteGateRefusal | undefined {
 		return this.writeGate?.();
 	}
 
 	#refuseIfGated(): void {
 		const reason = this.writeGate?.();
-		if (reason !== undefined) throw new SessionWriteGatedError(reason);
+		if (typeof reason === "string") throw new SessionWriteGatedError(reason);
+		if (reason !== undefined) throw new SessionWriteGatedError(reason.message, reason.code);
 	}
 
 	/** Strictly parse candidate bytes and build staged indices without side effects. */

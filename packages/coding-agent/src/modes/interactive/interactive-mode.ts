@@ -195,6 +195,7 @@ import { editInExternalEditor } from "./external-editor.ts";
 import { applyLiLocale, liCopy } from "./locale.ts";
 import { refreshModelCatalogs } from "./model-catalog-refresh.ts";
 import { getModelSearchText } from "./model-search.ts";
+import { OwnerBridgeServer, type OwnerBridgeSession } from "./owner-bridge-server.ts";
 import { type BlockedStatus, ProgramStatusReporter } from "./program-status-reporter.ts";
 import { shareSession } from "./session-share.ts";
 import {
@@ -460,6 +461,9 @@ export interface InteractiveModeOptions {
 	initialThemeSetting?: string;
 	/** Terminal implementation. Defaults to the current process terminal. */
 	terminal?: Terminal;
+	/** Enables the loopback owner bridge and strict writer enforcement for this TUI. */
+	ownerBridgeEnabled?: boolean;
+	handoffClaimed?: { ownerEpoch: number };
 }
 
 interface ExtensionChangelogUpdate {
@@ -620,6 +624,9 @@ export class InteractiveMode {
 	};
 	private autoTrustOnReloadCwd: string | undefined;
 	private themeController: InteractiveThemeController;
+	private ownerBridgeServer: OwnerBridgeServer | undefined;
+	private ownerBridgeServerStarted = false;
+	private ownerBridgeSessionKey: string | undefined;
 
 	// Convenience accessors
 	private get session(): AgentSession {
@@ -648,6 +655,7 @@ export class InteractiveMode {
 		});
 		this.runtimeHost.setRebindSession(async () => {
 			await this.rebindCurrentSession({ renderBeforeBind: true });
+			await this.updateOwnerBridgeSession();
 			this.themeController.applyFromSettings();
 			this.showRuntimeDiagnostics(this.runtimeHost.takeUnreportedDiagnostics());
 		});
@@ -1146,6 +1154,11 @@ export class InteractiveMode {
 
 		// Initialize extensions first so resources are shown before messages
 		await this.rebindCurrentSession();
+		await this.updateOwnerBridgeSession();
+		if (this.options.ownerBridgeEnabled) {
+			const status = this.session.getOwnerStatus();
+			this.showStatus(`Owner bridge active · TUI pid ${status.pid} · epoch ${status.ownerEpoch ?? 1}`);
+		}
 
 		// Render initial messages AFTER showing loaded resources
 		this.renderInitialMessages();
@@ -2241,6 +2254,42 @@ export class InteractiveMode {
 				this.showStatus(diagnostic.message);
 			}
 		}
+	}
+
+	private createOwnerBridgeSession(session: AgentSession): OwnerBridgeSession {
+		return {
+			getSessionId: () => session.sessionId,
+			getSessionFile: () => session.sessionFile,
+			isPersisted: () => session.sessionManager.isPersisted(),
+			getOwnerStatus: () => session.getOwnerStatus(),
+			subscribe: (listener) => session.subscribe(listener),
+			beginSessionHandoff: () => session.beginSessionHandoff(),
+			cancelSessionHandoff: () => session.cancelSessionHandoff(),
+			confirmSessionHandoffClaim: (input) => session.confirmSessionHandoffClaim(input),
+		};
+	}
+
+	private async updateOwnerBridgeSession(): Promise<void> {
+		if (!this.options.ownerBridgeEnabled) return;
+		const session = this.session;
+		const sessionFile = session.sessionManager.isPersisted() ? session.sessionFile : undefined;
+		const sessionKey = sessionFile ? `${session.sessionId}\0${sessionFile}` : undefined;
+		if (this.ownerBridgeServer && sessionKey === this.ownerBridgeSessionKey) return;
+		if (!this.ownerBridgeServer) this.ownerBridgeServer = new OwnerBridgeServer(getAgentDir());
+		const bridgeSession = this.createOwnerBridgeSession(session);
+		if (!this.ownerBridgeServerStarted) {
+			try {
+				await this.ownerBridgeServer.start(bridgeSession);
+				this.ownerBridgeServerStarted = true;
+			} catch (error) {
+				await this.ownerBridgeServer.close();
+				this.ownerBridgeServer = undefined;
+				throw error;
+			}
+		} else {
+			await this.ownerBridgeServer.updateSession(bridgeSession);
+		}
+		this.ownerBridgeSessionKey = sessionKey;
 	}
 
 	private async rebindCurrentSession(options: { renderBeforeBind?: boolean } = {}): Promise<void> {
@@ -3446,6 +3495,12 @@ export class InteractiveMode {
 				this.editor.setText("");
 				return;
 			}
+			if (text === "/handoff" || text.startsWith("/handoff ")) {
+				const action = text.slice("/handoff".length).trim();
+				this.editor.setText("");
+				await this.handleOwnerHandoffCommand(action);
+				return;
+			}
 			if (text === "/session") {
 				this.handleSessionCommand();
 				this.editor.setText("");
@@ -3597,6 +3652,13 @@ export class InteractiveMode {
 	private async handleEvent(event: AgentSessionEvent): Promise<void> {
 		if (!this.isInitialized) {
 			await this.init();
+		}
+		if (event.type === "entry_appended" && this.options.ownerBridgeEnabled) {
+			try {
+				await this.updateOwnerBridgeSession();
+			} catch (error) {
+				this.showError(`Owner bridge failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
 		}
 
 		this.footer.invalidate();
@@ -4555,6 +4617,7 @@ export class InteractiveMode {
 		// dispatch and re-sends the signal if only its own listeners remain.
 
 		if (options?.fromSignal) {
+			await this.closeOwnerBridge();
 			// Signal-triggered shutdown (SIGTERM/SIGHUP). Emit extension cleanup
 			// (session_shutdown) BEFORE touching the terminal. Extension teardown
 			// such as removing sockets does not write to the tty, so it must not be
@@ -4577,6 +4640,7 @@ export class InteractiveMode {
 		this.themeController.disableAutoSync();
 		await this.ui.terminal.drainInput(1000);
 
+		await this.closeOwnerBridge();
 		this.stop();
 		await this.runtimeHost.dispose();
 
@@ -6984,6 +7048,51 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	private async handleOwnerHandoffCommand(action: string): Promise<void> {
+		const status = this.session.getOwnerStatus();
+		if (!action || action === "status") {
+			this.showStatus(
+				`Writer: ${status.isOwner ? "TUI" : status.ownerKind} · pid ${status.pid} · epoch ${status.ownerEpoch ?? 1} · ${status.writerState ?? "idle"}`,
+			);
+			return;
+		}
+		if (action === "begin") {
+			const result = this.session.beginSessionHandoff();
+			if (result.ok) {
+				this.showWarning(
+					`Handoff pending for session ${status.sessionId}. One-use token for the authenticated bridge client: ${result.token}`,
+				);
+			} else {
+				this.showWarning(`${result.code}: ${result.message}`);
+			}
+			return;
+		}
+		if (action === "cancel") {
+			const result = this.session.cancelSessionHandoff();
+			this.showStatus(
+				result.ok ? "Session handoff cancelled; TUI is writable again." : `${result.code}: ${result.message}`,
+			);
+			return;
+		}
+		if (action === "claim") {
+			if (this.options.handoffClaimed) {
+				this.showStatus(
+					`TUI claimed the session before startup · epoch ${this.options.handoffClaimed.ownerEpoch}.`,
+				);
+			} else if (status.isOwner && status.ownerKind === "tui") {
+				this.showStatus(
+					"This TUI already owns the writer lease. Successor claims are consumed before startup via PI_SESSION_OWNER_CLAIM.",
+				);
+			} else {
+				this.showWarning(
+					"A successor must claim PI_SESSION_OWNER_CLAIM before constructing AgentSession; this viewer cannot claim on its behalf.",
+				);
+			}
+			return;
+		}
+		this.showWarning("Usage: /handoff begin|cancel|claim|status");
+	}
+
 	private handleSessionCommand(): void {
 		const stats = this.session.getSessionStats();
 		const sessionName = this.sessionManager.getSessionName();
@@ -7389,7 +7498,16 @@ export class InteractiveMode {
 		}
 	}
 
+	private async closeOwnerBridge(): Promise<void> {
+		const server = this.ownerBridgeServer;
+		this.ownerBridgeServer = undefined;
+		this.ownerBridgeServerStarted = false;
+		this.ownerBridgeSessionKey = undefined;
+		if (server) await server.close();
+	}
+
 	stop(fullscreenExitOutput = this.settingsManager.getFullscreenExitOutput()): void {
+		void this.closeOwnerBridge();
 		this.disposeActiveSelector();
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);

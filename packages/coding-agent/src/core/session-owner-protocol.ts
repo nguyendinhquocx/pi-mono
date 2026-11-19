@@ -33,7 +33,7 @@ export const OWNER_HEARTBEAT_STALE_MS = 90_000;
 export type OwnerKind = "tui" | "lix-worker" | "protocol-test";
 export type { WriterState } from "./session-open-lease.ts";
 
-import { SessionOpenLeaseRegistry } from "./session-open-lease.ts";
+import { type LeaseRecord, type RegistryOpResult, SessionOpenLeaseRegistry } from "./session-open-lease.ts";
 
 /** Thrown in strict mode when the writer cannot prove exclusive ownership. */
 export class SessionOwnerUnavailableError extends Error {
@@ -95,44 +95,53 @@ export function checkOwnerProtocolVersion(declared: number | undefined): void {
 	}
 }
 
-/**
- * Standalone successor-claim entry used by RPC attach flows: the successor
- * process claims the pending handoff BEFORE constructing its AgentSession
- * (a live owner's lease would otherwise block session open). Consumes the
- * PI_SESSION_OWNER_CLAIM env var ("agentDir|pathHash|token|sessionId"), so
- * the var must be cleared afterwards to avoid leaking into child processes.
- * Fails the process with a typed message instead of silently continuing.
- */
-export function claimSessionHandoffFromEnv(
-	env: NodeJS.ProcessEnv = process.env,
-	deps: { exit?: (code: number) => never } = {},
-): void {
-	const raw = env.PI_SESSION_OWNER_CLAIM;
-	if (!raw) return;
-	delete env.PI_SESSION_OWNER_CLAIM;
-	const parts = raw.split("|");
-	if (parts.length !== 4) {
-		process.stderr.write("PI_SESSION_OWNER_CLAIM malformed; expected agentDir|pathHash|token|sessionId\n");
-		(deps.exit ?? process.exit)(1);
-	}
-	const [agentDir, pathHash, token, sessionId] = parts;
-	const registry = SessionOpenLeaseRegistry.open(agentDir, {
+/** Claim a pending lease inside this process without exiting on a failed request. */
+export function claimSessionHandoffInProcess(input: {
+	agentDir: string;
+	pathHash: string;
+	token: string;
+	sessionId: string;
+	ownerKind: OwnerKind;
+}): RegistryOpResult<LeaseRecord> {
+	const registry = SessionOpenLeaseRegistry.open(input.agentDir, {
 		runtime: "owner-protocol",
 		buildHash: OWNER_PROTOCOL_VERSION.toString(),
 	});
-	const claimed = registry.claimHandoff({
-		pathHash,
-		token,
-		sessionId,
-		ownerKind: "lix-worker",
+	return registry.claimHandoff({
+		pathHash: input.pathHash,
+		token: input.token,
+		sessionId: input.sessionId,
+		ownerKind: input.ownerKind,
 		ownerProtocolVersion: OWNER_PROTOCOL_VERSION,
 	});
+}
+
+/**
+ * Claim a successor lease before constructing AgentSession. The one-use env
+ * value is consumed even on malformed/failed claims so it cannot leak to child
+ * processes. The caller chooses the owner kind for the new process.
+ */
+export function claimSessionHandoffFromEnv(
+	env: NodeJS.ProcessEnv,
+	options: { ownerKind: OwnerKind; exit?: (code: number) => never },
+): LeaseRecord | undefined {
+	const raw = env.PI_SESSION_OWNER_CLAIM;
+	if (!raw) return undefined;
+	delete env.PI_SESSION_OWNER_CLAIM;
+	const parts = raw.split("|");
+	if (parts.length !== 4 || parts.some((part) => part.length === 0)) {
+		process.stderr.write("PI_SESSION_OWNER_CLAIM malformed; expected agentDir|pathHash|token|sessionId\n");
+		(options.exit ?? process.exit)(1);
+	}
+	const [agentDir, pathHash, token, sessionId] = parts as [string, string, string, string];
+	const claimed = claimSessionHandoffInProcess({ agentDir, pathHash, token, sessionId, ownerKind: options.ownerKind });
 	if (!claimed.ok) {
 		process.stderr.write(`owner handoff claim failed: ${claimed.code}: ${claimed.message}\n`);
-		(deps.exit ?? process.exit)(1);
-		return;
+		(options.exit ?? process.exit)(1);
+		return undefined;
 	}
 	process.stderr.write(
 		`owner handoff claimed: epoch=${String(claimed.value.owner_epoch)} lease=${claimed.value.lease_id}\n`,
 	);
+	return claimed.value;
 }

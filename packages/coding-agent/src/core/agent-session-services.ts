@@ -13,6 +13,7 @@ import {
 } from "./resource-loader.ts";
 import { type CreateAgentSessionOptions, type CreateAgentSessionResult, createAgentSession } from "./sdk.ts";
 import type { SessionManager } from "./session-manager.ts";
+import type { OwnerKind } from "./session-owner-protocol.ts";
 import { SettingsManager } from "./settings-manager.ts";
 
 /**
@@ -62,6 +63,8 @@ export interface CreateAgentSessionFromServicesOptions {
 	excludeTools?: CreateAgentSessionOptions["excludeTools"];
 	noTools?: CreateAgentSessionOptions["noTools"];
 	customTools?: ToolDefinition[];
+	writerEnforcement?: "strict";
+	ownerKind?: OwnerKind;
 }
 
 /**
@@ -229,5 +232,7 @@ export async function createAgentSessionFromServices(
 		noTools: options.noTools,
 		customTools: options.customTools,
 		sessionStartEvent: options.sessionStartEvent,
+		writerEnforcement: options.writerEnforcement,
+		ownerKind: options.ownerKind,
 	});
 }

@@ -4,14 +4,16 @@
  * real lease registry on a temp agentDir.
  *
  * What this harness PROVES: single-writer registry semantics, token-based
- * handoff (no acquire window, no timeout takeover), writer_conflict on
- * concurrent claims, death-proof recovery, heartbeat state transitions,
- * legacy-record compatibility.
- * What it does NOT prove: gateway/browser transport and live TUI↔Web event
- * streaming with a real provider run — those are T2/T4/T5 integration gates.
+ * handoff, session binding, strict env claim, admission freeze, cached-guard
+ * revalidation, and a real child-process loopback bridge with auth/control/events.
+ * The bridge fixture uses a small session adapter; it does NOT prove the full
+ * TUI terminal, LiX gateway/browser transport, or a real provider turn (T2-T5).
  */
+
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createConnection, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -22,6 +24,7 @@ import {
 	SessionOpenLeaseRegistry,
 } from "../src/core/session-open-lease.ts";
 import { OWNER_PROTOCOL_VERSION } from "../src/core/session-owner-protocol.ts";
+import { createTestSession } from "./utilities.ts";
 
 const testRoots: string[] = [];
 const children: ChildProcessWithoutNullStreams[] = [];
@@ -95,6 +98,57 @@ async function attachChild(): Promise<ChildHandle> {
 	};
 }
 
+interface BridgeClient {
+	socket: Socket;
+	send(value: Record<string, unknown>): void;
+	next(): Promise<Record<string, unknown>>;
+	close(): Promise<void>;
+}
+
+async function connectBridgeClient(port: number): Promise<BridgeClient> {
+	const socket = createConnection({ host: "127.0.0.1", port });
+	socket.setEncoding("utf8");
+	const queued: Record<string, unknown>[] = [];
+	const waiters: Array<(value: Record<string, unknown>) => void> = [];
+	let buffer = "";
+	socket.on("data", (chunk: string) => {
+		buffer += chunk;
+		let newline = buffer.indexOf("\n");
+		while (newline !== -1) {
+			const line = buffer.slice(0, newline).replace(/\r$/, "");
+			buffer = buffer.slice(newline + 1);
+			if (line.length > 0) {
+				const value = JSON.parse(line) as Record<string, unknown>;
+				const waiter = waiters.shift();
+				if (waiter) waiter(value);
+				else queued.push(value);
+			}
+			newline = buffer.indexOf("\n");
+		}
+	});
+	socket.on("error", () => {});
+	const closed = new Promise<void>((resolve) => socket.once("close", resolve));
+	await new Promise<void>((resolve, reject) => {
+		socket.once("connect", resolve);
+		socket.once("error", reject);
+	});
+	return {
+		socket,
+		send(value) {
+			socket.write(`${JSON.stringify(value)}\n`);
+		},
+		next() {
+			const value = queued.shift();
+			if (value) return Promise.resolve(value);
+			return new Promise((resolve) => waiters.push(resolve));
+		},
+		async close() {
+			socket.destroy();
+			await closed;
+		},
+	};
+}
+
 function writeSessionFile(root: string): { file: string; pathHash: string; sessionId: string } {
 	const file = join(root, "sessions", "s1.jsonl");
 	mkdirSync(dirname(file), { recursive: true });
@@ -135,10 +189,28 @@ describe("session owner handoff (two real processes)", () => {
 		expect(begun.ok).toBe(true);
 		expect(begun.handoffEpoch).toBe(2);
 
+		const leasePath = join(root, "session-open-leases", "leases", `${acquired.lease.lease_id}.json`);
+		const persisted = JSON.parse(readFileSync(leasePath, "utf8")) as {
+			handoff_token?: string;
+			handoff_token_hash?: string;
+		};
+		expect(persisted.handoff_token_hash).toBe(createHash("sha256").update(begun.token).digest("hex").slice(0, 32));
+		expect(persisted.handoff_token).toBeUndefined();
+
 		// Wrong token must not take the lease.
 		const wrongToken = await b.send({ cmd: "claim", agentDir: root, pathHash, token: "0".repeat(32), sessionId });
 		expect(wrongToken.ok).toBe(false);
 		expect(wrongToken.code).toBe("writer_conflict");
+
+		const wrongSession = await b.send({
+			cmd: "claim",
+			agentDir: root,
+			pathHash,
+			token: begun.token,
+			sessionId: "different-session",
+		});
+		expect(wrongSession.ok).toBe(false);
+		expect(wrongSession.code).toBe("writer_conflict");
 
 		const claimed = await b.send<{ lease: LeaseRecord }>({
 			cmd: "claim",
@@ -213,6 +285,38 @@ describe("session owner handoff (two real processes)", () => {
 		expect(staleClaim.ok).toBe(false);
 	});
 
+	it("interactive env claim consumes the one-use value and records the TUI owner before session construction", async () => {
+		const root = makeRoot();
+		const { file, pathHash, sessionId } = writeSessionFile(root);
+		const predecessor = await attachChild();
+		const successor = await attachChild();
+		const acquired = await predecessor.send<{ lease: LeaseRecord }>({
+			cmd: "acquire",
+			agentDir: root,
+			sessionId,
+			transcriptPath: file,
+		});
+		expect(acquired.ok).toBe(true);
+		const begun = await predecessor.send<{ token: string; handoffEpoch: number }>({
+			cmd: "beginHandoff",
+			agentDir: root,
+			leaseId: acquired.lease.lease_id,
+		});
+		expect(begun.ok).toBe(true);
+
+		const claimed = await successor.send<{ lease: LeaseRecord; consumed: boolean }>({
+			cmd: "claimEnv",
+			agentDir: root,
+			pathHash,
+			token: begun.token,
+			sessionId,
+		});
+		expect(claimed.ok).toBe(true);
+		expect(claimed.consumed).toBe(true);
+		expect(claimed.lease.owner_kind).toBe("tui");
+		expect(claimed.lease.owner_epoch).toBe(begun.handoffEpoch);
+	});
+
 	it("heartbeat updates writer_state and refreshes heartbeat_utc under the identity guard", async () => {
 		const root = makeRoot();
 		const { file, sessionId } = writeSessionFile(root);
@@ -285,6 +389,193 @@ describe("session owner handoff (two real processes)", () => {
 			expect(registry.isOwnedByCurrentProcess(lease.value)).toBe(false);
 		}
 		void successor;
+	});
+
+	it("real bridge process authenticates, streams owner events, runs controls, rejects a second client, and survives disconnect", async () => {
+		const root = makeRoot();
+		const { file, pathHash, sessionId } = writeSessionFile(root);
+		const owner = await attachChild();
+		const started = await owner.send<{ port: number; pathHash: string }>({
+			cmd: "startBridge",
+			agentDir: root,
+			sessionFile: file,
+			sessionId,
+			pathHash,
+		});
+		expect(started.ok).toBe(true);
+		const tokenPath = join(root, "owner-bridge", `${pathHash}.token`);
+		const token = readFileSync(tokenPath, "utf8").trim();
+		const advertised = JSON.parse(readFileSync(join(root, "owner-bridge", `${pathHash}.json`), "utf8")) as Record<
+			string,
+			unknown
+		>;
+		expect(advertised).toMatchObject({ pid: owner.pid, port: started.port, sessionId });
+		expect(advertised.tokenFingerprint).toBe(createHash("sha256").update(token).digest("hex").slice(0, 32));
+
+		const wrong = await connectBridgeClient(started.port);
+		wrong.send({ type: "auth", token: "wrong-token" });
+		expect(await wrong.next()).toMatchObject({ type: "auth_result", success: false });
+		await wrong.close();
+
+		const client = await connectBridgeClient(started.port);
+		client.send({ type: "auth", token });
+		expect(await client.next()).toMatchObject({ type: "auth_result", success: true, sessionId });
+		client.send({ type: "owner.subscribe", id: "sub-1" });
+		expect(await client.next()).toMatchObject({ type: "response", id: "sub-1", success: true });
+
+		const second = await connectBridgeClient(started.port);
+		expect(await second.next()).toMatchObject({
+			type: "auth_result",
+			success: false,
+			error: { code: "client_limit" },
+		});
+		await second.close();
+
+		const emitted = await owner.send({ cmd: "emitBridgeEvent", name: "live-event" });
+		expect(emitted.ok).toBe(true);
+		expect(await client.next()).toMatchObject({
+			type: "owner_event",
+			owner_epoch: 1,
+			seq: 1,
+			event: { type: "session_info_changed", name: "live-event" },
+		});
+
+		client.send({ type: "owner.handoff.begin", id: "begin-1" });
+		const begun = await client.next();
+		expect(begun).toMatchObject({ type: "response", id: "begin-1", success: true });
+		const begunData = begun.data as { token: string; handoffEpoch: number };
+		client.send({ type: "owner.handoff.claim", id: "claim-wrong", token: "wrong", sessionId });
+		expect(await client.next()).toMatchObject({
+			type: "response",
+			id: "claim-wrong",
+			success: false,
+			error: { code: "writer_conflict" },
+		});
+		client.send({ type: "owner.handoff.cancel", id: "cancel-1" });
+		expect(await client.next()).toMatchObject({ type: "response", id: "cancel-1", success: true });
+
+		client.send({ type: "owner.handoff.begin", id: "begin-2" });
+		const secondBegin = await client.next();
+		const secondBeginData = secondBegin.data as { token: string; handoffEpoch: number };
+		expect(secondBeginData.handoffEpoch).toBe(begunData.handoffEpoch);
+		client.send({
+			type: "owner.handoff.claim",
+			id: "claim-1",
+			token: secondBeginData.token,
+			sessionId,
+		});
+		expect(await client.next()).toMatchObject({ type: "response", id: "claim-1", success: true });
+		await client.close();
+
+		const reconnected = await connectBridgeClient(started.port);
+		reconnected.send({ type: "auth", token });
+		expect(await reconnected.next()).toMatchObject({ type: "auth_result", success: true });
+		reconnected.send({ type: "owner.status", id: "status-after-reconnect" });
+		expect(await reconnected.next()).toMatchObject({
+			type: "response",
+			id: "status-after-reconnect",
+			success: true,
+			data: { isOwner: false, ownerKind: "lix-worker", ownerEpoch: 2 },
+		});
+		reconnected.send({ type: "owner.subscribe", id: "sub-after-reconnect" });
+		expect(await reconnected.next()).toMatchObject({ type: "response", id: "sub-after-reconnect", success: true });
+		const epochEvent = await owner.send({ cmd: "emitBridgeEvent", name: "next-epoch" });
+		expect(epochEvent.ok).toBe(true);
+		expect(await reconnected.next()).toMatchObject({
+			type: "owner_event",
+			owner_epoch: 2,
+			seq: 1,
+			event: { type: "session_info_changed", name: "next-epoch" },
+		});
+		await reconnected.close();
+		const stopped = await owner.send({ cmd: "stopBridge" });
+		expect(stopped.ok).toBe(true);
+		expect(existsSync(join(root, "owner-bridge", `${pathHash}.json`))).toBe(false);
+		expect(existsSync(tokenPath)).toBe(false);
+	});
+
+	it("handoff freezes prompts/appends and strict owners re-read the lease after a successor claim", async () => {
+		const fixture = await createTestSession({ ownerProtocol: true, initialMessages: ["seed transcript"] });
+		const { session, sessionManager, tempDir } = fixture;
+		const sessionFile = sessionManager.getSessionFile();
+		expect(sessionFile).toBeDefined();
+		const pathHash = canonicalTranscriptIdentity(sessionFile!).pathHash;
+		const owner = await attachChild();
+		type SessionInternals = {
+			_ensureSessionAccessGuard(): Promise<void>;
+			_preparePrompt(text: string, options?: unknown): Promise<unknown>;
+			_handoffAdmissionLocked: boolean;
+		};
+		const privateSession = session as unknown as SessionInternals;
+
+		try {
+			await privateSession._ensureSessionAccessGuard();
+			const originalEnsure = privateSession._ensureSessionAccessGuard;
+			const originalPrepare = privateSession._preparePrompt;
+			let finishGuardWait: (() => void) | undefined;
+			privateSession._ensureSessionAccessGuard = () =>
+				new Promise((resolve) => {
+					finishGuardWait = resolve;
+				});
+			privateSession._preparePrompt = async () => undefined;
+			const preflightPrompt = session.prompt("in-flight admission");
+			await Promise.resolve();
+			const racedBegin = session.beginSessionHandoff();
+			expect(racedBegin).toMatchObject({
+				ok: false,
+				code: "handoff_refused",
+				pendingWork: { prompt_admission: true },
+			});
+			finishGuardWait?.();
+			await preflightPrompt;
+			privateSession._ensureSessionAccessGuard = originalEnsure;
+			privateSession._preparePrompt = originalPrepare;
+
+			const begun = session.beginSessionHandoff();
+			expect(begun.ok).toBe(true);
+			if (!begun.ok) return;
+			await expect(session.prompt("must not enter a handoff-pending turn")).rejects.toMatchObject({
+				code: "handoff_pending",
+			});
+			let appendError: unknown;
+			try {
+				sessionManager.appendMessage({ role: "user", content: "must not append", timestamp: Date.now() });
+			} catch (error) {
+				appendError = error;
+			}
+			expect(appendError).toMatchObject({ code: "handoff_pending" });
+
+			const claimed = await owner.send<{ lease: LeaseRecord }>({
+				cmd: "claim",
+				agentDir: tempDir,
+				pathHash,
+				token: begun.token,
+				sessionId: session.sessionId,
+			});
+			expect(claimed.ok).toBe(true);
+			// Simulate a stale caller that still has the old shared OS guard but missed
+			// the admission freeze: the per-write lease re-read must reject its append.
+			privateSession._handoffAdmissionLocked = false;
+			let staleAppendError: unknown;
+			try {
+				sessionManager.appendMessage({ role: "user", content: "stale owner append", timestamp: Date.now() });
+			} catch (error) {
+				staleAppendError = error;
+			}
+			expect(staleAppendError).toMatchObject({ code: "writer_conflict" });
+			privateSession._handoffAdmissionLocked = true;
+			await expect(privateSession._ensureSessionAccessGuard()).rejects.toMatchObject({
+				name: "SessionDataLockedError",
+			});
+			const detached = await session.confirmSessionHandoffClaim({
+				token: begun.token,
+				sessionId: session.sessionId,
+			});
+			expect(detached).toMatchObject({ ok: true, ownerEpoch: 2, ownerPid: owner.pid });
+		} finally {
+			await session.releaseSessionDataAccess();
+			fixture.cleanup();
+		}
 	});
 
 	it("legacy lease records without owner fields still parse (backward compatibility)", () => {
