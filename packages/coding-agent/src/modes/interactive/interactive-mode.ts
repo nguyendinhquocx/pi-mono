@@ -2266,6 +2266,7 @@ export class InteractiveMode {
 			beginSessionHandoff: () => session.beginSessionHandoff(),
 			cancelSessionHandoff: () => session.cancelSessionHandoff(),
 			confirmSessionHandoffClaim: (input) => session.confirmSessionHandoffClaim(input),
+			onOwnerStateChanged: () => this.showOwnerStatus(session),
 		};
 	}
 
@@ -7048,12 +7049,17 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	private showOwnerStatus(session: AgentSession): void {
+		const status = session.getOwnerStatus();
+		this.showStatus(
+			`Writer: ${status.isOwner ? "TUI" : status.ownerKind} · pid ${status.pid} · epoch ${status.ownerEpoch ?? 1} · ${status.writerState ?? "idle"}`,
+		);
+	}
+
 	private async handleOwnerHandoffCommand(action: string): Promise<void> {
 		const status = this.session.getOwnerStatus();
 		if (!action || action === "status") {
-			this.showStatus(
-				`Writer: ${status.isOwner ? "TUI" : status.ownerKind} · pid ${status.pid} · epoch ${status.ownerEpoch ?? 1} · ${status.writerState ?? "idle"}`,
-			);
+			this.showOwnerStatus(this.session);
 			return;
 		}
 		if (action === "begin") {

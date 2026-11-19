@@ -41,6 +41,7 @@ export interface OwnerBridgeSession {
 		token: string;
 		sessionId: string;
 	}): Promise<{ ok: true; ownerEpoch: number; ownerPid: number } | { ok: false; code: string; message: string }>;
+	onOwnerStateChanged?(): void;
 }
 
 interface BridgeAdvertisement {
@@ -278,6 +279,7 @@ export class OwnerBridgeServer {
 					});
 					return;
 				}
+				session.onOwnerStateChanged?.();
 				this.writeResponse(socket, parsed.id, parsed.type, true, {
 					token: result.token,
 					handoffEpoch: result.handoffEpoch,
@@ -286,6 +288,7 @@ export class OwnerBridgeServer {
 			}
 			case "owner.handoff.cancel": {
 				const result = session.cancelSessionHandoff();
+				if (result.ok) session.onOwnerStateChanged?.();
 				this.writeResponse(
 					socket,
 					parsed.id,
@@ -308,6 +311,7 @@ export class OwnerBridgeServer {
 					token: parsed.token,
 					sessionId: parsed.sessionId,
 				});
+				if (result.ok) session.onOwnerStateChanged?.();
 				this.writeResponse(
 					socket,
 					parsed.id,
