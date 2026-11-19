@@ -74,6 +74,8 @@ ghi receipt mới (decision approved, artifactHash mới, supersedes build cũ) 
 
 Pi ProDesk chạy release riêng tại `~/.local/prodesk-pi`; **không** dùng `pi_core_manager.py` hay `install-prodesk-pi.sh` để cài Li vì hai tool đó pin `pi` path/version. Li có root riêng `~/.local/prodesk-li`; `pi`, `~/.local/prodesk-pi/current`, services và `.pi` profile không bị thay thế.
 
+**Tab spawn Li-first (từ SPEC-2026-11-18, 2026-11-19):** `~/.local/bin/prodesk-pi-launcher` mặc định exec Li wrapper (`~/.local/prodesk-li/bin/li`); set `PRODESK_TAB_RUNTIME=pi` để quay về Pi release. PTY/handle/session-title/argv contract giữ nguyên. Rollback launcher cũ nằm ở `~/.local/prodesk-pi-control/migration-backup-20261119T-li-first/`; source launcher tại laptop `app_presets/home_server/prodesk-pi-control/` (commit `d41e9805`).
+
 Release là bundle Linux x64 có Node 22.19.0 hash-pin từ `python/app_presets/home_server/pi-agent/artifacts/artifact-lock.json`, Li dist/assets và external runtime modules cần thiết (`jiti`, `@silvia-odwyer/photon-node`). Packer refuse source dirty, output ghi đè, hash mismatch hoặc thiếu build receipt.
 
 Trước build candidate, Pi ProDesk tạo snapshot private của toàn bộ `~/.pi` tại `~/.local/state/prodesk-li/profile-snapshots/<snapshot-id>/`:
