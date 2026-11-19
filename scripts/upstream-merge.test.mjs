@@ -15,15 +15,17 @@ function fakeGit({ revParse = {}, describe = "v1.5.2" } = {}) {
 	const calls = [];
 	return {
 		calls,
-		gitFn: (arg, opts) => {
-			calls.push({ arg, opts });
-			if (Array.isArray(arg)) return "";
-			if (arg.startsWith("refs/tags/") || /^[0-9a-f]{40}$/.test(arg)) {
-				if (arg === "refs/tags/v1.5.2" || arg === TAG_SHA || arg === MAIN_SHA) return arg === MAIN_SHA ? MAIN_SHA : TAG_SHA;
+		gitFn: (...args) => {
+			calls.push({ args });
+			const opts = typeof args.at(-1) === "object" ? args.pop() : {};
+			if (args[0] === "rev-parse") {
+				const ref = args[3];
+				if (ref === "refs/tags/v1.5.2" || ref === TAG_SHA || ref === MAIN_SHA) return ref === MAIN_SHA ? MAIN_SHA : TAG_SHA;
 				if (opts?.allowFail) return "";
 				throw new Error("unknown revision");
 			}
-			if (arg === "describe") return describe;
+			if (args[0] === "describe") return describe;
+			if (args[0] === "remote") return "";
 			return "";
 		},
 	};

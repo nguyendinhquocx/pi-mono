@@ -82,7 +82,8 @@ export function resolveTargetSha({ gitFn, target, channel, upstreamSha, dry }) {
 	}
 	const looksLikeTag = target.startsWith("v") && !FULL_SHA.test(target);
 	const ref = looksLikeTag ? `refs/tags/${target}` : target;
-	let resolved = gitFn(ref, { allowFail: true }) || gitFn(`${ref}^{commit}`, { allowFail: true });
+	let resolved = gitFn("rev-parse", "--verify", "--quiet", ref, { allowFail: true })
+		|| gitFn("rev-parse", "--verify", "--quiet", `${ref}^{commit}`, { allowFail: true });
 	if (!resolved) {
 		throw new Error(
 			dry
