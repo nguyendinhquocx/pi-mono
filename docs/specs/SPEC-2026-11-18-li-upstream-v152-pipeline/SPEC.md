@@ -13,6 +13,12 @@ related_paths: ["packages/coding-agent/src/core/agent-session.ts", "packages/cod
 
 # Spec: Upstream Li lên v1.5.2 + hệ thống hóa pipeline upstream cho fork fleet
 
+## Erratum — upstream target identity (2026-11-19)
+
+The original spec mislabeled `05fd3fbda0bbb9a1c7a76e4bf92ab58ed77c8d94` as the v1.5.2 release tag SHA. It is actually an upstream `main` commit dated 2026-11-18 (`docs(p3): decision: p3 likely ships as a single executable`). The official `v1.5.2` tag is `b4afdddf44e059c67ccf5097e5317d913521b470`, published 2026-11-10. GitHub compare reports 312 commits from the release tag to the integrated target. Li therefore contains the v1.5.2 release plus an unreleased upstream-main snapshot, while package version remains 1.5.2.
+
+At the correction check, upstream `main` was `5a14e69c067d40dfbff4f2fff7d3b34c897e2dc9`, 20 commits beyond the integrated target. Owner chose to keep the already-tested/deployed `05fd` state and defer those 20 commits. Future reports must identify release tag and main target separately. Detailed evidence: `docs/maintenance-receipts/2026-11-18-v152-a38d8cc93d.md`.
+
 ## Context Snapshot
 - Project / module: Li — fork build runtime từ `pi-mono` (upstream `earendil-works/pi`); worktree chính `D:\pcloud\workspace\code\pi-mono-li`, branch `li/stable`. Runbook: `docs/li-maintenance.md`. Registry: `D:\pcloud\workspace\knowledge\upstream-forks\REGISTRY.md` (entry pi-mono, trạng thái `paused-upstream`).
 - Supersedes: none (spec mới; tham chiếu SPEC-2026-10-19-li-private-runtime cho hợp đồng routing runtime, SPEC-2026-10-22-li-prodesk-linux-install cho lane ProDesk).
