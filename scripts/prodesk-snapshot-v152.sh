@@ -66,8 +66,11 @@ python3 - "$staging_dir/snapshot.json" "$snapshot_id" "$file_count" "$link_count
 import json, sys
 from datetime import datetime, timezone
 path, snapshot_id, file_count, link_count, socket_count, directory_time_drift, digest, size = sys.argv[1:]
+# Numeric receipt fields must be JSON numbers, not strings (argv is always
+# str): verifiers compare counts/size with int arithmetic and a string receipt
+# makes every equality check false (seen 2026-11-19 on the v1.5.2 snapshot).
 with open(path, 'w', encoding='utf-8') as f:
-    json.dump({'snapshot_id': snapshot_id, 'source_path': '.pi', 'file_count': file_count, 'symlink_count': link_count, 'socket_count_skipped': socket_count, 'directory_time_drift_count': directory_time_drift, 'archive_sha256': digest, 'archive_size_bytes': size, 'created_at': datetime.now(timezone.utc).isoformat()}, f, indent=2)
+    json.dump({'snapshot_id': snapshot_id, 'source_path': '.pi', 'file_count': int(file_count), 'symlink_count': int(link_count), 'socket_count_skipped': int(socket_count), 'directory_time_drift_count': int(directory_time_drift), 'archive_sha256': digest, 'archive_size_bytes': int(size), 'created_at': datetime.now(timezone.utc).isoformat()}, f, indent=2)
     f.write('\n')
 PY
 chmod 0600 "$staging_dir/profile.tar.gz" "$staging_dir/snapshot.json"
