@@ -192,6 +192,7 @@ flowchart TD
   - Session mới gõ tiếng Việt UI vẫn đúng; `/trim` hoạt động (T20 approved); compaction chạy trên session dài.
 - Reproduce sau promote (T20 approved): `powershell -NoProfile -File tests/super-parent/resume-tool-loadout-smoke.ps1 -LiRepo ..\pi-mono-li -ExtensionSource app_presets\pi\extensions` (từ Python repo). Candidate external worktree hiện fail TypeScript branded-type resolution do hai real workspace paths — không bypass; nếu vẫn fail sau promote, mở task sửa harness.
 - Files: không sửa (verify-only).
+- **Kết quả T7 (2026-11-18): PASS — user UAT đủ 6 mục**: (1) boot `li` từ CWD project, UI VI render đúng; (2) session list chung với `pi` (cùng profile); (3) `/trim` chạy trên runtime thật (T20 approved); (4) compaction trên session dài OK; (5) subagent_tab spawn từ Li → child chạy Li CLI; (6) không mở cùng session file 2 runtime đồng thời. Auto-verify kèm: `li update` refuse đúng contract không side effect; `li --help` identity Li; smoke harness sau promote vẫn fail branded-type 2 workspace paths — đúng bệnh đã ghi, mở task riêng post-promote (không block).
 
 ### Task 8: ProDesk deploy + Li-first runtime
 - Acceptance (luồng 2 chặng, cấm gộp):
