@@ -272,3 +272,9 @@ flowchart TD
 - [ ] Gate UAT: User Test bảng trên PASS (user chạy).
 - [ ] Gate ProDesk: installer verify + readiness + rollback pointer kiểm chứng (T8).
 - [ ] Gate tài liệu: receipt + REGISTRY + runbook cập nhật (T9, T10); spec-archive PASS.
+
+### Task 10: Receipt + REGISTRY/runbook + archive (DONE 2026-11-19)
+- Maintenance receipt: `docs/maintenance-receipts/2026-11-18-v152-a38d8cc93d.md` (commit `3473e7bd72`) — status DONE, refs/artifacts/risks/evidence/lessons đầy đủ.
+- REGISTRY `knowledge/upstream-forks/REGISTRY.md`: entry pi-mono → `PROMOTED v1.5.2 2026-11-18` kèm backups + rollback pointers.
+- Runbook `docs/li-maintenance.md`: ghi ProDesk tab spawn Li-first (`PRODESK_TAB_RUNTIME=pi` fallback, launcher backup path).
+- Spec archive: `docs/specs/SPEC-2026-11-18-li-upstream-v152-pipeline/` (SPEC/RECEIPT/INDEX, `--spec-check` PASS) — working source cleared.
