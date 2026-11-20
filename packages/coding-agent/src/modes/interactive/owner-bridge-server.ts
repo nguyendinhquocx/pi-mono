@@ -1,11 +1,12 @@
 /** Loopback JSONL owner bridge shared by the interactive TUI and local host clients. */
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { unlinkSync } from "node:fs";
-import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { readFileSync, unlinkSync } from "node:fs";
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import type { AgentSessionEvent } from "../../core/agent-session.ts";
 import { canonicalTranscriptIdentity } from "../../core/session-open-lease.ts";
+import { OWNER_PROTOCOL_VERSION } from "../../core/session-owner-protocol.ts";
 import { toJsonEvent } from "../json-event.ts";
 
 const MAX_LINE_BYTES = 1024 * 1024;
@@ -52,31 +53,82 @@ interface BridgeAdvertisement {
 	writerState: string;
 }
 
+const STATUS_CACHE_TTL_MS = 200;
+const MAX_PENDING_AUTH_SOCKETS = 4;
+
 /** Serve the interactive owner's events and handoff controls on loopback only. */
 export class OwnerBridgeServer {
 	private readonly bridgeDir: string;
-	private readonly token = randomBytes(32).toString("hex");
+	private token = randomBytes(32).toString("hex");
+	private tokenFingerprint: string;
 	private server: Server | undefined;
 	private session: OwnerBridgeSession | undefined;
 	private unsubscribe: (() => void) | undefined;
 	private activeClient: Socket | undefined;
 	private activeClientAuthenticated = false;
 	private activeClientSubscribed = false;
+	private readonly pendingAuthSockets = new Set<Socket>();
+	private cachedOwnerStatus: { status: OwnerBridgeStatus; at: number } | undefined;
 	private eventEpoch: number | undefined;
 	private eventSeq = 0;
 	private advertisedPath: string | undefined;
 	private tokenPath: string | undefined;
 	private port: number | undefined;
-	private readonly processExitHandler = (): void => {
-		for (const filePath of [this.advertisedPath, this.tokenPath]) {
-			if (!filePath) continue;
+	/** True when the discovery file on disk still belongs to THIS bridge process and the given token epoch. */
+	#discoveryIsOurs(tokenFingerprint: string): boolean {
+		const advertisedPath = this.advertisedPath;
+		if (!advertisedPath) return false;
+		let raw: string;
+		try {
+			raw = readFileSync(advertisedPath, "utf8");
+		} catch {
+			return false;
+		}
+		try {
+			const advertisement = JSON.parse(raw) as { pid?: unknown; tokenFingerprint?: unknown };
+			return advertisement.pid === process.pid && advertisement.tokenFingerprint === tokenFingerprint;
+		} catch {
+			// Unparseable discovery data may belong to another owner; never delete on a guess.
+			return false;
+		}
+	}
+	#tokenFileIsOurs(tokenPath: string, token: string): boolean {
+		try {
+			return readFileSync(tokenPath, "utf8").trim() === token;
+		} catch {
+			return false;
+		}
+	}
+	/**
+	 * Remove only discovery files this bridge still owns; a successor's files stay
+	 * untouched. Verification and unlink happen synchronously in one JS turn so a
+	 * successor publishing between the two cannot be raced (F3). Callers rotating
+	 * the token pass the identity that WROTE the files on disk, otherwise the
+	 * post-rotation fingerprint would never match and the old advertisement would
+	 * be stranded (delta-review FINDING-1).
+	 */
+	#removeOwnedDiscoverySync(expectedToken = this.token, expectedFingerprint = this.tokenFingerprint): void {
+		const advertisedPath = this.advertisedPath;
+		const tokenPath = this.tokenPath;
+		if (advertisedPath && this.#discoveryIsOurs(expectedFingerprint)) {
 			try {
-				unlinkSync(filePath);
+				unlinkSync(advertisedPath);
 			} catch {}
 		}
+		if (tokenPath && this.#tokenFileIsOurs(tokenPath, expectedToken)) {
+			try {
+				unlinkSync(tokenPath);
+			} catch {}
+		}
+		if (this.advertisedPath === advertisedPath) this.advertisedPath = undefined;
+		if (this.tokenPath === tokenPath) this.tokenPath = undefined;
+	}
+	private readonly processExitHandler = (): void => {
+		this.#removeOwnedDiscoverySync();
 	};
 
 	constructor(agentDir: string) {
+		this.tokenFingerprint = createHash("sha256").update(this.token, "utf8").digest("hex").slice(0, 32);
 		this.bridgeDir = join(agentDir, "owner-bridge");
 		process.on("exit", this.processExitHandler);
 	}
@@ -115,17 +167,24 @@ export class OwnerBridgeServer {
 		this.activeClient?.end();
 		this.activeClient = undefined;
 		this.activeClientAuthenticated = false;
-		await this.removeAdvertisement();
+		this.cachedOwnerStatus = undefined;
+		// Rotate BEFORE removing the old discovery record: a client holding the old
+		// token cannot authenticate across a session change (F2). The removal still
+		// verifies against the token that wrote the files on disk.
+		const previousToken = this.token;
+		const previousFingerprint = this.tokenFingerprint;
+		this.token = randomBytes(32).toString("hex");
+		this.tokenFingerprint = createHash("sha256").update(this.token, "utf8").digest("hex").slice(0, 32);
+		this.#removeOwnedDiscoverySync(previousToken, previousFingerprint);
 		const sessionFile = session.isPersisted() ? session.getSessionFile() : undefined;
 		if (!sessionFile || this.port === undefined) return;
 		const pathHash = canonicalTranscriptIdentity(sessionFile).pathHash;
 		this.advertisedPath = join(this.bridgeDir, `${pathHash}.json`);
 		this.tokenPath = join(this.bridgeDir, `${pathHash}.token`);
-		const fingerprint = createHash("sha256").update(this.token, "utf8").digest("hex").slice(0, 32);
 		const advertisement: BridgeAdvertisement = {
 			pid: process.pid,
 			port: this.port,
-			tokenFingerprint: fingerprint,
+			tokenFingerprint: this.tokenFingerprint,
 			sessionId: session.getSessionId(),
 			writerState: session.getOwnerStatus().writerState ?? "idle",
 		};
@@ -144,44 +203,28 @@ export class OwnerBridgeServer {
 		this.activeClient = undefined;
 		this.activeClientAuthenticated = false;
 		this.activeClientSubscribed = false;
-		await this.removeAdvertisement();
+		for (const pending of this.pendingAuthSockets) pending.destroy();
+		this.pendingAuthSockets.clear();
+		this.#removeOwnedDiscoverySync();
 		process.off("exit", this.processExitHandler);
 		const server = this.server;
 		this.server = undefined;
 		if (server) await new Promise<void>((resolve) => server.close(() => resolve()));
 	}
 
-	private async removeAdvertisement(): Promise<void> {
-		const advertisedPath = this.advertisedPath;
-		const tokenPath = this.tokenPath;
-		await Promise.all(
-			[advertisedPath, tokenPath]
-				.filter((filePath): filePath is string => filePath !== undefined)
-				.map(async (filePath) => {
-					try {
-						await rm(filePath, { force: true });
-					} catch {
-						// Discovery cleanup is best-effort; it must not prevent terminal restoration.
-					}
-				}),
-		);
-		if (this.advertisedPath === advertisedPath) this.advertisedPath = undefined;
-		if (this.tokenPath === tokenPath) this.tokenPath = undefined;
-	}
-
 	private acceptClient(socket: Socket): void {
-		if (this.activeClient) {
+		// Auth-first-then-slot: unauthenticated sockets occupy a small pending pool
+		// instead of the single client slot (bridge-security finding).
+		if (this.pendingAuthSockets.size >= MAX_PENDING_AUTH_SOCKETS) {
 			this.writeLine(socket, {
 				type: "auth_result",
 				success: false,
-				error: { code: "client_limit", message: "owner bridge allows one client at a time" },
+				error: { code: "client_limit", message: "owner bridge has too many pending authentication attempts" },
 			});
 			socket.end();
 			return;
 		}
-		this.activeClient = socket;
-		this.activeClientAuthenticated = false;
-		this.activeClientSubscribed = false;
+		this.pendingAuthSockets.add(socket);
 		socket.setEncoding("utf8");
 		let input = "";
 		const authTimeout = setTimeout(() => socket.destroy(), AUTH_TIMEOUT_MS);
@@ -202,6 +245,7 @@ export class OwnerBridgeServer {
 		});
 		socket.on("close", () => {
 			clearTimeout(authTimeout);
+			this.pendingAuthSockets.delete(socket);
 			if (this.activeClient === socket) {
 				this.activeClient = undefined;
 				this.activeClientAuthenticated = false;
@@ -226,7 +270,9 @@ export class OwnerBridgeServer {
 			socket.destroy();
 			return;
 		}
-		if (!this.activeClientAuthenticated) {
+		if (this.activeClient !== socket) {
+			// Authentication phase: this socket has not won the client slot yet. The
+			// authenticated flags below describe the ACTIVE client, not this pending one.
 			if (parsed.type !== "auth" || typeof parsed.token !== "string" || !sameToken(this.token, parsed.token)) {
 				this.writeLine(socket, {
 					type: "auth_result",
@@ -236,6 +282,19 @@ export class OwnerBridgeServer {
 				socket.destroy();
 				return;
 			}
+			if (this.activeClient) {
+				// Slot is claimed only by an authenticated client; a second correct
+				// token still cannot take it (client_limit).
+				this.writeLine(socket, {
+					type: "auth_result",
+					success: false,
+					error: { code: "client_limit", message: "owner bridge allows one client at a time" },
+				});
+				socket.destroy();
+				return;
+			}
+			this.pendingAuthSockets.delete(socket);
+			this.activeClient = socket;
 			this.activeClientAuthenticated = true;
 			clearTimeout(authTimeout);
 			this.writeLine(socket, {
@@ -262,10 +321,26 @@ export class OwnerBridgeServer {
 			return;
 		}
 		switch (parsed.type) {
-			case "owner.subscribe":
+			case "owner.subscribe": {
+				if (parsed.protocolVersion !== OWNER_PROTOCOL_VERSION) {
+					// Fail-closed handshake, symmetric with the RPC owner_capability check:
+					// an unversioned subscriber cannot read owner events.
+					this.writeResponse(socket, parsed.id, parsed.type, false, undefined, {
+						code: "protocol_mismatch",
+						message: `owner bridge requires protocol version ${OWNER_PROTOCOL_VERSION}`,
+					});
+					return;
+				}
 				this.activeClientSubscribed = true;
-				this.writeResponse(socket, parsed.id, parsed.type, true, session.getOwnerStatus());
+				this.eventEpoch = undefined;
+				this.eventSeq = 0;
+				// Every (re)subscription must re-snapshot before trusting the stream.
+				this.writeResponse(socket, parsed.id, parsed.type, true, {
+					...session.getOwnerStatus(),
+					resync_required: true,
+				});
 				return;
+			}
 			case "owner.status":
 				this.writeResponse(socket, parsed.id, parsed.type, true, session.getOwnerStatus());
 				return;
@@ -280,6 +355,7 @@ export class OwnerBridgeServer {
 					return;
 				}
 				session.onOwnerStateChanged?.();
+				this.cachedOwnerStatus = undefined;
 				this.writeResponse(socket, parsed.id, parsed.type, true, {
 					token: result.token,
 					handoffEpoch: result.handoffEpoch,
@@ -288,7 +364,10 @@ export class OwnerBridgeServer {
 			}
 			case "owner.handoff.cancel": {
 				const result = session.cancelSessionHandoff();
-				if (result.ok) session.onOwnerStateChanged?.();
+				if (result.ok) {
+					session.onOwnerStateChanged?.();
+					this.cachedOwnerStatus = undefined;
+				}
 				this.writeResponse(
 					socket,
 					parsed.id,
@@ -311,7 +390,10 @@ export class OwnerBridgeServer {
 					token: parsed.token,
 					sessionId: parsed.sessionId,
 				});
-				if (result.ok) session.onOwnerStateChanged?.();
+				if (result.ok) {
+					session.onOwnerStateChanged?.();
+					this.cachedOwnerStatus = undefined;
+				}
 				this.writeResponse(
 					socket,
 					parsed.id,
@@ -333,10 +415,26 @@ export class OwnerBridgeServer {
 	private publishEvent(event: AgentSessionEvent): void {
 		const socket = this.activeClient;
 		if (!socket || !this.activeClientAuthenticated || !this.activeClientSubscribed) return;
-		const epoch = this.session?.getOwnerStatus().ownerEpoch ?? 1;
+		// Re-read the owner epoch at most once per TTL window so dense event bursts do
+		// not parse the lease registry per event; state changes invalidate the cache.
+		const now = Date.now();
+		if (!this.cachedOwnerStatus || now - this.cachedOwnerStatus.at >= STATUS_CACHE_TTL_MS) {
+			this.cachedOwnerStatus = { status: this.session!.getOwnerStatus(), at: now };
+		}
+		const epoch = this.cachedOwnerStatus.status.ownerEpoch ?? 1;
 		if (this.eventEpoch !== epoch) {
+			const previousEpoch = this.eventEpoch;
 			this.eventEpoch = epoch;
 			this.eventSeq = 0;
+			if (previousEpoch !== undefined) {
+				// Epoch changed mid-subscription: force the viewer to re-snapshot.
+				this.writeLine(socket, {
+					type: "owner_epoch_changed",
+					previous_epoch: previousEpoch,
+					owner_epoch: epoch,
+					resync_required: true,
+				});
+			}
 		}
 		this.writeLine(socket, {
 			type: "owner_event",

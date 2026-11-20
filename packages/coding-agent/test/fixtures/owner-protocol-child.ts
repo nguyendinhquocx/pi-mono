@@ -11,7 +11,7 @@
  */
 import { createInterface } from "node:readline";
 import type { AgentSessionEvent } from "../../src/core/agent-session.ts";
-import { SessionOpenLeaseRegistry } from "../../src/core/session-open-lease.ts";
+import { type LeaseRecord, SessionOpenLeaseRegistry } from "../../src/core/session-open-lease.ts";
 import {
 	claimSessionHandoffFromEnv,
 	claimSessionHandoffInProcess,
@@ -32,7 +32,9 @@ type Command =
 	| { cmd: "abortHandoff"; agentDir: string; leaseId: string }
 	| { cmd: "heartbeat"; agentDir: string; leaseId: string; writerState?: "idle" | "running" }
 	| { cmd: "getLease"; agentDir: string; pathHash: string }
+	| { cmd: "releaseLease"; agentDir: string; expectedLease: LeaseRecord }
 	| { cmd: "startBridge"; agentDir: string; sessionFile: string; sessionId: string; pathHash: string }
+	| { cmd: "updateSession"; sessionFile: string; sessionId: string; pathHash: string }
 	| { cmd: "emitBridgeEvent"; name: string }
 	| { cmd: "stopBridge" }
 	| { cmd: "ping" };
@@ -230,11 +232,27 @@ async function main(): Promise<void> {
 					);
 					break;
 				}
+				case "releaseLease": {
+					const registry = openRegistry(command.agentDir);
+					const result = registry.releaseLease(command.expectedLease);
+					respond(result.ok ? { ok: true } : { ok: false, code: result.code, error: result.message });
+					break;
+				}
 				case "startBridge": {
 					bridgeSession = new FixtureBridgeSession(command.sessionFile, command.sessionId, command.pathHash);
 					bridgeServer = new OwnerBridgeServer(command.agentDir);
 					await bridgeServer.start(bridgeSession);
 					respond({ ok: true, pid: process.pid, port: bridgeServer.getPort(), pathHash: command.pathHash });
+					break;
+				}
+				case "updateSession": {
+					if (!bridgeServer) {
+						respond({ ok: false, error: "bridge is not started" });
+						break;
+					}
+					bridgeSession = new FixtureBridgeSession(command.sessionFile, command.sessionId, command.pathHash);
+					await bridgeServer.updateSession(bridgeSession);
+					respond({ ok: true });
 					break;
 				}
 				case "emitBridgeEvent": {

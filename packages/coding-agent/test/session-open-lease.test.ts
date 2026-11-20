@@ -107,7 +107,7 @@ describe("SessionOpenLeaseRegistry", () => {
 		const leasePath = join(root, "session-open-leases", "leases", `${first.value.lease_id}.json`);
 		expect(existsSync(leasePath)).toBe(true);
 		expect(JSON.parse(readFileSync(leasePath, "utf8")).lease_state).toBe("open");
-		expect(registry.releaseLease(first.value.lease_id)).toEqual({ ok: true, value: true });
+		expect(registry.releaseLease(first.value)).toEqual({ ok: true, value: true });
 		expect(existsSync(leasePath)).toBe(false);
 	});
 

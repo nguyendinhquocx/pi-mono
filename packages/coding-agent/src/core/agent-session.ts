@@ -711,6 +711,8 @@ export class AgentSession {
 	private _ownerKind: OwnerKind = "tui";
 	private _uiPendingCount = 0;
 	private _promptAdmissionCount = 0;
+	/** In-flight steer/followUp admissions; beginSessionHandoff must refuse while > 0. */
+	private _queueAdmissionCount = 0;
 	private _handoffAdmissionLocked = false;
 	private _pendingHandoffToken: string | undefined;
 	private _detachedOwnerLease: LeaseRecord | undefined;
@@ -2691,6 +2693,10 @@ export class AgentSession {
 					"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
 				);
 			}
+			// Mirror _queueUserInput: never enqueue into a session frozen mid-prompt
+			// (the admission counter above covers beginSessionHandoff; this covers a
+			// freeze that raced the awaits above).
+			this._throwIfSessionDataLocked();
 			if (options.streamingBehavior === "followUp") {
 				await this._queueFollowUp(expandedText, currentImages);
 			} else {
@@ -2804,6 +2810,10 @@ export class AgentSession {
 		let expandedText = this._expandSkillCommand(processedInput.text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
+		// The awaits above (input handlers, expansion) may have raced a handoff that
+		// passed its idle check before this admission registered; never enqueue into
+		// a frozen session.
+		this._throwIfSessionDataLocked();
 		if (behavior === "steer") {
 			await this._queueSteer(expandedText, processedInput.images);
 		} else {
@@ -2827,7 +2837,14 @@ export class AgentSession {
 		options?: { source?: InputSource },
 	): Promise<QueuedInputDisposition> {
 		this._throwIfSessionDataLocked();
-		return this._queueUserInput(text, images, "steer", options?.source ?? "interactive");
+		// Reserve admission before the first await: input-handler and template awaits
+		// must not let a handoff begin between the lock check and the actual enqueue.
+		this._queueAdmissionCount++;
+		try {
+			return await this._queueUserInput(text, images, "steer", options?.source ?? "interactive");
+		} finally {
+			this._queueAdmissionCount--;
+		}
 	}
 
 	/**
@@ -2844,7 +2861,12 @@ export class AgentSession {
 		options?: { source?: InputSource },
 	): Promise<QueuedInputDisposition> {
 		this._throwIfSessionDataLocked();
-		return this._queueUserInput(text, images, "followUp", options?.source ?? "interactive");
+		this._queueAdmissionCount++;
+		try {
+			return await this._queueUserInput(text, images, "followUp", options?.source ?? "interactive");
+		} finally {
+			this._queueAdmissionCount--;
+		}
 	}
 
 	/**
@@ -3935,20 +3957,18 @@ export class AgentSession {
 	private _acquireSessionOpenLeaseIfNeeded(): void {
 		const registry = this._leaseRegistry;
 		const sessionFile = this.sessionManager.getSessionFile();
-		if (
-			!registry ||
-			!registry.available ||
-			!this.sessionManager.isPersisted() ||
-			!sessionFile ||
-			!existsSync(sessionFile)
-		) {
-			if (this._ownerStrict && registry && !registry.available) {
+		if (!this.sessionManager.isPersisted() || !sessionFile) return;
+		if (!registry || !registry.available) {
+			if (this._ownerStrict) {
 				throw new SessionOwnerUnavailableError(
-					`strict writer mode requires the lease registry: ${registry.degradationReason ?? "unavailable"}`,
+					`strict writer mode requires the lease registry: ${registry?.degradationReason ?? "unavailable"}`,
 				);
 			}
 			return;
 		}
+		// Strict owners claim the canonical path before its first transcript bytes
+		// exist. Legacy local TUI keeps the previous lazy-acquire behavior.
+		if (!this._ownerStrict && !existsSync(sessionFile)) return;
 		if (this._sessionOpenLease?.session_id === this.sessionManager.getSessionId()) return;
 		const { pathHash } = canonicalTranscriptIdentity(sessionFile);
 		const acquired = registry.acquireLease({
@@ -4179,6 +4199,7 @@ export class AgentSession {
 			retrying: this._retryAbortController !== undefined,
 			failed_response: this._failedResponse !== undefined,
 			prompt_admission: this._promptAdmissionCount > 0,
+			queue_admission: this._queueAdmissionCount > 0,
 		};
 	}
 
@@ -4215,7 +4236,7 @@ export class AgentSession {
 			};
 		}
 		const sessionFile = this.sessionManager.getSessionFile();
-		if (!this.sessionManager.isPersisted() || !sessionFile || !existsSync(sessionFile)) return undefined;
+		if (!this.sessionManager.isPersisted() || !sessionFile) return undefined;
 		const { pathHash } = canonicalTranscriptIdentity(sessionFile);
 		const current = registry.getLeaseForPath(pathHash);
 		if (!current.ok || !current.value) {
@@ -4277,9 +4298,12 @@ export class AgentSession {
 
 	private async _ensureSessionAccessGuard(): Promise<void> {
 		const sessionFile = this.sessionManager.getSessionFile();
-		if (!this.sessionManager.isPersisted() || !sessionFile || !existsSync(sessionFile)) return;
+		if (!this.sessionManager.isPersisted() || !sessionFile) return;
 		const { pathHash } = canonicalTranscriptIdentity(sessionFile);
 		if (this._ownerStrict) this._assertCurrentOwnerLease(pathHash);
+		// A strict owner claims even a not-yet-created transcript path; the OS
+		// shared write guard is acquired once the first bytes exist.
+		if (!existsSync(sessionFile)) return;
 		if (this._sessionAccessGuard?.isHeld) {
 			// Strict/bridge owners re-read the registry above; cached process-local guards
 			// cannot survive a successor claim just because the OS shared lock is still held.
@@ -4489,15 +4513,11 @@ export class AgentSession {
 		if (this._sessionDataAdmissionLocked) {
 			return { status: "refused", code: "session_data_locked", message: "session data lock is already held" };
 		}
+		// The constructor-installed composite gate reads this flag and the strict
+		// owner lease. Do not replace or clear it during the refresh transaction.
 		this._sessionDataAdmissionLocked = true;
-		this.sessionManager.setWriteGate(() =>
-			this._sessionDataAdmissionLocked
-				? "session_data_locked: in-place session refresh owns transcript writes"
-				: undefined,
-		);
 		const unlockGate = () => {
 			this._sessionDataAdmissionLocked = false;
-			this.sessionManager.setWriteGate(undefined);
 		};
 		const registry = this._leaseRegistry;
 		const accessGuard = this._sessionAccessGuard;
@@ -4730,7 +4750,6 @@ export class AgentSession {
 			} finally {
 				this._heldSessionDataLock = undefined;
 				this._sessionDataAdmissionLocked = false;
-				this.sessionManager.setWriteGate(undefined);
 			}
 		}
 		return failure
@@ -5128,7 +5147,7 @@ export class AgentSession {
 		if (guard) await guard.release();
 		const lease = this._sessionOpenLease;
 		this._sessionOpenLease = undefined;
-		if (lease) this._leaseRegistry?.releaseLease(lease.lease_id);
+		if (lease) this._leaseRegistry?.releaseLease(lease);
 	}
 
 	async bindExtensions(bindings: ExtensionBindings): Promise<void> {

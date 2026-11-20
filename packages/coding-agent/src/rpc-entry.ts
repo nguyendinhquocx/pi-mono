@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { APP_NAME } from "./config.ts";
 import { configureHttpDispatcher } from "./core/http-dispatcher.ts";
-import { claimSessionHandoffFromEnv } from "./core/session-owner-protocol.ts";
 import { main } from "./main.ts";
 
 process.title = `${APP_NAME}-rpc`;
@@ -9,11 +8,8 @@ process.env.PI_CODING_AGENT = "true";
 process.env.AI_AGENT = "pi";
 process.emitWarning = (() => {}) as typeof process.emitWarning;
 
-// Owner handoff successor path: claim the pending lease BEFORE the runtime
-// builds its AgentSession, otherwise the still-alive previous owner's lease
-// record blocks session open (SessionDataLockedError).
-const handoffClaim = claimSessionHandoffFromEnv(process.env, { ownerKind: "lix-worker" });
-if (handoffClaim) process.env.PI_SESSION_OWNER_STRICT = "1";
+// main consumes and validates any one-use handoff claim after resolving the
+// selected session but before AgentSession construction.
 
 configureHttpDispatcher();
 

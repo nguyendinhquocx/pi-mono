@@ -66,6 +66,7 @@ import {
 	UnknownSessionEntryTypeError,
 	UnsupportedSessionVersionError,
 } from "./core/session-manager.ts";
+import { canonicalTranscriptIdentity } from "./core/session-open-lease.ts";
 import { claimSessionHandoffFromEnv, resolveOwnerStrictMode } from "./core/session-owner-protocol.ts";
 import { collectSettingsDiagnostics, deduplicateDiagnostics } from "./core/settings-diagnostics.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
@@ -611,6 +612,9 @@ export interface MainOptions {
 
 export async function main(args: string[], options?: MainOptions) {
 	resetTimings();
+	// Consume the raw capability before any startup path can launch child processes.
+	let rawSessionOwnerClaim = process.env.PI_SESSION_OWNER_CLAIM;
+	delete process.env.PI_SESSION_OWNER_CLAIM;
 	// Li must agree with the shared Pi profile before anything reads agent/session dirs.
 	if (APP_NAME === "li") {
 		try {
@@ -711,13 +715,19 @@ export async function main(args: string[], options?: MainOptions) {
 
 	let appMode = resolveAppMode(parsed, process.stdin.isTTY, process.stdout.isTTY);
 	const interactiveCommand = appMode === "interactive" && !parsed.help && parsed.listModels === undefined;
-	const handoffClaimRequested = interactiveCommand && Boolean(process.env.PI_SESSION_OWNER_CLAIM);
+	const handoffClaimRequested = rawSessionOwnerClaim !== undefined && rawSessionOwnerClaim.length > 0;
+	if (handoffClaimRequested && appMode !== "interactive" && appMode !== "rpc") {
+		console.error(chalk.red("Error: PI_SESSION_OWNER_CLAIM requires interactive or RPC mode"));
+		process.exit(1);
+	}
+	if (handoffClaimRequested && (parsed.help || parsed.listModels !== undefined)) {
+		console.error(chalk.red("Error: PI_SESSION_OWNER_CLAIM cannot be used with help or model-list commands"));
+		process.exit(1);
+	}
 	const ownerBridgeEnabled =
 		interactiveCommand && (isTruthyEnvFlag(process.env.PI_SESSION_OWNER_BRIDGE) || handoffClaimRequested);
-	const interactiveHandoffClaim = interactiveCommand
-		? claimSessionHandoffFromEnv(process.env, { ownerKind: "tui" })
-		: undefined;
-	const ownerProtocolStrict = ownerBridgeEnabled || interactiveHandoffClaim !== undefined || resolveOwnerStrictMode();
+	let interactiveHandoffClaim: ReturnType<typeof claimSessionHandoffFromEnv>;
+	const ownerProtocolStrict = ownerBridgeEnabled || handoffClaimRequested || resolveOwnerStrictMode();
 	const shouldTakeOverStdout = appMode !== "interactive" && !isPlainRuntimeMetadataCommand(parsed);
 	if (shouldTakeOverStdout) {
 		takeOverStdout();
@@ -796,13 +806,30 @@ export async function main(args: string[], options?: MainOptions) {
 			process.exit(1);
 		}
 	}
+	if (handoffClaimRequested) {
+		const sessionFile = sessionManager.getSessionFile();
+		const ownerKind = appMode === "interactive" ? "tui" : appMode === "rpc" ? "lix-worker" : undefined;
+		if (!ownerKind || !sessionManager.isPersisted() || !sessionFile || !rawSessionOwnerClaim) {
+			console.error(chalk.red("Error: owner handoff claim has no matching persisted session target"));
+			process.exit(1);
+		}
+		const claimEnv: NodeJS.ProcessEnv = { PI_SESSION_OWNER_CLAIM: rawSessionOwnerClaim };
+		interactiveHandoffClaim = claimSessionHandoffFromEnv(claimEnv, {
+			ownerKind,
+			expectedAgentDir: agentDir,
+			expectedPathHash: canonicalTranscriptIdentity(sessionFile).pathHash,
+			expectedSessionId: sessionManager.getSessionId(),
+		});
+		rawSessionOwnerClaim = undefined;
+		if (!interactiveHandoffClaim) process.exit(1);
+	}
+	let sessionNameToApply: string | undefined;
 	if (parsed.name !== undefined) {
-		const name = normalizeSessionName(parsed.name);
-		if (name === undefined) {
+		sessionNameToApply = normalizeSessionName(parsed.name);
+		if (sessionNameToApply === undefined) {
 			console.error(chalk.red("Error: --name requires a non-empty value"));
 			process.exit(1);
 		}
-		sessionManager.appendSessionInfo(name);
 	}
 	time("createSessionManager");
 
@@ -991,6 +1018,9 @@ export async function main(args: string[], options?: MainOptions) {
 	time("createAgentSessionRuntime");
 	const { services, session, modelFallbackMessage } = runtime;
 	const { settingsManager, modelRuntime, resourceLoader } = services;
+	// Mutating session metadata is delayed until AgentSession has acquired the
+	// strict writer lease and installed its composite SessionManager write gate.
+	if (sessionNameToApply !== undefined) sessionManager.appendSessionInfo(sessionNameToApply);
 	setCapabilityOverrides(settingsManager.getTerminalCapabilityOverrides());
 	applyHttpProxySettings(settingsManager.getGlobalSettings().httpProxy);
 	configureHttpDispatcher(settingsManager.getHttpIdleTimeoutMs());

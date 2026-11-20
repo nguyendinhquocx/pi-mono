@@ -1615,15 +1615,20 @@ export class SessionManager {
 	/** In-process admission gate installed synchronously by AgentSession locks. */
 	private writeGate: (() => string | SessionWriteGateRefusal | undefined) | undefined;
 	/**
-	 * Startup repairs (trailing-newline append, legacy migration rewrite) that
-	 * were detected while loading the transcript but NOT yet written. Opening a
+	 * Startup repairs (empty-header initialization, trailing-newline append,
+	 * legacy migration rewrite) detected while loading but NOT yet written. Opening a
 	 * session must never mutate transcript bytes: the writes are deferred until
 	 * the caller's session access guard has been acquired (or the guard outcome
 	 * is a typed refusal, in which case the bytes stay unchanged).
 	 */
-	private deferredStartupRepair: { trailingNewline: boolean; migrationRewrite: boolean } = {
+	private deferredStartupRepair: {
+		trailingNewline: boolean;
+		migrationRewrite: boolean;
+		initializeEmptyFile: boolean;
+	} = {
 		trailingNewline: false,
 		migrationRewrite: false,
+		initializeEmptyFile: false,
 	};
 
 	private constructor(
@@ -1659,7 +1664,11 @@ export class SessionManager {
 
 	/** True when a startup newline repair and/or migration rewrite is still pending. */
 	hasDeferredStartupRepairs(): boolean {
-		return this.deferredStartupRepair.trailingNewline || this.deferredStartupRepair.migrationRewrite;
+		return (
+			this.deferredStartupRepair.trailingNewline ||
+			this.deferredStartupRepair.migrationRewrite ||
+			this.deferredStartupRepair.initializeEmptyFile
+		);
 	}
 
 	/**
@@ -1670,11 +1679,18 @@ export class SessionManager {
 	 * blocked paths — a blocked open must leave the transcript bytes unchanged.
 	 */
 	applyDeferredStartupRepairs(): void {
-		if (!this.deferredStartupRepair.trailingNewline && !this.deferredStartupRepair.migrationRewrite) return;
+		if (!this.hasDeferredStartupRepairs()) return;
 		if (!this.persist || !this.sessionFile) {
 			this.deferredStartupRepair.trailingNewline = false;
 			this.deferredStartupRepair.migrationRewrite = false;
+			this.deferredStartupRepair.initializeEmptyFile = false;
 			return;
+		}
+		if (this.deferredStartupRepair.initializeEmptyFile) {
+			this.#refuseIfGated();
+			this._rewriteFile();
+			this.deferredStartupRepair.initializeEmptyFile = false;
+			this.flushed = true;
 		}
 		if (this.deferredStartupRepair.trailingNewline) {
 			this.#refuseIfGated();
@@ -1708,8 +1724,9 @@ export class SessionManager {
 				: readSessionEntries(this.sessionFile);
 			this.deferredStartupRepair.trailingNewline = needsTrailingNewlineRepair;
 
-			// If file was empty, initialize it with a valid session header. If it was
-			// non-empty but did not parse as a pi session, fail without modifying it.
+			// If the file was empty, keep its new header in memory and defer the
+			// rewrite until AgentSession has established the owner/write guard. If it
+			// was non-empty but invalid, fail without modifying it.
 			if (entries.length === 0) {
 				const explicitPath = this.sessionFile;
 				if (statSync(explicitPath).size > 0) {
@@ -1718,8 +1735,8 @@ export class SessionManager {
 				this.deferredStartupRepair.trailingNewline = false;
 				this.newSession();
 				this.sessionFile = explicitPath;
-				this._rewriteFile();
-				this.flushed = true;
+				this.deferredStartupRepair.initializeEmptyFile = true;
+				this.flushed = false;
 				return;
 			}
 
@@ -1862,6 +1879,12 @@ export class SessionManager {
 
 		if (!this.flushed) {
 			if (!this._hasConversation()) return;
+			if (this.deferredStartupRepair.initializeEmptyFile) {
+				this._rewriteFile();
+				this.deferredStartupRepair.initializeEmptyFile = false;
+				this.flushed = true;
+				return;
+			}
 			const fd = openSync(this.sessionFile, "wx");
 			try {
 				for (const e of this.fileEntries) {
@@ -2236,6 +2259,7 @@ export class SessionManager {
 			// current version; any pending startup repairs are already superseded.
 			this.deferredStartupRepair.trailingNewline = false;
 			this.deferredStartupRepair.migrationRewrite = false;
+			this.deferredStartupRepair.initializeEmptyFile = false;
 		} catch (error) {
 			this.fileEntries = snapshotEntries;
 			this.byId = snapshotById;

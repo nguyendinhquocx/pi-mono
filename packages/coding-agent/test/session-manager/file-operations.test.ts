@@ -508,24 +508,27 @@ describe("SessionManager.setSessionFile with corrupted files", () => {
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
-	it("truncates and rewrites empty file with valid header", () => {
+	it("defers empty-file initialization: open keeps bytes, first append writes the header", () => {
 		const emptyFile = join(tempDir, "empty.jsonl");
 		writeFileSync(emptyFile, "");
 
 		const sm = SessionManager.open(emptyFile, tempDir);
 
-		// Should have created a new session with valid header
+		// Opening must not mutate transcript bytes (deferred until owner/guard setup).
 		expect(sm.getSessionId()).toBeTruthy();
 		expect(sm.getHeader()).toBeTruthy();
 		expect(sm.getHeader()?.type).toBe("session");
+		expect(readFileSync(emptyFile, "utf-8")).toBe("");
 
-		// File should now contain a valid header
+		// The first conversation append flushes the deferred header rewrite.
+		sm.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
 		const content = readFileSync(emptyFile, "utf-8");
 		const lines = content.trim().split("\n").filter(Boolean);
-		expect(lines.length).toBe(1);
+		expect(lines.length).toBe(2);
 		const header = JSON.parse(lines[0]);
 		expect(header.type).toBe("session");
 		expect(header.id).toBe(sm.getSessionId());
+		expect(JSON.parse(lines[1]).type).toBe("message");
 	});
 
 	it("throws and preserves non-empty file without valid header", () => {
@@ -561,12 +564,13 @@ describe("SessionManager.setSessionFile with corrupted files", () => {
 		expect(sm.getSessionFile()).toBe(explicitPath);
 	});
 
-	it("subsequent loads of initialized empty file work correctly", () => {
+	it("subsequent loads see the same session once the deferred header was flushed", () => {
 		const emptyFile = join(tempDir, "empty.jsonl");
 		writeFileSync(emptyFile, "");
 
 		const sm1 = SessionManager.open(emptyFile, tempDir);
 		const sessionId = sm1.getSessionId();
+		sm1.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
 
 		const sm2 = SessionManager.open(emptyFile, tempDir);
 		expect(sm2.getSessionId()).toBe(sessionId);

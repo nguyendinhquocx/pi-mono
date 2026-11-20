@@ -180,6 +180,8 @@ export interface TestSessionOptions {
 	ownerProtocol?: boolean;
 	/** Seed a persisted transcript before constructing AgentSession. */
 	initialMessages?: string[];
+	/** Open an existing zero-byte transcript so strict startup deferral can be tested. */
+	emptySessionFile?: boolean;
 }
 
 /**
@@ -269,9 +271,17 @@ export async function createTestSession(options: TestSessionOptions = {}): Promi
 		streamFn: streamSimple,
 	});
 
-	const sessionManager = options.inMemory
-		? SessionManager.inMemory()
-		: SessionManager.create(tempDir, options.ownerProtocol ? tempDir : undefined);
+	let sessionManager: SessionManager;
+	if (options.inMemory) {
+		sessionManager = SessionManager.inMemory();
+	} else if (options.emptySessionFile) {
+		if (options.initialMessages?.length) throw new Error("emptySessionFile cannot be combined with initialMessages");
+		const emptySessionFile = join(tempDir, "empty-session.jsonl");
+		writeFileSync(emptySessionFile, "", "utf8");
+		sessionManager = SessionManager.open(emptySessionFile, tempDir, tempDir);
+	} else {
+		sessionManager = SessionManager.create(tempDir, options.ownerProtocol ? tempDir : undefined);
+	}
 	for (const text of options.initialMessages ?? []) {
 		sessionManager.appendMessage({ role: "user", content: text, timestamp: Date.now() });
 	}

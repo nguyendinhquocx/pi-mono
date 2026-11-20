@@ -1220,14 +1220,25 @@ export class SessionOpenLeaseRegistry {
 		});
 	}
 
-	/** Release = delete the lease file under the per-identity guard (never a `closed` state). */
-	releaseLease(leaseId: string): RegistryOpResult<true> {
-		const leasePath = join(this.#paths.leasesDir, `${leaseId}.json`);
-		const raw = readJsonFileSync(leasePath);
-		if (!raw.ok) return raw.missing ? { ok: true, value: true } : fail("registry_invalid", raw.message);
-		const record = parseLeaseRecord(raw.value);
-		if (!record) return fail("registry_invalid", "lease record failed schema validation during release");
-		return this.withIdentityGuard(record.path_hash, () => {
+	/** Release only the exact lease generation held by the caller. */
+	releaseLease(expectedLease: LeaseRecord): RegistryOpResult<true> {
+		const leasePath = join(this.#paths.leasesDir, `${expectedLease.lease_id}.json`);
+		return this.withIdentityGuard(expectedLease.path_hash, () => {
+			const raw = readJsonFileSync(leasePath);
+			if (!raw.ok) return raw.missing ? { ok: true, value: true } : fail("registry_invalid", raw.message);
+			const current = parseLeaseRecord(raw.value);
+			if (!current) return fail("registry_invalid", "lease record failed schema validation during release");
+			if (
+				current.lease_id !== expectedLease.lease_id ||
+				current.path_hash !== expectedLease.path_hash ||
+				current.session_id !== expectedLease.session_id ||
+				current.pid !== expectedLease.pid ||
+				current.process_start_utc !== expectedLease.process_start_utc ||
+				current.owner_epoch !== expectedLease.owner_epoch ||
+				current.owner_kind !== expectedLease.owner_kind
+			) {
+				return fail("writer_conflict", "lease ownership changed before release");
+			}
 			try {
 				unlinkSync(leasePath);
 				return { ok: true, value: true };
@@ -1518,7 +1529,7 @@ export class SessionOpenLeaseRegistry {
 		for (const lease of records) {
 			if (lease.pid === process.pid) continue;
 			if (this.processInventory.isProcessAlive(lease.pid, lease.process_start_utc)) continue;
-			const released = this.releaseLease(lease.lease_id);
+			const released = this.releaseLease(lease);
 			if (released.ok) reclaimed++;
 		}
 		return { ok: true, value: reclaimed };

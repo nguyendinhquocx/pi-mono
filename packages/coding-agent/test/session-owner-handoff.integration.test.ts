@@ -23,7 +23,7 @@ import {
 	parseLeaseRecord,
 	SessionOpenLeaseRegistry,
 } from "../src/core/session-open-lease.ts";
-import { OWNER_PROTOCOL_VERSION } from "../src/core/session-owner-protocol.ts";
+import { claimSessionHandoffFromEnv, OWNER_PROTOCOL_VERSION } from "../src/core/session-owner-protocol.ts";
 import { createTestSession } from "./utilities.ts";
 
 const testRoots: string[] = [];
@@ -149,11 +149,15 @@ async function connectBridgeClient(port: number): Promise<BridgeClient> {
 	};
 }
 
-function writeSessionFile(root: string): { file: string; pathHash: string; sessionId: string } {
-	const file = join(root, "sessions", "s1.jsonl");
+function writeSessionFile(
+	root: string,
+	name = "s1.jsonl",
+	sessionId = "s1",
+): { file: string; pathHash: string; sessionId: string } {
+	const file = join(root, "sessions", name);
 	mkdirSync(dirname(file), { recursive: true });
 	writeFileSync(file, '{"type":"synthetic"}\n');
-	return { file, pathHash: canonicalTranscriptIdentity(file).pathHash, sessionId: "s1" };
+	return { file, pathHash: canonicalTranscriptIdentity(file).pathHash, sessionId };
 }
 
 describe("session owner handoff (two real processes)", () => {
@@ -233,6 +237,98 @@ describe("session owner handoff (two real processes)", () => {
 		const adopted = await b.send<{ owned: boolean }>({ cmd: "adopt", agentDir: root, pathHash });
 		expect(adopted.ok).toBe(true);
 		expect(adopted.owned).toBe(true);
+	});
+
+	it("stale predecessor release cannot delete the successor lease after claim", async () => {
+		const root = makeRoot();
+		const { file, pathHash, sessionId } = writeSessionFile(root);
+		const predecessor = await attachChild();
+		const successor = await attachChild();
+		const acquired = await predecessor.send<{ lease: LeaseRecord }>({
+			cmd: "acquire",
+			agentDir: root,
+			sessionId,
+			transcriptPath: file,
+		});
+		expect(acquired.ok).toBe(true);
+		const begun = await predecessor.send<{ token: string }>({
+			cmd: "beginHandoff",
+			agentDir: root,
+			leaseId: acquired.lease.lease_id,
+		});
+		expect(begun.ok).toBe(true);
+		const claimed = await successor.send<{ lease: LeaseRecord }>({
+			cmd: "claim",
+			agentDir: root,
+			pathHash,
+			token: begun.token,
+			sessionId,
+		});
+		expect(claimed.ok).toBe(true);
+
+		const staleRelease = await predecessor.send({
+			cmd: "releaseLease",
+			agentDir: root,
+			expectedLease: acquired.lease,
+		});
+		expect(staleRelease).toMatchObject({ ok: false, code: "writer_conflict" });
+		const current = await successor.send<{ lease: LeaseRecord | null }>({
+			cmd: "getLease",
+			agentDir: root,
+			pathHash,
+		});
+		expect(current.ok).toBe(true);
+		expect(current.lease?.pid).toBe(successor.pid);
+		expect(current.lease?.owner_epoch).toBe(claimed.lease.owner_epoch);
+	});
+
+	it("strict owner acquires its lease before initializing an empty transcript", async () => {
+		const fixture = await createTestSession({ ownerProtocol: true, emptySessionFile: true });
+		const { session, sessionManager } = fixture;
+		const sessionFile = sessionManager.getSessionFile();
+		expect(sessionFile).toBeDefined();
+		const pathHash = canonicalTranscriptIdentity(sessionFile!).pathHash;
+		const registry = (session as unknown as { _leaseRegistry: SessionOpenLeaseRegistry })._leaseRegistry;
+		try {
+			expect(readFileSync(sessionFile!, "utf8")).toBe("");
+			expect(registry.getLeaseForPath(pathHash)).toMatchObject({
+				ok: true,
+				value: { session_id: session.sessionId, pid: process.pid },
+			});
+			await session.bindExtensions({ mode: "tui" });
+			const [header] = readFileSync(sessionFile!, "utf8").trimEnd().split("\\n");
+			expect(JSON.parse(header!)).toMatchObject({ type: "session", id: session.sessionId });
+		} finally {
+			await session.releaseSessionDataAccess();
+			fixture.cleanup();
+		}
+	});
+
+	it("strict owner leases a new transcript path before the first file exists", async () => {
+		const fixture = await createTestSession({ ownerProtocol: true });
+		const { session, sessionManager, tempDir } = fixture;
+		const sessionFile = sessionManager.getSessionFile();
+		expect(sessionFile).toBeDefined();
+		const pathHash = canonicalTranscriptIdentity(sessionFile!).pathHash;
+		const registry = (session as unknown as { _leaseRegistry: SessionOpenLeaseRegistry })._leaseRegistry;
+		const contender = await attachChild();
+		try {
+			expect(existsSync(sessionFile!)).toBe(false);
+			expect(registry.getLeaseForPath(pathHash)).toMatchObject({
+				ok: true,
+				value: { session_id: session.sessionId, pid: process.pid },
+			});
+			const conflict = await contender.send({
+				cmd: "acquire",
+				agentDir: tempDir,
+				sessionId: session.sessionId,
+				transcriptPath: sessionFile,
+			});
+			expect(conflict).toMatchObject({ ok: false, code: "writer_conflict" });
+		} finally {
+			await session.releaseSessionDataAccess();
+			fixture.cleanup();
+		}
 	});
 
 	it("handoff-refused path: busy writer state still allows abort by owner, claim fails without pending", async () => {
@@ -315,6 +411,47 @@ describe("session owner handoff (two real processes)", () => {
 		expect(claimed.consumed).toBe(true);
 		expect(claimed.lease.owner_kind).toBe("tui");
 		expect(claimed.lease.owner_epoch).toBe(begun.handoffEpoch);
+	});
+
+	it("env claim refuses a session target mismatch before consuming the pending lease", () => {
+		const root = makeRoot();
+		const { file, pathHash, sessionId } = writeSessionFile(root);
+		const registry = SessionOpenLeaseRegistry.open(root, {
+			runtime: "protocol-test",
+			buildHash: OWNER_PROTOCOL_VERSION.toString(),
+		});
+		const acquired = registry.acquireLease({
+			sessionId,
+			transcriptPath: file,
+			ownerKind: "protocol-test",
+			ownerProtocolVersion: OWNER_PROTOCOL_VERSION,
+		});
+		expect(acquired.ok).toBe(true);
+		if (!acquired.ok) return;
+		const begun = registry.beginHandoff({ leaseId: acquired.value.lease_id });
+		expect(begun.ok).toBe(true);
+		if (!begun.ok) return;
+		const env: NodeJS.ProcessEnv = {
+			PI_SESSION_OWNER_CLAIM: `${root}|${pathHash}|${begun.value.token}|${sessionId}`,
+		};
+		const exit = (code: number): never => {
+			throw new Error(`exit:${code}`);
+		};
+
+		expect(() =>
+			claimSessionHandoffFromEnv(env, {
+				ownerKind: "tui",
+				expectedAgentDir: root,
+				expectedPathHash: pathHash,
+				expectedSessionId: "different-session",
+				exit,
+			}),
+		).toThrow("exit:1");
+		expect(env.PI_SESSION_OWNER_CLAIM).toBeUndefined();
+		expect(registry.getLeaseForPath(pathHash)).toMatchObject({
+			ok: true,
+			value: { writer_state: "handoff-pending", session_id: sessionId },
+		});
 	});
 
 	it("heartbeat updates writer_state and refreshes heartbeat_utc under the identity guard", async () => {
@@ -420,10 +557,25 @@ describe("session owner handoff (two real processes)", () => {
 		const client = await connectBridgeClient(started.port);
 		client.send({ type: "auth", token });
 		expect(await client.next()).toMatchObject({ type: "auth_result", success: true, sessionId });
-		client.send({ type: "owner.subscribe", id: "sub-1" });
-		expect(await client.next()).toMatchObject({ type: "response", id: "sub-1", success: true });
+		// Fail-closed handshake: an unversioned subscriber is rejected.
+		client.send({ type: "owner.subscribe", id: "sub-no-version" });
+		expect(await client.next()).toMatchObject({
+			type: "response",
+			id: "sub-no-version",
+			success: false,
+			error: { code: "protocol_mismatch" },
+		});
+		client.send({ type: "owner.subscribe", id: "sub-1", protocolVersion: OWNER_PROTOCOL_VERSION });
+		expect(await client.next()).toMatchObject({
+			type: "response",
+			id: "sub-1",
+			success: true,
+			data: { resync_required: true },
+		});
 
 		const second = await connectBridgeClient(started.port);
+		// Auth-first-then-slot: the second correct token cannot take an occupied slot.
+		second.send({ type: "auth", token });
 		expect(await second.next()).toMatchObject({
 			type: "auth_result",
 			success: false,
@@ -465,6 +617,22 @@ describe("session owner handoff (two real processes)", () => {
 			sessionId,
 		});
 		expect(await client.next()).toMatchObject({ type: "response", id: "claim-1", success: true });
+
+		// The same subscription survives the epoch change and must be told to resync.
+		const epochChangeEmit = await owner.send({ cmd: "emitBridgeEvent", name: "next-epoch" });
+		expect(epochChangeEmit.ok).toBe(true);
+		expect(await client.next()).toMatchObject({
+			type: "owner_epoch_changed",
+			previous_epoch: 1,
+			owner_epoch: 2,
+			resync_required: true,
+		});
+		expect(await client.next()).toMatchObject({
+			type: "owner_event",
+			owner_epoch: 2,
+			seq: 1,
+			event: { type: "session_info_changed", name: "next-epoch" },
+		});
 		await client.close();
 
 		const reconnected = await connectBridgeClient(started.port);
@@ -477,15 +645,20 @@ describe("session owner handoff (two real processes)", () => {
 			success: true,
 			data: { isOwner: false, ownerKind: "lix-worker", ownerEpoch: 2 },
 		});
-		reconnected.send({ type: "owner.subscribe", id: "sub-after-reconnect" });
-		expect(await reconnected.next()).toMatchObject({ type: "response", id: "sub-after-reconnect", success: true });
-		const epochEvent = await owner.send({ cmd: "emitBridgeEvent", name: "next-epoch" });
+		reconnected.send({ type: "owner.subscribe", id: "sub-after-reconnect", protocolVersion: OWNER_PROTOCOL_VERSION });
+		expect(await reconnected.next()).toMatchObject({
+			type: "response",
+			id: "sub-after-reconnect",
+			success: true,
+			data: { resync_required: true },
+		});
+		const epochEvent = await owner.send({ cmd: "emitBridgeEvent", name: "post-resubscribe" });
 		expect(epochEvent.ok).toBe(true);
 		expect(await reconnected.next()).toMatchObject({
 			type: "owner_event",
 			owner_epoch: 2,
 			seq: 1,
-			event: { type: "session_info_changed", name: "next-epoch" },
+			event: { type: "session_info_changed", name: "post-resubscribe" },
 		});
 		await reconnected.close();
 		const stopped = await owner.send({ cmd: "stopBridge" });
@@ -576,6 +749,215 @@ describe("session owner handoff (two real processes)", () => {
 			await session.releaseSessionDataAccess();
 			fixture.cleanup();
 		}
+	});
+
+	it("does not clear the strict owner write gate after a refused in-place data lock", async () => {
+		const fixture = await createTestSession({ ownerProtocol: true, initialMessages: ["seed transcript"] });
+		const { session, sessionManager } = fixture;
+		await session.bindExtensions({ mode: "tui" });
+		const internals = session as unknown as {
+			_sessionWriteGateRefusal: () => { code: string; message: string };
+		};
+		const originalWriteGate = internals._sessionWriteGateRefusal;
+		internals._sessionWriteGateRefusal = () => ({ code: "writer_conflict", message: "simulated successor claim" });
+		try {
+			expect(sessionManager.checkWriteGate()).toMatchObject({ code: "writer_conflict" });
+			const lock = await session.acquireSessionDataLock();
+			expect(lock).toMatchObject({ status: "refused", code: "promotion_required" });
+			expect(sessionManager.checkWriteGate()).toMatchObject({ code: "writer_conflict" });
+		} finally {
+			internals._sessionWriteGateRefusal = originalWriteGate;
+			await session.releaseSessionDataAccess();
+			fixture.cleanup();
+		}
+	});
+
+	it("bridge close/exit must not delete a successor's discovery files at the same path", async () => {
+		const root = makeRoot();
+		const { file, pathHash, sessionId } = writeSessionFile(root);
+		const owner = await attachChild();
+		const started = await owner.send<{ port: number }>({
+			cmd: "startBridge",
+			agentDir: root,
+			sessionFile: file,
+			sessionId,
+			pathHash,
+		});
+		expect(started.ok).toBe(true);
+		const advertisedPath = join(root, "owner-bridge", `${pathHash}.json`);
+		const tokenPath = join(root, "owner-bridge", `${pathHash}.token`);
+		expect(existsSync(advertisedPath)).toBe(true);
+
+		// Simulate a successor publishing its own discovery at the identical pathHash
+		// after winning the handoff (different pid + token fingerprint).
+		const successorAdvertisement = {
+			pid: (owner.pid ?? process.pid) + 10_000,
+			port: 1,
+			tokenFingerprint: "successor-fingerprint",
+			sessionId,
+			writerState: "idle",
+		};
+		writeFileSync(advertisedPath, `${JSON.stringify(successorAdvertisement)}\n`);
+		writeFileSync(tokenPath, "successor-token\n");
+
+		const stopped = await owner.send({ cmd: "stopBridge" });
+		expect(stopped.ok).toBe(true);
+
+		// The stale owner cleanup must leave the successor's files untouched.
+		expect(JSON.parse(readFileSync(advertisedPath, "utf8"))).toMatchObject(successorAdvertisement);
+		expect(readFileSync(tokenPath, "utf8")).toBe("successor-token\n");
+	});
+
+	it("steer/followUp admission freezes handoff and never enqueues into a frozen session", async () => {
+		const fixture = await createTestSession({ ownerProtocol: true, initialMessages: ["seed transcript"] });
+		const { session, sessionManager } = fixture;
+		await session.bindExtensions({ mode: "tui" });
+		const privateSession = session as unknown as {
+			_steeringMessages: string[];
+			_followUpMessages: string[];
+			_handoffAdmissionLocked: boolean;
+			_runInputHandlers: (
+				text: string,
+				images: unknown,
+				source: string,
+				behavior?: string,
+			) => Promise<{ text: string; images?: unknown } | undefined>;
+		};
+		const originalHandlers = privateSession._runInputHandlers;
+		let releaseSteer: (() => void) | undefined;
+		privateSession._runInputHandlers = async () =>
+			new Promise((resolve) => {
+				releaseSteer = () => resolve({ text: "queued steering" });
+			});
+		try {
+			// Layer 1: an in-flight steer admission makes beginSessionHandoff refuse.
+			const queued = session.steer("mid-expansion steer");
+			await Promise.resolve();
+			const racedBegin = session.beginSessionHandoff();
+			expect(racedBegin).toMatchObject({
+				ok: false,
+				code: "handoff_refused",
+				pendingWork: { queue_admission: true },
+			});
+			releaseSteer?.();
+			// The steer completed before the freeze, so it lands normally...
+			await expect(queued).resolves.toBe("queued");
+			expect(privateSession._steeringMessages).toHaveLength(1);
+			// ...and the queued message now blocks any handoff attempt.
+			const afterQueueBegin = session.beginSessionHandoff();
+			expect(afterQueueBegin).toMatchObject({
+				ok: false,
+				pendingWork: { steering: 1 },
+			});
+			session.clearQueue();
+
+			// Layer 2: a freeze starting mid-expansion must never receive the enqueue.
+			const queuedLate = session.steer("late steer");
+			await Promise.resolve();
+			privateSession._handoffAdmissionLocked = true;
+			releaseSteer?.();
+			await expect(queuedLate).rejects.toMatchObject({ code: "handoff_pending" });
+			expect(privateSession._steeringMessages).toHaveLength(0);
+			expect(privateSession._followUpMessages).toHaveLength(0);
+			privateSession._handoffAdmissionLocked = false;
+
+			// Once idle again, the handoff lifecycle still works normally.
+			const idleBegin = session.beginSessionHandoff();
+			expect(idleBegin.ok).toBe(true);
+			if (!idleBegin.ok) return;
+			expect(session.cancelSessionHandoff()).toMatchObject({ ok: true });
+			expect(sessionManager.checkWriteGate()).toBeUndefined();
+		} finally {
+			privateSession._runInputHandlers = originalHandlers;
+			await session.releaseSessionDataAccess();
+			fixture.cleanup();
+		}
+	});
+
+	it("pending authentication pool caps unauthenticated sockets without taking the client slot", async () => {
+		const root = makeRoot();
+		const { file, pathHash, sessionId } = writeSessionFile(root);
+		const owner = await attachChild();
+		const started = await owner.send<{ port: number }>({
+			cmd: "startBridge",
+			agentDir: root,
+			sessionFile: file,
+			sessionId,
+			pathHash,
+		});
+		expect(started.ok).toBe(true);
+
+		// Four unauthenticated sockets wait in the pending pool...
+		const pending: BridgeClient[] = [];
+		for (let i = 0; i < 4; i++) pending.push(await connectBridgeClient(started.port));
+		// ...the fifth is refused at accept time...
+		const fifth = await connectBridgeClient(started.port);
+		expect(await fifth.next()).toMatchObject({
+			type: "auth_result",
+			success: false,
+			error: { code: "client_limit" },
+		});
+		await fifth.close();
+		// Free the pending pool, then the real client slot accepts a correct token.
+		for (const held of pending) await held.close();
+		const legit = await connectBridgeClient(started.port);
+		const liveToken = readFileSync(join(root, "owner-bridge", `${pathHash}.token`), "utf8").trim();
+		legit.send({ type: "auth", token: liveToken });
+		expect(await legit.next()).toMatchObject({ type: "auth_result", success: true });
+		await legit.close();
+
+		const stopped = await owner.send({ cmd: "stopBridge" });
+		expect(stopped.ok).toBe(true);
+	});
+
+	it("updateSession rotates the token: old token fails auth and old discovery files are removed", async () => {
+		const root = makeRoot();
+		const { file, pathHash, sessionId } = writeSessionFile(root);
+		const owner = await attachChild();
+		const started = await owner.send<{ port: number }>({
+			cmd: "startBridge",
+			agentDir: root,
+			sessionFile: file,
+			sessionId,
+			pathHash,
+		});
+		expect(started.ok).toBe(true);
+		const oldToken = readFileSync(join(root, "owner-bridge", `${pathHash}.token`), "utf8").trim();
+
+		// Switch the bridge to a different session (different pathHash).
+		const other = writeSessionFile(root, "s2.jsonl", "s2");
+		const updated = await owner.send({
+			cmd: "updateSession",
+			sessionFile: other.file,
+			sessionId: other.sessionId,
+			pathHash: other.pathHash,
+		});
+		expect(updated.ok).toBe(true);
+
+		// Old discovery must be gone even though the fingerprint on disk is pre-rotation.
+		expect(existsSync(join(root, "owner-bridge", `${pathHash}.json`))).toBe(false);
+		expect(existsSync(join(root, "owner-bridge", `${pathHash}.token`))).toBe(false);
+		expect(existsSync(join(root, "owner-bridge", `${other.pathHash}.json`))).toBe(true);
+		expect(
+			JSON.parse(readFileSync(join(root, "owner-bridge", `${other.pathHash}.json`), "utf8")) as Record<
+				string,
+				unknown
+			>,
+		).toMatchObject({ sessionId: other.sessionId });
+
+		// A client holding the pre-rotation token cannot authenticate; the new one works.
+		const oldClient = await connectBridgeClient(started.port);
+		oldClient.send({ type: "auth", token: oldToken });
+		expect(await oldClient.next()).toMatchObject({ type: "auth_result", success: false });
+		await oldClient.close();
+		const newClient = await connectBridgeClient(started.port);
+		const newToken = readFileSync(join(root, "owner-bridge", `${other.pathHash}.token`), "utf8").trim();
+		newClient.send({ type: "auth", token: newToken });
+		expect(await newClient.next()).toMatchObject({ type: "auth_result", success: true });
+		await newClient.close();
+
+		const stopped = await owner.send({ cmd: "stopBridge" });
+		expect(stopped.ok).toBe(true);
 	});
 
 	it("legacy lease records without owner fields still parse (backward compatibility)", () => {

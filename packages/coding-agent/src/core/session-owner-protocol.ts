@@ -33,6 +33,7 @@ export const OWNER_HEARTBEAT_STALE_MS = 90_000;
 export type OwnerKind = "tui" | "lix-worker" | "protocol-test";
 export type { WriterState } from "./session-open-lease.ts";
 
+import { resolve } from "node:path";
 import { type LeaseRecord, type RegistryOpResult, SessionOpenLeaseRegistry } from "./session-open-lease.ts";
 
 /** Thrown in strict mode when the writer cannot prove exclusive ownership. */
@@ -123,7 +124,13 @@ export function claimSessionHandoffInProcess(input: {
  */
 export function claimSessionHandoffFromEnv(
 	env: NodeJS.ProcessEnv,
-	options: { ownerKind: OwnerKind; exit?: (code: number) => never },
+	options: {
+		ownerKind: OwnerKind;
+		expectedAgentDir?: string;
+		expectedPathHash?: string;
+		expectedSessionId?: string;
+		exit?: (code: number) => never;
+	},
 ): LeaseRecord | undefined {
 	const raw = env.PI_SESSION_OWNER_CLAIM;
 	if (!raw) return undefined;
@@ -134,6 +141,20 @@ export function claimSessionHandoffFromEnv(
 		(options.exit ?? process.exit)(1);
 	}
 	const [agentDir, pathHash, token, sessionId] = parts as [string, string, string, string];
+	const normalizeAgentDir = (value: string): string => {
+		const absolute = resolve(value);
+		return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+	};
+	const targetMismatch =
+		(options.expectedAgentDir !== undefined &&
+			normalizeAgentDir(agentDir) !== normalizeAgentDir(options.expectedAgentDir)) ||
+		(options.expectedPathHash !== undefined && pathHash !== options.expectedPathHash) ||
+		(options.expectedSessionId !== undefined && sessionId !== options.expectedSessionId);
+	if (targetMismatch) {
+		process.stderr.write("PI_SESSION_OWNER_CLAIM target does not match the session selected by this runtime\n");
+		(options.exit ?? process.exit)(1);
+		return undefined;
+	}
 	const claimed = claimSessionHandoffInProcess({ agentDir, pathHash, token, sessionId, ownerKind: options.ownerKind });
 	if (!claimed.ok) {
 		process.stderr.write(`owner handoff claim failed: ${claimed.code}: ${claimed.message}\n`);
