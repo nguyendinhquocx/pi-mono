@@ -446,6 +446,31 @@ export class SessionDataLockedError extends Error {
 	}
 }
 
+/**
+ * Typed refusal when another live process owns the session writer lease at
+ * open. Distinct from {@link SessionDataLockedError}: that one is a transient
+ * same-process trim lock, while this is a real cross-process conflict whose
+ * holder must close before this runtime can own the transcript.
+ */
+export class SessionOpenWriterConflictError extends Error {
+	readonly code = "session_open_writer_conflict" as const;
+	readonly holderPid: number | undefined;
+	readonly holderOpenedAt: string | undefined;
+
+	constructor(holder?: { pid?: number; opened_at?: string } | null) {
+		const pid = typeof holder?.pid === "number" ? holder.pid : undefined;
+		const openedAt = typeof holder?.opened_at === "string" ? holder.opened_at : undefined;
+		const holderSuffix = pid !== undefined ? ` (PID ${pid}${openedAt ? `, opened ${openedAt}` : ""})` : "";
+		super(
+			`Session is already owned by another live process${holderSuffix}. ` +
+				"Close that tab/process first: opening the same session twice risks losing concurrent in-place edits.",
+		);
+		this.name = "SessionOpenWriterConflictError";
+		this.holderPid = pid;
+		this.holderOpenedAt = openedAt;
+	}
+}
+
 /** Typed refusal while a successor is expected to claim the session lease. */
 export class SessionHandoffPendingError extends Error {
 	readonly code = "handoff_pending" as const;
@@ -4002,7 +4027,9 @@ export class AgentSession {
 				this._startOwnerHeartbeat();
 				return;
 			}
-			if (acquired.code === "writer_conflict") throw new SessionDataLockedError();
+			if (acquired.code === "writer_conflict") {
+				throw new SessionOpenWriterConflictError(adopted.ok ? adopted.value : undefined);
+			}
 			if (this._ownerStrict) {
 				throw new SessionOwnerUnavailableError(`cannot acquire session owner lease: ${acquired.message}`);
 			}

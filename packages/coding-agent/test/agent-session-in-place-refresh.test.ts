@@ -1,17 +1,28 @@
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { APP_NAME, VERSION } from "../src/config.ts";
-import { AgentSession, SessionDataLockedError } from "../src/core/agent-session.ts";
+import { AgentSession, SessionDataLockedError, SessionOpenWriterConflictError } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import type { ExtensionFactory } from "../src/core/extensions/types.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import {
 	canonicalTranscriptIdentity,
+	createDefaultProcessInventory,
 	PROCESS_START_UNKNOWN,
 	SessionOpenLeaseRegistry,
 } from "../src/core/session-open-lease.ts";
@@ -225,6 +236,68 @@ describe("AgentSession in-place refresh", () => {
 		} finally {
 			await session.releaseSessionDataAccess();
 			session.dispose();
+			fixture.restorePackageDir();
+		}
+	}, 30_000);
+
+	// A foreign LIVE writer lease must fail the open-time acquire with a typed
+	// conflict naming the holder, instead of the generic in-place refresh text.
+	it("maps a foreign live writer lease at open to a typed conflict naming the holder", async () => {
+		const fixture = await createPersistedSession({ skipExtensionBinding: true });
+		const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 60_000)"], { stdio: "ignore" });
+		if (child.pid === undefined) throw new Error("failed to spawn holder child process");
+		const internals = fixture.session as unknown as {
+			_sessionOpenLease: unknown;
+			_acquireSessionOpenLeaseIfNeeded(): void;
+		};
+		try {
+			const holderStart = createDefaultProcessInventory().getProcessStartUtc(child.pid);
+			if (!holderStart) throw new Error("could not prove child process start identity");
+			const { pathHash } = canonicalTranscriptIdentity(fixture.sessionFile);
+			const leasesDir = join(fixture.root, "session-open-leases", "leases");
+
+			// Drop the fixture's own lease so only the foreign live lease remains.
+			for (const name of readdirSync(leasesDir)) {
+				if (!name.endsWith(".json")) continue;
+				const leasePath = join(leasesDir, name);
+				const record = JSON.parse(readFileSync(leasePath, "utf8")) as {
+					path_hash?: string;
+					pid?: number;
+				};
+				if (record.path_hash === pathHash && record.pid === process.pid) unlinkSync(leasePath);
+			}
+
+			const foreignLeaseId = createHash("sha256").update(`foreign:${pathHash}`).digest("hex").slice(0, 32);
+			const foreignLease = {
+				lease_id: foreignLeaseId,
+				session_id: fixture.session.sessionManager.getSessionId(),
+				path_hash: pathHash,
+				pid: child.pid,
+				process_start_utc: holderStart,
+				runtime: "li",
+				build_hash: "test",
+				opened_at: new Date().toISOString(),
+				lease_state: "open",
+				owner_kind: "tui",
+				owner_epoch: 1,
+				writer_state: "idle",
+			};
+			writeFileSync(join(leasesDir, `${foreignLeaseId}.json`), `${JSON.stringify(foreignLease)}\n`);
+
+			internals._sessionOpenLease = undefined;
+			let conflictError: unknown;
+			try {
+				internals._acquireSessionOpenLeaseIfNeeded();
+			} catch (error) {
+				conflictError = error;
+			}
+			expect(conflictError).toBeInstanceOf(SessionOpenWriterConflictError);
+			expect((conflictError as SessionOpenWriterConflictError).holderPid).toBe(child.pid);
+			expect((conflictError as Error).message).toContain(`PID ${child.pid}`);
+		} finally {
+			child.kill();
+			await fixture.session.releaseSessionDataAccess();
+			fixture.session.dispose();
 			fixture.restorePackageDir();
 		}
 	}, 30_000);
