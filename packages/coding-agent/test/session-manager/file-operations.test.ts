@@ -87,6 +87,158 @@ describe("loadEntriesFromFile", () => {
 		expect(entries[1].type).toBe("message");
 	});
 
+	it("rejects malformed custom_message content blocks on strict parse", () => {
+		const file = join(tempDir, "invalid-custom-message.jsonl");
+		const header = {
+			type: "session",
+			version: 3,
+			id: "invalid-custom-message",
+			timestamp: "2025-01-01T00:00:00Z",
+			cwd: tempDir,
+		};
+		const entry = {
+			type: "custom_message",
+			id: "cm1",
+			parentId: null,
+			timestamp: "2025-01-01T00:00:01Z",
+			customType: "test",
+			content: [null],
+			display: false,
+		};
+		writeFileSync(file, `${JSON.stringify(header)}\n${JSON.stringify(entry)}\n`);
+		expect(() => parseSessionTranscriptStrict(readFileSync(file, "utf8"))).toThrow(
+			/custom_message content must be a string or text\/image block array/,
+		);
+	});
+
+	it("fails closed on malformed legacy custom messages without repairing the source file", () => {
+		const file = join(tempDir, "legacy-invalid-custom-message.jsonl");
+		const header = {
+			type: "session",
+			version: 3,
+			id: "legacy-invalid-custom-message",
+			timestamp: "2025-01-01T00:00:00Z",
+			cwd: tempDir,
+		};
+		const entry = {
+			type: "custom_message",
+			id: "cm1",
+			parentId: null,
+			timestamp: "2025-01-01T00:00:01Z",
+			customType: "test",
+			content: [null],
+			display: false,
+		};
+		const raw = `${JSON.stringify(header)}\n${JSON.stringify(entry)}`;
+		writeFileSync(file, raw);
+
+		expect(() => loadEntriesFromFile(file)).toThrow(
+			/custom_message content must be a string or text\/image block array/,
+		);
+		expect(readFileSync(file, "utf8")).toBe(raw);
+	});
+
+	it("fails closed on legacy context edits that violate the custom target contract", () => {
+		const file = join(tempDir, "legacy-invalid-custom-context-edit.jsonl");
+		const entries = [
+			{
+				type: "session",
+				version: 3,
+				id: "legacy-invalid-custom-context-edit",
+				timestamp: "2025-01-01T00:00:00Z",
+				cwd: tempDir,
+			},
+			{
+				type: "custom_message",
+				id: "cm1",
+				parentId: null,
+				timestamp: "2025-01-01T00:00:01Z",
+				customType: "test",
+				content: [{ type: "text", text: "original" }],
+				display: false,
+			},
+			{
+				type: "context_edit",
+				id: "ce1",
+				parentId: "cm1",
+				timestamp: "2025-01-01T00:00:02Z",
+				targetId: "cm1",
+				replacement: {
+					content: [{ type: "toolCall", id: "call", name: "read", arguments: {} }],
+				},
+			},
+		];
+		const raw = entries.map((entry) => JSON.stringify(entry)).join("\n");
+		writeFileSync(file, raw);
+
+		expect(() => loadEntriesFromFile(file)).toThrow(
+			/context_edit targeting a custom message must contain only text\/image content/,
+		);
+		expect(readFileSync(file, "utf8")).toBe(raw);
+	});
+
+	it("rejects generic context-edit blocks when the target is a custom message", () => {
+		const file = join(tempDir, "invalid-custom-context-edit.jsonl");
+		const header = {
+			type: "session",
+			version: 3,
+			id: "invalid-custom-context-edit",
+			timestamp: "2025-01-01T00:00:00Z",
+			cwd: tempDir,
+		};
+		const target = {
+			type: "custom_message",
+			id: "cm1",
+			parentId: null,
+			timestamp: "2025-01-01T00:00:01Z",
+			customType: "test",
+			content: [{ type: "text", text: "original" }],
+			display: false,
+		};
+		const edit = {
+			type: "context_edit",
+			id: "ce1",
+			parentId: "cm1",
+			timestamp: "2025-01-01T00:00:02Z",
+			targetId: "cm1",
+			replacement: {
+				content: [{ type: "toolCall", id: "call", name: "read", arguments: {} }],
+			},
+		};
+		writeFileSync(file, [header, target, edit].map((entry) => JSON.stringify(entry)).join("\n"));
+		expect(() => parseSessionTranscriptStrict(readFileSync(file, "utf8"))).toThrow(
+			/context_edit targeting a custom message must contain only text\/image content/,
+		);
+	});
+
+	it("rejects custom-role message entries with unsupported content blocks", () => {
+		const file = join(tempDir, "invalid-custom-role-message.jsonl");
+		const header = {
+			type: "session",
+			version: 3,
+			id: "invalid-custom-role-message",
+			timestamp: "2025-01-01T00:00:00Z",
+			cwd: tempDir,
+		};
+		const entry = {
+			type: "message",
+			id: "m1",
+			parentId: null,
+			timestamp: "2025-01-01T00:00:01Z",
+			message: {
+				role: "custom",
+				customType: "test",
+				content: [{ type: "toolCall", id: "call", name: "read", arguments: {} }],
+				display: false,
+				timestamp: 1,
+			},
+		};
+		writeFileSync(file, `${JSON.stringify(header)}\n${JSON.stringify(entry)}\n`);
+		expect(() => parseSessionTranscriptStrict(readFileSync(file, "utf8"))).toThrow(
+			/custom\/hook message has invalid required fields/,
+		);
+	});
+
 	it("skips malformed lines but keeps valid ones", () => {
 		const file = join(tempDir, "mixed.jsonl");
 		writeFileSync(

@@ -39,6 +39,8 @@ import {
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
+	isCustomMessageContent,
+	snapshotCustomMessage,
 } from "./messages.ts";
 import { parseJsonStrict } from "./session-open-lease.ts";
 export const CURRENT_SESSION_VERSION = 3;
@@ -132,19 +134,29 @@ export class UnknownSessionEntryTypeError extends Error {
 function validateSessionFileEntries(entries: FileEntry[], filePath: string): void {
 	if (entries.length === 0) return;
 	const header = entries[0];
-	if (header.type === "session") {
-		const version =
-			typeof (header as { version?: unknown }).version === "number" ? (header as { version: number }).version : 1;
-		if (version > CURRENT_SESSION_VERSION) {
-			throw new UnsupportedSessionVersionError(version, filePath, APP_NAME);
-		}
+	const version =
+		header.type === "session" && typeof (header as { version?: unknown }).version === "number"
+			? (header as { version: number }).version
+			: 1;
+	if (header.type === "session" && version > CURRENT_SESSION_VERSION) {
+		throw new UnsupportedSessionVersionError(version, filePath, APP_NAME);
 	}
 	for (const [index, entry] of entries.entries()) {
 		if (index === 0 && entry.type === "session") continue; // header, not an entry
 		if (!KNOWN_SESSION_ENTRY_TYPES.has(entry.type)) {
 			throw new UnknownSessionEntryTypeError(entry.type, entry.id, filePath, APP_NAME);
 		}
+		const record = entry as unknown as Record<string, unknown>;
+		const message = record.message;
+		const needsStrictBoundaryValidation =
+			entry.type === "custom_message" ||
+			entry.type === "context_edit" ||
+			(entry.type === "message" &&
+				isPlainObject(message) &&
+				(message.role === "custom" || message.role === "hookMessage"));
+		if (needsStrictBoundaryValidation) validateStrictEntryFields(record, index + 1, version);
 	}
+	validateStrictContextEdits(entries.slice(1) as SessionEntry[]);
 }
 
 export interface SessionHeader {
@@ -506,17 +518,29 @@ function isUsageLike(value: unknown): boolean {
 function isMessageContent(value: unknown): boolean {
 	if (typeof value === "string") return true;
 	if (!Array.isArray(value)) return false;
-	return value.every((block) => {
+	for (let index = 0; index < value.length; index++) {
+		if (!Object.hasOwn(value, index)) return false;
+		const block = value[index];
 		if (!isPlainObject(block) || typeof block.type !== "string") return false;
-		if (block.type === "text") return typeof block.text === "string";
-		if (block.type === "image") return typeof block.data === "string" && typeof block.mimeType === "string";
-		if (block.type === "toolCall") {
-			return typeof block.id === "string" && typeof block.name === "string" && isPlainObject(block.arguments);
+		if (block.type === "text" && typeof block.text === "string") continue;
+		if (block.type === "image" && typeof block.data === "string" && typeof block.mimeType === "string") continue;
+		if (
+			block.type === "toolCall" &&
+			typeof block.id === "string" &&
+			typeof block.name === "string" &&
+			isPlainObject(block.arguments)
+		) {
+			continue;
 		}
-		if (block.type === "thinking" || block.type === "redactedThinking")
-			return typeof block.thinking === "string" || typeof block.data === "string";
+		if (
+			(block.type === "thinking" || block.type === "redactedThinking") &&
+			(typeof block.thinking === "string" || typeof block.data === "string")
+		) {
+			continue;
+		}
 		return false;
-	});
+	}
+	return true;
 }
 
 /**
@@ -614,7 +638,7 @@ function validateStrictEntryFields(entry: Record<string, unknown>, line: number,
 				case "hookMessage":
 					if (
 						typeof message.customType !== "string" ||
-						!isMessageContent(message.content) ||
+						!isCustomMessageContent(message.content) ||
 						typeof message.display !== "boolean"
 					) {
 						throw new SessionTranscriptParseError("custom/hook message has invalid required fields", line);
@@ -711,8 +735,11 @@ function validateStrictEntryFields(entry: Record<string, unknown>, line: number,
 				throw new SessionTranscriptParseError("custom_message needs a string customType", line);
 			}
 			const content = entry.content;
-			if (typeof content !== "string" && !Array.isArray(content)) {
-				throw new SessionTranscriptParseError("custom_message content must be a string or array", line);
+			if (!isCustomMessageContent(content)) {
+				throw new SessionTranscriptParseError(
+					"custom_message content must be a string or text/image block array",
+					line,
+				);
 			}
 			if (typeof entry.display !== "boolean") {
 				throw new SessionTranscriptParseError("custom_message needs a boolean display", line);
@@ -829,8 +856,29 @@ export function parseSessionTranscriptStrict(raw: string): { header: SessionHead
 		entries.push(record as unknown as SessionEntry);
 		previousLegacyId = id;
 	}
+	validateStrictContextEdits(entries);
 	validateStrictPathResolution(header, entries, idsByLine);
 	return { header, entries };
+}
+
+/** A context edit targeting a custom message must keep its narrower text/image content contract. */
+function validateStrictContextEdits(entries: SessionEntry[]): void {
+	const entryById = new Map(entries.map((entry) => [entry.id, entry]));
+	for (const [index, entry] of entries.entries()) {
+		if (entry.type !== "context_edit" || entry.replacement === null) continue;
+		const target = entryById.get(entry.targetId);
+		if (!target) continue; // Dangling off-branch references retain existing compatibility.
+		const targetMessage = target.type === "message" ? (target.message as unknown) : undefined;
+		const customTarget =
+			target.type === "custom_message" ||
+			(isPlainObject(targetMessage) && (targetMessage.role === "custom" || targetMessage.role === "hookMessage"));
+		if (customTarget && !isCustomMessageContent(entry.replacement.content)) {
+			throw new SessionTranscriptParseError(
+				"context_edit targeting a custom message must contain only text/image content",
+				index + 2,
+			);
+		}
+	}
 }
 
 function parseStrictLine(line: string, lineNo: number): Record<string, unknown> {
@@ -1941,12 +1989,23 @@ export class SessionManager {
 	 * These need to be appended via appendCompaction() and appendBranchSummary() methods.
 	 */
 	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
+		const role = message.role;
+		let persistedMessage: Message | CustomMessage | BashExecutionMessage;
+		if (role === "custom") {
+			const timestamp = (message as CustomMessage).timestamp;
+			if (typeof timestamp !== "number" || !Number.isFinite(timestamp)) {
+				throw new TypeError("Custom message timestamp must be a finite number");
+			}
+			persistedMessage = { role: "custom", ...snapshotCustomMessage(message), timestamp };
+		} else {
+			persistedMessage = { ...message, role } as Message | BashExecutionMessage;
+		}
 		const entry: SessionMessageEntry = {
 			type: "message",
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
-			message,
+			message: persistedMessage,
 		};
 		this._appendEntry(entry);
 		return entry.id;
@@ -2113,12 +2172,10 @@ export class SessionManager {
 		display: boolean,
 		details?: T,
 	): string {
+		const snapshot = snapshotCustomMessage<T>({ customType, content, display, details });
 		const entry: CustomMessageEntry<T> = {
 			type: "custom_message",
-			customType,
-			content,
-			display,
-			details,
+			...snapshot,
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
@@ -2129,14 +2186,6 @@ export class SessionManager {
 
 	/** Append a branch-local edit to an earlier model-visible entry. */
 	appendContextEdit(targetId: string, replacement: ContextEditEntry["replacement"]): string {
-		if (
-			replacement !== null &&
-			(typeof replacement !== "object" ||
-				!("content" in replacement) ||
-				(typeof replacement.content !== "string" && !Array.isArray(replacement.content)))
-		) {
-			throw new Error("Context edit replacement must be null or contain string/array content");
-		}
 		const target = this.byId.get(targetId);
 		if (!target) throw new Error(`Entry ${targetId} not found`);
 		if (!this.getBranch().some((entry) => entry.id === targetId)) {
@@ -2149,13 +2198,47 @@ export class SessionManager {
 					target.message.role === "assistant" ||
 					target.message.role === "toolResult"));
 		if (!editable) throw new Error(`Entry ${targetId} does not contribute editable model content`);
-		const targetRole = target.type === "message" ? target.message.role : "custom";
-		const normalizedReplacement =
-			replacement !== null &&
-			(targetRole === "assistant" || targetRole === "toolResult") &&
-			typeof replacement.content === "string"
-				? { content: [{ type: "text" as const, text: replacement.content }] }
-				: replacement;
+
+		let normalizedReplacement: ContextEditEntry["replacement"];
+		if (replacement === null) {
+			normalizedReplacement = null;
+		} else {
+			if (!isPlainObject(replacement) || !Object.hasOwn(replacement, "content")) {
+				throw new TypeError("Context edit replacement must be null or contain content");
+			}
+			const rawContent = replacement.content;
+			if (typeof rawContent !== "string" && !Array.isArray(rawContent)) {
+				throw new TypeError("Context edit replacement content must be a string or array");
+			}
+			let contentSnapshot: unknown;
+			try {
+				const serialized = JSON.stringify(rawContent);
+				if (serialized === undefined) throw new TypeError("content did not serialize");
+				contentSnapshot = JSON.parse(serialized);
+			} catch {
+				throw new TypeError("Context edit replacement content must be JSON-serializable");
+			}
+
+			const customTarget = target.type === "custom_message";
+			const validContent = customTarget
+				? isCustomMessageContent(contentSnapshot)
+				: isMessageContent(contentSnapshot);
+			if (!validContent) {
+				throw new TypeError(
+					customTarget
+						? "Custom context edit content must be a string or text/image block array"
+						: "Context edit replacement content must be a string or valid content-block array",
+				);
+			}
+
+			const targetRole = target.type === "message" ? target.message.role : "custom";
+			const content =
+				(targetRole === "assistant" || targetRole === "toolResult") && typeof contentSnapshot === "string"
+					? [{ type: "text" as const, text: contentSnapshot }]
+					: (contentSnapshot as ContextEditableContent);
+			normalizedReplacement = { content };
+		}
+
 		const entry: ContextEditEntry = {
 			type: "context_edit",
 			id: generateId(this.byId),

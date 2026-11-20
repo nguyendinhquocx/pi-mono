@@ -52,6 +52,84 @@ export interface CustomMessage<T = unknown> {
 	timestamp: number;
 }
 
+export type CustomMessagePayload<T = unknown> = Pick<
+	CustomMessage<T>,
+	"customType" | "content" | "display" | "details"
+>;
+
+/** Runtime validator + snapshot for extension payloads; TypeScript types do not protect JS extensions. */
+export function snapshotCustomMessage<T = unknown>(value: unknown): CustomMessagePayload<T> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new TypeError("Custom message must be an object");
+	}
+	const record = value as Record<string, unknown>;
+	const customType = record.customType;
+	const rawContent = record.content;
+	const display = record.display;
+	const details = record.details;
+	if (typeof customType !== "string" || typeof display !== "boolean") {
+		throw new TypeError("Custom message requires a string customType and boolean display");
+	}
+	return {
+		customType,
+		content: snapshotCustomMessageContent(rawContent),
+		display,
+		details: snapshotJsonValue(details) as T | undefined,
+	};
+}
+
+/** Match the JSONL persistence semantics while severing mutable extension references. */
+function snapshotJsonValue(value: unknown): unknown {
+	if (value === undefined) return undefined;
+	try {
+		const serialized = JSON.stringify(value);
+		return serialized === undefined ? undefined : JSON.parse(serialized);
+	} catch {
+		throw new TypeError("Custom message metadata must be JSON-serializable");
+	}
+}
+
+export function isCustomMessageContent(value: unknown): value is string | (TextContent | ImageContent)[] {
+	if (typeof value === "string") return true;
+	if (!Array.isArray(value)) return false;
+	for (let index = 0; index < value.length; index++) {
+		if (!Object.hasOwn(value, index)) return false;
+		const block = value[index];
+		if (!block || typeof block !== "object" || Array.isArray(block)) return false;
+		const record = block as Record<string, unknown>;
+		if (
+			record.type === "text" &&
+			typeof record.text === "string" &&
+			(record.textSignature === undefined || typeof record.textSignature === "string")
+		) {
+			continue;
+		}
+		if (record.type === "image" && typeof record.data === "string" && typeof record.mimeType === "string") continue;
+		return false;
+	}
+	return true;
+}
+
+/** Copy mutable extension content so it cannot change after validation/queue admission. */
+export function snapshotCustomMessageContent(value: unknown): string | (TextContent | ImageContent)[] {
+	if (value == null) return [];
+	if (typeof value === "string") return value;
+	if (!Array.isArray(value)) {
+		throw new TypeError("Custom message content must be a string or an array of text/image blocks");
+	}
+
+	for (let index = 0; index < value.length; index++) {
+		if (!Object.hasOwn(value, index)) {
+			throw new TypeError("Custom message content cannot contain sparse array holes");
+		}
+	}
+	const snapshot = snapshotJsonValue(value);
+	if (!isCustomMessageContent(snapshot)) {
+		throw new TypeError("Custom message content must contain text/image blocks");
+	}
+	return snapshot;
+}
+
 export interface BranchSummaryMessage {
 	role: "branchSummary";
 	summary: string;

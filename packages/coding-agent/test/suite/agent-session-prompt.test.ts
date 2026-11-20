@@ -566,6 +566,165 @@ describe("AgentSession prompt characterization", () => {
 	// Issue #10267, #5581: a run started by sendMessage(..., { triggerTurn: true }) skipped
 	// before_agent_start, so its second request patched away the sections handlers had added.
 	describe("runs started by a custom message", () => {
+		it("rejects malformed custom-message metadata before appending it", async () => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			const entryCountBefore = harness.sessionManager.getEntries().length;
+
+			await expect(harness.session.sendCustomMessage({ content: [], display: false } as any)).rejects.toThrow(
+				/customType.*display/i,
+			);
+			await expect(
+				harness.session.sendCustomMessage({ customType: "legacy-empty", content: [] } as any),
+			).rejects.toThrow(/customType.*display/i);
+			await expect(
+				harness.session.sendCustomMessage({ customType: "bad-block", content: [null], display: false } as any),
+			).rejects.toThrow(/text\/image blocks/i);
+			await expect(
+				harness.session.sendCustomMessage({
+					customType: "bad-type",
+					content: [{ type: "toolCall", id: "call", name: "read", arguments: {} }],
+					display: false,
+				} as any),
+			).rejects.toThrow(/text\/image blocks/i);
+			await expect(
+				harness.session.sendCustomMessage({
+					customType: "bad-signature",
+					content: [{ type: "text", text: "hello", textSignature: { invalid: true } }],
+					display: false,
+				} as any),
+			).rejects.toThrow(/text\/image blocks/i);
+			const sparseContent = new Array(1);
+			await expect(
+				harness.session.sendCustomMessage({ customType: "sparse", content: sparseContent, display: false } as any),
+			).rejects.toThrow(/sparse array holes/i);
+
+			expect(harness.sessionManager.getEntries()).toHaveLength(entryCountBefore);
+			expect(harness.session.messages.filter((message) => message.role === "custom")).toHaveLength(0);
+		});
+
+		it("snapshots custom-message getters and payloads before queueing", async () => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			const blocks: Array<{ type: string; text?: string; toHTML?: () => string }> = [
+				{ type: "text", text: "before", toHTML: () => "<b>before</b>" },
+			];
+			const details = { progress: 0 };
+			let customTypeReads = 0;
+			let displayReads = 0;
+			let contentReads = 0;
+			let detailsReads = 0;
+			const message = {
+				get customType() {
+					customTypeReads++;
+					return customTypeReads === 1 ? "snapshot" : undefined;
+				},
+				get display() {
+					displayReads++;
+					return displayReads === 1 ? false : undefined;
+				},
+				get content() {
+					contentReads++;
+					return contentReads === 1 ? blocks : [null];
+				},
+				get details() {
+					detailsReads++;
+					return details;
+				},
+			};
+
+			await harness.session.sendCustomMessage(message as any, { deliverAs: "nextTurn" });
+			blocks[0]!.text = "after";
+			blocks.push(null as any);
+			details.progress = 100;
+
+			const queued = (
+				harness.session as unknown as {
+					_pendingNextTurnMessages: Array<{
+						customType: string;
+						display: boolean;
+						content: unknown[];
+						details: { progress: number };
+					}>;
+				}
+			)._pendingNextTurnMessages[0];
+			expect([customTypeReads, displayReads, contentReads, detailsReads]).toEqual([1, 1, 1, 1]);
+			expect(queued).toMatchObject({
+				customType: "snapshot",
+				display: false,
+				content: [{ type: "text", text: "before" }],
+				details: { progress: 0 },
+			});
+		});
+
+		it("keeps normalizing omitted content when required metadata is valid", async () => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+
+			await harness.session.sendCustomMessage({ customType: "legacy-empty", display: false } as any);
+
+			const entry = harness.sessionManager.getEntries().findLast((candidate) => candidate.type === "custom_message");
+			expect(entry).toMatchObject({
+				type: "custom_message",
+				customType: "legacy-empty",
+				content: [],
+				display: false,
+			});
+		});
+
+		it("validates custom messages returned by before_agent_start before provider requests", async () => {
+			let providerCalls = 0;
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("before_agent_start", () => ({
+							message: { customType: "bad-result", content: [null], display: true } as any,
+						}));
+					},
+				],
+			});
+			harnesses.push(harness);
+			harness.setResponses([
+				() => {
+					providerCalls++;
+					return fauxAssistantMessage("must not reach provider");
+				},
+			]);
+
+			await expect(harness.session.prompt("hello")).rejects.toThrow(/text\/image blocks/i);
+			expect(providerCalls).toBe(0);
+			expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom_message")).toHaveLength(0);
+		});
+
+		it("revalidates a custom start message after before_agent_start mutation", async () => {
+			let providerCalls = 0;
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("before_agent_start", (event) => {
+							if (event.messageType === "custom") (event.message as any).display = undefined;
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			harness.setResponses([
+				() => {
+					providerCalls++;
+					return fauxAssistantMessage("must not reach provider");
+				},
+			]);
+
+			await expect(
+				harness.session.sendCustomMessage(
+					{ customType: "starting", content: "start", display: true },
+					{ triggerTurn: true },
+				),
+			).rejects.toThrow(/customType.*display/i);
+			expect(providerCalls).toBe(0);
+			expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom_message")).toHaveLength(0);
+		});
+
 		it("keeps the same system prompt for every request of the run", async () => {
 			const events: BeforeAgentStartEvent[] = [];
 			const noopTool: AgentTool = {

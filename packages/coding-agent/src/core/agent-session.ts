@@ -135,7 +135,7 @@ import {
 } from "./extensions/index.ts";
 import { type BeforeAgentStartTrigger, emitSessionShutdownEvent } from "./extensions/runner.ts";
 import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
-import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
+import { type BashExecutionMessage, type CustomMessage, convertToLlm, snapshotCustomMessage } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { NestedToolCallRunner } from "./nested-tool-calls.ts";
@@ -2470,7 +2470,11 @@ export class AgentSession {
 
 		const messages: AgentMessage[] = [];
 		if (trigger.messageType === "custom") {
-			messages.push(trigger.message);
+			messages.push({
+				role: "custom",
+				...snapshotCustomMessage(trigger.message),
+				timestamp: Date.now(),
+			});
 		} else {
 			// Normalize images after before_agent_start so extension-driven model selection
 			// determines the resize profile used for the request and history.
@@ -2489,11 +2493,7 @@ export class AgentSession {
 		for (const msg of result.messages) {
 			messages.push({
 				role: "custom",
-				customType: msg.customType,
-				// Untyped extensions can pass null/missing content; normalize at ingestion.
-				content: msg.content ?? [],
-				display: msg.display,
-				details: msg.details,
+				...snapshotCustomMessage(msg),
 				timestamp: Date.now(),
 			});
 		}
@@ -2955,26 +2955,26 @@ export class AgentSession {
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
 		this._throwIfSessionDataLocked();
-		const appMessage = {
-			role: "custom" as const,
-			customType: message.customType,
-			// Untyped extensions can pass null/missing content; normalize at ingestion.
-			content: message.content ?? [],
-			display: message.display,
-			details: message.details,
+		const messageSnapshot = snapshotCustomMessage<T>(message);
+		const optionsSnapshot = options ? { triggerTurn: options.triggerTurn, deliverAs: options.deliverAs } : undefined;
+		const appMessage: CustomMessage<T> = {
+			role: "custom",
+			...messageSnapshot,
 			timestamp: Date.now(),
-		} satisfies CustomMessage<T>;
-		if (options?.deliverAs === "nextTurn") {
+		};
+		if (optionsSnapshot?.deliverAs === "nextTurn") {
 			this._pendingNextTurnMessages.push(appMessage);
-		} else if (this.isStreaming && options?.triggerTurn !== false) {
-			if (options?.deliverAs === "followUp") {
+		} else if (this.isStreaming && optionsSnapshot?.triggerTurn !== false) {
+			if (optionsSnapshot?.deliverAs === "followUp") {
 				this.agent.followUp(appMessage);
 			} else {
 				this.agent.steer(appMessage);
 			}
-		} else if (options?.triggerTurn) {
+		} else if (optionsSnapshot?.triggerTurn) {
 			if (this._isEmittingAgentSettled) {
-				this._deferredSettledActions.push(async () => await this.sendCustomMessage(message, options));
+				this._deferredSettledActions.push(
+					async () => await this.sendCustomMessage(messageSnapshot, optionsSnapshot),
+				);
 				return;
 			}
 			await this._startRun({ messageType: "custom", message: appMessage });
@@ -2990,15 +2990,21 @@ export class AgentSession {
 	}
 
 	private _appendCustomMessage(appMessage: CustomMessage): void {
+		const messageSnapshot = snapshotCustomMessage(appMessage);
 		this.sessionManager.appendCustomMessageEntry(
-			appMessage.customType,
-			appMessage.content,
-			appMessage.display,
-			appMessage.details,
+			messageSnapshot.customType,
+			messageSnapshot.content,
+			messageSnapshot.display,
+			messageSnapshot.details,
 		);
 		this._refreshFinalizedContext();
-		this._emit({ type: "message_start", message: appMessage });
-		this._emit({ type: "message_end", message: appMessage });
+		const persistedMessage: CustomMessage = {
+			role: "custom",
+			...messageSnapshot,
+			timestamp: appMessage.timestamp,
+		};
+		this._emit({ type: "message_start", message: persistedMessage });
+		this._emit({ type: "message_end", message: persistedMessage });
 	}
 
 	/**
