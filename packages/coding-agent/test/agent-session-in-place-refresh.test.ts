@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { APP_NAME, VERSION } from "../src/config.ts";
 import { AgentSession, SessionDataLockedError } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
+import type { ExtensionFactory } from "../src/core/extensions/types.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import {
 	canonicalTranscriptIdentity,
@@ -17,7 +18,7 @@ import {
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { TranscriptWriteGuard } from "../src/core/transcript-write-guard.ts";
 import { createInMemoryModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
-import { createTestResourceLoader } from "./utilities.ts";
+import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.ts";
 
 const roots: string[] = [];
 
@@ -30,6 +31,7 @@ async function createPersistedSession(options?: {
 	foreignLiveClaim?: boolean;
 	skipExtensionBinding?: boolean;
 	usesDefaultTools?: boolean;
+	extensionFactories?: ExtensionFactory[];
 }) {
 	const root = mkdtempSync(join(tmpdir(), "pi-session-refresh-test-"));
 	roots.push(root);
@@ -138,6 +140,9 @@ async function createPersistedSession(options?: {
 		if (!planted.ok) throw new Error(`failed to plant foreign live claim: ${JSON.stringify(planted)}`);
 	}
 
+	const extensionsResult = options?.extensionFactories
+		? await createTestExtensionsResult(options.extensionFactories, root)
+		: undefined;
 	const sessionManager = SessionManager.open(sessionFile, transcriptDir);
 	const authStorage = AuthStorage.inMemory();
 	const agent = new Agent({
@@ -157,7 +162,7 @@ async function createPersistedSession(options?: {
 		cwd: root,
 		agentDir: root,
 		modelRuntime: getModelRuntime(await createInMemoryModelRegistry(authStorage)),
-		resourceLoader: createTestResourceLoader(),
+		resourceLoader: createTestResourceLoader(extensionsResult ? { extensionsResult } : undefined),
 		initialActiveToolNames: [],
 		usesDefaultTools: options?.usesDefaultTools === true,
 	});
@@ -367,7 +372,93 @@ describe("AgentSession in-place refresh", () => {
 		30_000,
 	);
 
-	// Fix 1: keepClaim keeps the mutation journal as recovery evidence.
+	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
+		"allows a trim command to inspect and acquire the session while excluding only its own prompt admission",
+		async () => {
+			let inspection: Awaited<ReturnType<AgentSession["inspectSessionDataLease"]>> | undefined;
+			let lockStatus: string | undefined;
+			let reloadStatus: string | undefined;
+			let idleForHandoff: boolean | undefined;
+			let handoffSnapshotHasPromptAdmission: boolean | undefined;
+			let sessionForTest: AgentSession | undefined;
+			const fixture = await createPersistedSession({
+				extensionFactories: [
+					(pi) => {
+						pi.registerCommand("trim", {
+							description: "Regression probe for trim prompt admission",
+							handler: async () => {
+								const session = sessionForTest!;
+								idleForHandoff = session.isIdleForHandoff();
+								handoffSnapshotHasPromptAdmission =
+									session.getOwnerStatus().pendingWork.prompt_admission === true;
+								inspection = await session.inspectSessionDataLease();
+								if (inspection.status !== "ready") return;
+								const lock = await session.acquireSessionDataLock();
+								lockStatus = lock.status;
+								if (lock.status !== "acquired") return;
+								const reload = await session.reloadSessionFromDisk({
+									expectedFingerprint: lock.fingerprint,
+									lockId: lock.lockId,
+								});
+								reloadStatus = reload.status;
+								await session.releaseSessionDataLock(lock.lockId);
+							},
+						});
+					},
+				],
+			});
+			sessionForTest = fixture.session;
+			try {
+				await fixture.session.prompt("/trim");
+				expect(inspection).toMatchObject({ status: "ready" });
+				expect(lockStatus).toBe("acquired");
+				expect(reloadStatus).toBe("reloaded");
+				expect(idleForHandoff).toBe(false);
+				expect(handoffSnapshotHasPromptAdmission).toBe(true);
+			} finally {
+				await fixture.session.releaseSessionDataAccess();
+				fixture.session.dispose();
+				fixture.restorePackageDir();
+			}
+		},
+		30_000,
+	);
+
+	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
+		"keeps a separate prompt admission blocking trim while the trim command is running",
+		async () => {
+			let inspection: Awaited<ReturnType<AgentSession["inspectSessionDataLease"]>> | undefined;
+			let concurrentPrompt: Promise<void> | undefined;
+			let sessionForTest: AgentSession | undefined;
+			const fixture = await createPersistedSession({
+				extensionFactories: [
+					(pi) => {
+						pi.registerCommand("trim-probe", {
+							description: "Regression probe for concurrent prompt admission",
+							handler: async () => {
+								const session = sessionForTest!;
+								concurrentPrompt = session.prompt("another prompt").catch(() => {});
+								inspection = await session.inspectSessionDataLease();
+							},
+						});
+					},
+				],
+			});
+			sessionForTest = fixture.session;
+			try {
+				await fixture.session.prompt("/trim-probe");
+				await concurrentPrompt;
+				expect(inspection).toMatchObject({ status: "refused", code: "pending_work" });
+				if (inspection?.status === "refused") expect(inspection.message).toContain("prompt_admission=true");
+			} finally {
+				await fixture.session.releaseSessionDataAccess();
+				fixture.session.dispose();
+				fixture.restorePackageDir();
+			}
+		},
+		30_000,
+	);
+
 	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
 		"reports which pending-work queues block session-data inspection without exposing contents",
 		async () => {
@@ -604,6 +695,7 @@ describe("AgentSession in-place refresh", () => {
 		30_000,
 	);
 
+	// Fix 1: keepClaim keeps the mutation journal as recovery evidence.
 	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
 		"keeps the claim journal on keepClaim release and refuses the next acquire as recovery_blocked",
 		async () => {

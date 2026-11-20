@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -711,6 +712,8 @@ export class AgentSession {
 	private _ownerKind: OwnerKind = "tui";
 	private _uiPendingCount = 0;
 	private _promptAdmissionCount = 0;
+	private readonly _promptAdmissionTokens = new Set<symbol>();
+	private readonly _promptAdmissionContext = new AsyncLocalStorage<symbol>();
 	/** In-flight steer/followUp admissions; beginSessionHandoff must refuse while > 0. */
 	private _queueAdmissionCount = 0;
 	private _handoffAdmissionLocked = false;
@@ -2617,7 +2620,9 @@ export class AgentSession {
 		this._throwIfSessionDataLocked();
 		// Reserve admission before the first await; otherwise a handoff can pass its
 		// idle check while this prompt is still validating the cached owner guard.
+		const promptAdmissionToken = Symbol("prompt-admission");
 		this._promptAdmissionCount++;
+		this._promptAdmissionTokens.add(promptAdmissionToken);
 		try {
 			await this._ensureSessionAccessGuard();
 			this._throwIfSessionDataLocked();
@@ -2630,7 +2635,9 @@ export class AgentSession {
 			// Handle extension commands first (execute immediately, even during streaming)
 			// Extension commands manage their own LLM interaction via pi.sendMessage()
 			if (expandPromptTemplates && text.startsWith("/")) {
-				const handled = await this._tryExecuteExtensionCommand(text);
+				const handled = await this._promptAdmissionContext.run(promptAdmissionToken, () =>
+					this._tryExecuteExtensionCommand(text),
+				);
 				if (handled) {
 					preflightResult?.("handled");
 					return;
@@ -2654,6 +2661,7 @@ export class AgentSession {
 			}
 			if (trigger) await this._startRun(trigger, () => preflightResult?.("started"));
 		} finally {
+			this._promptAdmissionTokens.delete(promptAdmissionToken);
 			this._promptAdmissionCount--;
 		}
 	}
@@ -4184,7 +4192,18 @@ export class AgentSession {
 		}
 	}
 
-	private _pendingSessionWorkDetails(): Record<string, number | boolean> {
+	private _currentSessionDataAdmissionExemption(): symbol | undefined {
+		const currentPromptAdmission = this._promptAdmissionContext.getStore();
+		return currentPromptAdmission !== undefined && this._promptAdmissionTokens.has(currentPromptAdmission)
+			? currentPromptAdmission
+			: undefined;
+	}
+
+	private _pendingSessionWorkDetails(exemptPromptAdmission?: symbol): Record<string, number | boolean> {
+		const isExemptAdmissionActive =
+			exemptPromptAdmission !== undefined && this._promptAdmissionTokens.has(exemptPromptAdmission);
+		const exemptAdmissionCount = isExemptAdmissionActive ? 1 : 0;
+		const hasOtherPromptAdmission = this._promptAdmissionCount > exemptAdmissionCount;
 		return {
 			steering: this._steeringMessages.length,
 			follow_up: this._followUpMessages.length,
@@ -4198,19 +4217,20 @@ export class AgentSession {
 			emitting_settled: this._isEmittingAgentSettled,
 			retrying: this._retryAbortController !== undefined,
 			failed_response: this._failedResponse !== undefined,
-			prompt_admission: this._promptAdmissionCount > 0,
+			// Only session-data checks pass the current trim token; owner/handoff checks keep it pending.
+			prompt_admission: hasOtherPromptAdmission,
 			queue_admission: this._queueAdmissionCount > 0,
 		};
 	}
 
-	private _hasPendingSessionWork(): boolean {
-		return Object.values(this._pendingSessionWorkDetails()).some((value) =>
+	private _hasPendingSessionWork(exemptPromptAdmission?: symbol): boolean {
+		return Object.values(this._pendingSessionWorkDetails(exemptPromptAdmission)).some((value) =>
 			typeof value === "number" ? value > 0 : value,
 		);
 	}
 
-	private _pendingSessionWorkMessage(prefix: string): string {
-		const pending = Object.entries(this._pendingSessionWorkDetails()).filter(([, value]) =>
+	private _pendingSessionWorkMessage(prefix: string, exemptPromptAdmission?: symbol): string {
+		const pending = Object.entries(this._pendingSessionWorkDetails(exemptPromptAdmission)).filter(([, value]) =>
 			typeof value === "number" ? value > 0 : value,
 		);
 		const summary = pending.map(([name, value]) => `${name}=${value}`).join(", ") || "unknown";
@@ -4412,10 +4432,13 @@ export class AgentSession {
 
 	/** Read-only pre-preview check for persisted identity, idleness, lease and promotion gates. */
 	async inspectSessionDataLease(): Promise<SessionDataLeaseInspectionResult> {
-		return this._inspectSessionDataLease(false);
+		return this._inspectSessionDataLease(false, this._currentSessionDataAdmissionExemption());
 	}
 
-	private async _inspectSessionDataLease(allowAdmissionLocked: boolean): Promise<SessionDataLeaseInspectionResult> {
+	private async _inspectSessionDataLease(
+		allowAdmissionLocked: boolean,
+		exemptPromptAdmission?: symbol,
+	): Promise<SessionDataLeaseInspectionResult> {
 		if (this._extensionMode !== "tui") {
 			return this._sessionDataRefused("unsupported_mode", "session trim is available only in interactive mode");
 		}
@@ -4429,8 +4452,11 @@ export class AgentSession {
 		if (!this.isIdle || this._isEmittingAgentSettled || this.isRetrying) {
 			return this._sessionDataRefused("not_idle", "agent run, compaction, retry, or continuation is active");
 		}
-		if (this._hasPendingSessionWork()) {
-			return this._sessionDataRefused("pending_work", this._pendingSessionWorkMessage("Session trim is blocked"));
+		if (this._hasPendingSessionWork(exemptPromptAdmission)) {
+			return this._sessionDataRefused(
+				"pending_work",
+				this._pendingSessionWorkMessage("Session trim is blocked", exemptPromptAdmission),
+			);
 		}
 		if (
 			!this._sessionAccessGuard?.isHeld ||
@@ -4528,7 +4554,7 @@ export class AgentSession {
 		let upgradeCompleted = false;
 		let success = false;
 		try {
-			const inspected = await this._inspectSessionDataLease(true);
+			const inspected = await this._inspectSessionDataLease(true, this._currentSessionDataAdmissionExemption());
 			if (inspected.status !== "ready") {
 				return { status: "refused", code: inspected.code, message: inspected.message };
 			}
@@ -4945,10 +4971,11 @@ export class AgentSession {
 		const sessionFile = this.sessionManager.getSessionFile();
 		if (!sessionFile || !this.sessionManager.isPersisted())
 			return refuse("not_persisted", "current session is not persisted");
-		if (!this._sessionDataAdmissionLocked || this._hasPendingSessionWork() || !this.isIdle) {
+		const exemptPromptAdmission = this._currentSessionDataAdmissionExemption();
+		if (!this._sessionDataAdmissionLocked || this._hasPendingSessionWork(exemptPromptAdmission) || !this.isIdle) {
 			return refuse(
 				"pending_work",
-				this._pendingSessionWorkMessage("Session is no longer idle or has pending work"),
+				this._pendingSessionWorkMessage("Session is no longer idle or has pending work", exemptPromptAdmission),
 			);
 		}
 		if (canonicalTranscriptIdentity(held.guard.path).identity !== canonicalTranscriptIdentity(sessionFile).identity) {
