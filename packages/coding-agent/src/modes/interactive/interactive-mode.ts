@@ -1161,7 +1161,7 @@ export class InteractiveMode {
 		await this.updateOwnerBridgeSession();
 		if (this.options.ownerBridgeEnabled) {
 			const status = this.session.getOwnerStatus();
-			this.showStatus(`Owner bridge active · TUI pid ${status.pid} · epoch ${status.ownerEpoch ?? 1}`);
+			this.showStatus(liCopy().status.ownerBridgeActive(status.pid, status.ownerEpoch ?? 1));
 		}
 
 		// Render initial messages AFTER showing loaded resources
@@ -7060,7 +7060,12 @@ export class InteractiveMode {
 	private showOwnerStatus(session: AgentSession): void {
 		const status = session.getOwnerStatus();
 		this.showStatus(
-			`Writer: ${status.isOwner ? "TUI" : status.ownerKind} · pid ${status.pid} · epoch ${status.ownerEpoch ?? 1} · ${status.writerState ?? "idle"}`,
+			liCopy().status.writerStatus(
+				status.isOwner ? "TUI" : (status.ownerKind ?? "unknown"),
+				status.pid,
+				status.ownerEpoch ?? 1,
+				status.writerState ?? "idle",
+			),
 		);
 	}
 
@@ -7090,13 +7095,9 @@ export class InteractiveMode {
 		}
 		if (action === "claim") {
 			if (this.options.handoffClaimed) {
-				this.showStatus(
-					`TUI claimed the session before startup · epoch ${this.options.handoffClaimed.ownerEpoch}.`,
-				);
+				this.showStatus(liCopy().status.tuiClaimedBeforeStartup(this.options.handoffClaimed.ownerEpoch));
 			} else if (status.isOwner && status.ownerKind === "tui") {
-				this.showStatus(
-					"This TUI already owns the writer lease. Successor claims are consumed before startup via PI_SESSION_OWNER_CLAIM.",
-				);
+				this.showStatus(liCopy().status.tuiOwnsWriterLease);
 			} else {
 				this.showWarning(
 					"A successor must claim PI_SESSION_OWNER_CLAIM before constructing AgentSession; this viewer cannot claim on its behalf.",

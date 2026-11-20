@@ -267,7 +267,7 @@ describe("Li / menu command descriptions", () => {
 	}
 
 	it("keeps the EN catalog verbatim against BUILTIN_SLASH_COMMANDS", () => {
-		expect(BUILTIN_SLASH_COMMANDS).toHaveLength(24);
+		expect(BUILTIN_SLASH_COMMANDS).toHaveLength(25);
 		for (const command of BUILTIN_SLASH_COMMANDS) {
 			expect(LI_UI_COPY.en.slashCommands[command.name]?.description, command.name).toBe(command.description);
 		}

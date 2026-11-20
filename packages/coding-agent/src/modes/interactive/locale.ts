@@ -180,6 +180,10 @@ export interface LiUiCopy {
 		startupInProgress: string;
 		autoCompactionCancelled: string;
 		suspendNotSupported: string;
+		tuiOwnsWriterLease: string;
+		ownerBridgeActive: (pid: number, epoch: number) => string;
+		writerStatus: (ownerLabel: string, pid: number, epoch: number, writerState: string) => string;
+		tuiClaimedBeforeStartup: (epoch: number) => string;
 		noQueuedMessages: string;
 		restoredQueued: (count: number) => string;
 		modelNoThinking: string;
@@ -480,6 +484,7 @@ const EN_COPY: LiUiCopy = {
 		copy: { description: "Copy last agent message to clipboard" },
 		name: { description: "Set session display name" },
 		session: { description: "Show session info and stats" },
+		handoff: { description: "Inspect or transfer the session writer" },
 		changelog: { description: "Show changelog entries" },
 		hotkeys: { description: "Show all keyboard shortcuts" },
 		fork: { description: "Create a new fork from a previous user message" },
@@ -549,6 +554,12 @@ const EN_COPY: LiUiCopy = {
 		startupInProgress: "Startup is still in progress",
 		autoCompactionCancelled: "Auto-compaction cancelled",
 		suspendNotSupported: "Suspend to background is not supported on Windows",
+		tuiOwnsWriterLease:
+			"This TUI already owns the writer lease. Successor claims are consumed before startup via PI_SESSION_OWNER_CLAIM.",
+		ownerBridgeActive: (pid, epoch) => `Owner bridge active · TUI pid ${pid} · epoch ${epoch}`,
+		writerStatus: (ownerLabel, pid, epoch, writerState) =>
+			`Writer: ${ownerLabel} · pid ${pid} · epoch ${epoch} · ${writerState}`,
+		tuiClaimedBeforeStartup: (epoch) => `TUI claimed the session before startup · epoch ${epoch}.`,
 		noQueuedMessages: "No queued messages to restore",
 		restoredQueued: (count) => `Restored ${count} queued message${count > 1 ? "s" : ""} to editor`,
 		modelNoThinking: "Current model does not support thinking",
@@ -854,6 +865,7 @@ const VI_COPY: LiUiCopy = {
 		copy: { description: "Copy message agent cuối vào clipboard" },
 		name: { description: "Đặt tên hiển thị session" },
 		session: { description: "Xem thông tin và thống kê session" },
+		handoff: { description: "Xem hoặc chuyển quyền ghi session" },
 		changelog: { description: "Xem các mục changelog" },
 		hotkeys: { description: "Xem tất cả phím tắt" },
 		fork: { description: "Tạo fork mới từ một message user trước đó" },
@@ -923,6 +935,12 @@ const VI_COPY: LiUiCopy = {
 		startupInProgress: "Khởi động chưa xong",
 		autoCompactionCancelled: "Đã hủy tự nén ngữ cảnh",
 		suspendNotSupported: "Không hỗ trợ đưa xuống nền trên Windows",
+		tuiOwnsWriterLease:
+			"TUI này đã giữ writer lease. Claim của successor được tiêu thụ trước khi khởi động qua PI_SESSION_OWNER_CLAIM.",
+		ownerBridgeActive: (pid, epoch) => `Owner bridge đang chạy · TUI pid ${pid} · epoch ${epoch}`,
+		writerStatus: (ownerLabel, pid, epoch, writerState) =>
+			`Writer: ${ownerLabel} · pid ${pid} · epoch ${epoch} · ${writerState}`,
+		tuiClaimedBeforeStartup: (epoch) => `TUI đã claim session trước khi khởi động · epoch ${epoch}.`,
 		noQueuedMessages: "Không có message đang chờ để khôi phục",
 		restoredQueued: (count) => `Đã đưa ${count} message đang chờ về editor`,
 		modelNoThinking: "Model hiện tại không hỗ trợ suy nghĩ",

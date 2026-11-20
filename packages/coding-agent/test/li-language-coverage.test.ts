@@ -243,14 +243,14 @@ describe("Li UI copy coverage inventory", () => {
 	});
 
 	it("keeps every built-in slash command inside both catalogs (descriptions only)", () => {
-		expect(BUILTIN_SLASH_COMMANDS).toHaveLength(24);
+		expect(BUILTIN_SLASH_COMMANDS).toHaveLength(25);
 		for (const command of BUILTIN_SLASH_COMMANDS) {
 			expect(LI_UI_COPY.en.slashCommands[command.name]?.description, `en/${command.name}`).toBe(command.description);
 			expect(LI_UI_COPY.vi.slashCommands[command.name]?.description, `vi/${command.name}`).toBeTruthy();
 		}
 		// argumentHint is data, not copy: the catalog entries carry only descriptions.
-		expect(Object.keys(LI_UI_COPY.en.slashCommands)).toHaveLength(24);
-		expect(Object.keys(LI_UI_COPY.vi.slashCommands)).toHaveLength(24);
+		expect(Object.keys(LI_UI_COPY.en.slashCommands)).toHaveLength(25);
+		expect(Object.keys(LI_UI_COPY.vi.slashCommands)).toHaveLength(25);
 	});
 
 	it("keeps built-in /hotkeys copy in the locale catalog", () => {
