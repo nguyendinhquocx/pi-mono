@@ -224,6 +224,7 @@ export interface LiUiCopy {
 		sessionExported: (filePath: string) => string;
 		sessionImported: (inputPath: string) => string;
 		resumedIn: (cwd: string) => string;
+		resumeConflict: (holderPid: number | undefined, openedAt: string | undefined) => string;
 		forkedInto: (sessionId: string, cwd: string) => string;
 		importCancelled: string;
 		copiedLastMessage: string;
@@ -608,6 +609,14 @@ const EN_COPY: LiUiCopy = {
 		sessionExported: (filePath) => `Session exported to: ${filePath}`,
 		sessionImported: (inputPath) => `Session imported from: ${inputPath}`,
 		resumedIn: (cwd) => `Resumed session in ${cwd}`,
+		resumeConflict: (holderPid, openedAt) => {
+			const holder = holderPid !== undefined ? ` (PID ${holderPid}${openedAt ? `, opened ${openedAt}` : ""})` : "";
+			const recovery =
+				holderPid !== undefined
+					? "close that tab/process (or end the PID if it is orphaned), then resume again"
+					: "close that tab/process first, then resume again";
+			return `Session is open in another live process${holder} — ${recovery}.`;
+		},
 		forkedInto: (sessionId, cwd) => `Forked into new session ${sessionId} in ${cwd}`,
 		importCancelled: "Import cancelled",
 		copiedLastMessage: "Copied last agent message to clipboard",
@@ -989,6 +998,14 @@ const VI_COPY: LiUiCopy = {
 		sessionExported: (filePath) => `Đã export session ra: ${filePath}`,
 		sessionImported: (inputPath) => `Đã import session từ: ${inputPath}`,
 		resumedIn: (cwd) => `Đã resume session trong ${cwd}`,
+		resumeConflict: (holderPid, openedAt) => {
+			const holder = holderPid !== undefined ? ` (PID ${holderPid}${openedAt ? `, mở lúc ${openedAt}` : ""})` : "";
+			const recovery =
+				holderPid !== undefined
+					? "đóng tab/process đó (hoặc kết thúc PID nếu nó mồ côi) rồi resume lại"
+					: "đóng tab/process đó rồi resume lại";
+			return `Session đang mở trong process khác${holder} — ${recovery}.`;
+		},
 		forkedInto: (sessionId, cwd) => `Đã fork sang session mới ${sessionId} tại ${cwd}`,
 		importCancelled: "Đã hủy import",
 		copiedLastMessage: "Đã copy message agent cuối vào clipboard",

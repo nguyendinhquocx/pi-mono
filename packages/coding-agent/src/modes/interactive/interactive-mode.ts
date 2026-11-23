@@ -66,7 +66,12 @@ import {
 	getDocsPath,
 	VERSION,
 } from "../../config.ts";
-import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../../core/agent-session.ts";
+import {
+	type AgentSession,
+	type AgentSessionEvent,
+	parseSkillBlock,
+	SessionOpenWriterConflictError,
+} from "../../core/agent-session.ts";
 import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.ts";
 import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.ts";
 import {
@@ -6136,13 +6141,20 @@ export class InteractiveMode {
 			if (error instanceof MissingSessionCwdError) {
 				switch (await this.promptForMissingSessionCwd(error)) {
 					case "continue": {
-						const result = await this.runtimeHost.switchSession(sessionPath, {
-							cwdOverride: error.issue.fallbackCwd,
-							withSession: options?.withSession,
-							projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
-						});
-						if (!result.cancelled) this.showStatus(liCopy().status.resumedIn(error.issue.fallbackCwd));
-						return result;
+						let retryResult: { cancelled: boolean };
+						try {
+							retryResult = await this.runtimeHost.switchSession(sessionPath, {
+								cwdOverride: error.issue.fallbackCwd,
+								withSession: options?.withSession,
+								projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
+							});
+						} catch (retryError: unknown) {
+							const conflict = this.resumeWriterConflict(retryError);
+							if (conflict) return conflict;
+							throw retryError;
+						}
+						if (!retryResult.cancelled) this.showStatus(liCopy().status.resumedIn(error.issue.fallbackCwd));
+						return retryResult;
 					}
 					case "fork":
 						return this.switchToForkedSession(sessionPath, error.issue.fallbackCwd, options);
@@ -6151,8 +6163,19 @@ export class InteractiveMode {
 						return { cancelled: true };
 				}
 			}
+			if (error instanceof SessionOpenWriterConflictError) {
+				const conflict = this.resumeWriterConflict(error);
+				if (conflict) return conflict;
+			}
 			return this.handleFatalRuntimeError("Failed to resume session", error);
 		}
+	}
+
+	/** Lease-held session at resume: warn with holder PID and stay alive instead of fatal crash. */
+	private resumeWriterConflict(error: unknown): { cancelled: boolean } | undefined {
+		if (!(error instanceof SessionOpenWriterConflictError)) return undefined;
+		this.showWarning(liCopy().status.resumeConflict(error.holderPid, error.holderOpenedAt));
+		return { cancelled: true };
 	}
 
 	/** Fork a session whose stored cwd is gone into `cwd` and switch to the fork, like `--session <id>` from another project (#11060). */
@@ -6163,10 +6186,19 @@ export class InteractiveMode {
 	): Promise<{ cancelled: boolean }> {
 		const fork = SessionManager.forkFrom(sourcePath, cwd, this.sessionManager.getSessionDir());
 		const forkPath = fork.getSessionFile()!;
-		const result = await this.runtimeHost.switchSession(forkPath, {
-			withSession: options?.withSession,
-			projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
-		});
+		let result: { cancelled: boolean };
+		try {
+			result = await this.runtimeHost.switchSession(forkPath, {
+				withSession: options?.withSession,
+				projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
+			});
+		} catch (error: unknown) {
+			const conflict = this.resumeWriterConflict(error);
+			if (!conflict) throw error;
+			// The fork file was created but the switch was refused; drop the orphan copy.
+			fs.rmSync(forkPath, { force: true });
+			return conflict;
+		}
 		if (result.cancelled) {
 			// An extension vetoed the switch; drop the fork so cancelling leaves no copy behind.
 			fs.rmSync(forkPath, { force: true });
