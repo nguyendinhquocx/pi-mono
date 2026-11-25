@@ -180,7 +180,7 @@ import { piLogoLines, piWordmark, supportsPiLogo } from "./components/pi-logo.ts
 import { createLoginMenuSelector } from "./components/radius-login-selector.ts";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.ts";
 import { SessionSelectorComponent } from "./components/session-selector.ts";
-import { SettingsSelectorComponent } from "./components/settings-selector.ts";
+import { SettingsSelectorComponent, type TelegramFollowUpStatusSnapshot } from "./components/settings-selector.ts";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.ts";
 import {
 	BranchSummaryStatusIndicator,
@@ -204,6 +204,18 @@ import { getModelSearchText } from "./model-search.ts";
 import { OwnerBridgeServer, type OwnerBridgeSession } from "./owner-bridge-server.ts";
 import { type BlockedStatus, ProgramStatusReporter } from "./program-status-reporter.ts";
 import { shareSession } from "./session-share.ts";
+import {
+	evaluateEnableGate,
+	GLOBAL_STATUS_ERROR_CODES,
+	GLOBAL_STATUS_PROTOCOL_VERSION,
+	type PolicyMutation,
+	type PolicyReadResult,
+	type PolicyWriteResult,
+	readGlobalPolicy,
+	readGlobalStatus,
+	resolveSupervisorRoot,
+	writeGlobalPolicy,
+} from "./telegram-follow-up-policy.ts";
 import {
 	getAvailableThemes,
 	getAvailableThemesWithPaths,
@@ -5252,6 +5264,23 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	/** Compact, content-free bridge/delivery status for the Telegram follow-up submenu. */
+	private telegramFollowUpStatusSnapshot(): TelegramFollowUpStatusSnapshot {
+		const status = readGlobalStatus(resolveSupervisorRoot());
+		if (!status.present || status.protocolVersion !== GLOBAL_STATUS_PROTOCOL_VERSION || !status.freshBridge) {
+			return { kind: "no_bridge" };
+		}
+		if (status.lastDeliveryStatus === "failed") {
+			const code = status.lastDeliveryCode ?? "OTHER";
+			return {
+				kind: "failed",
+				errorCode: (GLOBAL_STATUS_ERROR_CODES as readonly string[]).includes(code) ? code : "OTHER",
+			};
+		}
+		if (status.lastDeliveryStatus === "unknown") return { kind: "unknown_delivery" };
+		return { kind: "ready" };
+	}
+
 	private showSettingsSelector(focusItemId?: string): void {
 		this.showSelector((done) => {
 			let selector: SettingsSelectorComponent | undefined;
@@ -5296,6 +5325,7 @@ export class InteractiveMode {
 					quietStartup: this.settingsManager.getQuietStartup(),
 					liToolOutputStyle: this.settingsManager.getLiToolOutputStyle(),
 					liLanguage: this.settingsManager.getLiLanguage(),
+					telegramFollowUp: { policy: readGlobalPolicy(resolveSupervisorRoot()).policy },
 					clearOnShrink: this.settingsManager.getClearOnShrink(),
 					showTerminalProgress: this.settingsManager.getShowTerminalProgress(),
 					tuiMode: this.ui.mode,
@@ -5420,6 +5450,20 @@ export class InteractiveMode {
 						this.setupAutocompleteProvider();
 						// Keep the cursor on the language row after rebuilding Settings.
 						this.showSettingsSelector("li-language");
+					},
+					onTelegramFollowUpPolicyChange: (mutate: PolicyMutation): PolicyWriteResult => {
+						// Enable requests must see a live v2 bridge; writeGlobalPolicy
+						// runs the gate under the cross-process lock, so two sessions
+						// racing to enable cannot bypass it.
+						return writeGlobalPolicy(resolveSupervisorRoot(), mutate, {
+							enableGate: (_policy, previous) =>
+								previous.enabled ? { ok: true } : evaluateEnableGate(resolveSupervisorRoot()),
+						});
+					},
+					onTelegramFollowUpPolicyRefresh: (): PolicyReadResult => readGlobalPolicy(resolveSupervisorRoot()),
+					onTelegramFollowUpStatus: (): TelegramFollowUpStatusSnapshot => this.telegramFollowUpStatusSnapshot(),
+					onTelegramFollowUpRenderRequest: () => {
+						this.ui.requestRender();
 					},
 					onDefaultProjectTrustChange: (defaultProjectTrust) => {
 						this.settingsManager.setDefaultProjectTrust(defaultProjectTrust);

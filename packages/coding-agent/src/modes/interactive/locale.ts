@@ -90,6 +90,24 @@ export interface LiUiCopy {
 			liToolOutputStyle: LiSettingsItemCopy;
 			liLanguage: LiSettingsItemCopy;
 		};
+		telegramFollowUpEntry: LiSettingsItemCopy;
+		telegramFollowUpSubmenu: {
+			title: string;
+			master: LiSettingsItemCopy;
+			masterOn: string;
+			masterOff: string;
+			securityDescription: string;
+			finalDelay: LiSettingsItemCopy;
+			askUserDelay: LiSettingsItemCopy;
+			terminalDelay: LiSettingsItemCopy;
+			delaySelectTitle: (label: string) => string;
+			delaySelectDescription: string;
+			status: LiSettingsItemCopy;
+			statusReady: string;
+			statusUnknown: string;
+			statusNoBridge: string;
+			statusErr: (code: string) => string;
+		};
 		themeSubmenu: {
 			title: string;
 			description: string;
@@ -406,6 +424,42 @@ const EN_COPY: LiUiCopy = {
 				label: "Interface language",
 				description: "EN = English · VI = Tiếng Việt. Changes apply immediately in Li.",
 			},
+		},
+		telegramFollowUpEntry: {
+			label: "Telegram follow-up",
+			description: "Telegram follow-ups; + on, - off.",
+		},
+		telegramFollowUpSubmenu: {
+			title: "Telegram follow-up",
+			master: {
+				label: "Master",
+				description: "Only sanitized answers/questions. Heuristic filter; avoid credentials.",
+			},
+			masterOn: "On",
+			masterOff: "Off",
+			securityDescription: "Only sanitized answers/questions. Heuristic filter; avoid credentials.",
+			finalDelay: {
+				label: "Final",
+				description: "Final answer delay.",
+			},
+			askUserDelay: {
+				label: "Ask-user",
+				description: "ask_user question delay.",
+			},
+			terminalDelay: {
+				label: "Terminal",
+				description: "Interactive terminal notice.",
+			},
+			delaySelectTitle: (label) => `${label} delay`,
+			delaySelectDescription: "Pick Off or a delay in minutes.",
+			status: {
+				label: "Status",
+				description: "Bridge status; see /tele status.",
+			},
+			statusReady: "Ready",
+			statusUnknown: "Unknown",
+			statusNoBridge: "No bridge",
+			statusErr: (code) => `Err ${code}`,
 		},
 		themeSubmenu: {
 			title: "Theme",
@@ -795,6 +849,42 @@ const VI_COPY: LiUiCopy = {
 				label: "Ngôn ngữ giao diện",
 				description: "EN = English · VI = Tiếng Việt. Đổi là áp dụng ngay trong Li.",
 			},
+		},
+		telegramFollowUpEntry: {
+			label: "Follow-up Telegram",
+			description: "Follow-up Telegram; + bật, - tắt.",
+		},
+		telegramFollowUpSubmenu: {
+			title: "Follow-up Telegram",
+			master: {
+				label: "Chính",
+				description: "Chỉ gửi answer/câu hỏi sanitize. Lọc heuristic; đừng nhập credential.",
+			},
+			masterOn: "Bật",
+			masterOff: "Tắt",
+			securityDescription: "Chỉ gửi answer/câu hỏi sanitize. Lọc heuristic; đừng nhập credential.",
+			finalDelay: {
+				label: "Answer",
+				description: "Trễ gửi answer cuối.",
+			},
+			askUserDelay: {
+				label: "Hỏi",
+				description: "Trễ câu hỏi ask_user.",
+			},
+			terminalDelay: {
+				label: "Terminal",
+				description: "Cảnh báo terminal interactive.",
+			},
+			delaySelectTitle: (label) => `Trễ ${label}`,
+			delaySelectDescription: "Chọn Tắt hoặc trễ (phút).",
+			status: {
+				label: "Trạng thái",
+				description: "Trạng thái bridge; xem /tele status.",
+			},
+			statusReady: "Sẵn sàng",
+			statusUnknown: "Không rõ",
+			statusNoBridge: "No bridge",
+			statusErr: (code) => `Lỗi ${code}`,
 		},
 		themeSubmenu: {
 			title: "Theme",

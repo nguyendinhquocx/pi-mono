@@ -7,6 +7,11 @@ import {
 	SettingsSelectorComponent,
 } from "../src/modes/interactive/components/settings-selector.ts";
 import { SelectSubmenu } from "../src/modes/interactive/components/settings-submenu.ts";
+import {
+	defaultTelegramFollowUpPolicy,
+	type PolicyWriteResult,
+	type TelegramFollowUpPolicy,
+} from "../src/modes/interactive/telegram-follow-up-policy.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
 import { createHarness, type Harness } from "./suite/harness.ts";
@@ -202,5 +207,203 @@ describe("SettingsSelectorComponent", () => {
 		submenu.handleInput("\r");
 
 		expect(onSelect).toHaveBeenCalledWith("theme-10");
+	});
+
+	const telegramBaseConfig = {
+		autoCompact: false,
+		steeringMode: "all",
+		followUpMode: "all",
+		transport: "auto",
+		sessionShareDestination: "auto",
+		httpIdleTimeoutMs: 300000,
+		cacheWarmingMode: "off",
+		thinkingLevel: "medium",
+		hideThinkingBlock: false,
+		mermaidRenderingMode: "final",
+		showCacheMissNotices: false,
+		collapseChangelog: true,
+		enableInstallTelemetry: false,
+		defaultProjectTrust: "ask",
+		doubleEscapeAction: "tree",
+		treeFilterMode: "default",
+		showHardwareCursor: true,
+		editorPaddingX: 1,
+		outputPad: 0,
+		autocompleteMaxVisible: 5,
+		quietStartup: false,
+		clearOnShrink: true,
+		showTerminalProgress: false,
+		tuiMode: "regular",
+		fullscreenExitOutput: "transcript",
+		fullscreenScrollbar: "auto",
+		fullscreenCopyOnSelect: true,
+		fullscreenWheelScrollLines: 3,
+		warnings: {},
+		defaultModel: "not set",
+		availableDefaultModels: [],
+		availableThinkingLevels: [],
+		modelThinkingLevels: {},
+		availableThemes: [],
+		currentTheme: "dark",
+		terminalTheme: "dark",
+	} as unknown as SettingsConfig;
+
+	const policy = defaultTelegramFollowUpPolicy();
+
+	function makeTelegramCallbacks(): {
+		callbacks: SettingsCallbacks;
+		mutations: Array<PolicyWriteResult>;
+		onPolicyChange: ReturnType<typeof vi.fn>;
+	} {
+		const onPolicyChange = vi.fn((mutate: (p: typeof policy) => typeof policy): PolicyWriteResult => {
+			const next = { ...mutate(policy) };
+			Object.assign(policy, next);
+			return { ok: true, policy: next };
+		});
+		const callbacks = {
+			onCancel: () => {},
+			onTelegramFollowUpPolicyChange: onPolicyChange,
+			onTelegramFollowUpPolicyRefresh: () => ({ policy, source: "file" as const }),
+			onTelegramFollowUpStatus: () => ({ kind: "ready" as const }),
+		} as unknown as SettingsCallbacks;
+		return { callbacks, mutations: [], onPolicyChange };
+	}
+
+	function openTelegramSubmenu(config: SettingsConfig, callbacks: SettingsCallbacks) {
+		const list = new SettingsSelectorComponent(config, callbacks).getSettingsList();
+		list.selectItem("telegram-follow-up");
+		list.handleInput("\r");
+		return list;
+	}
+
+	it("hides the Telegram follow-up row without the Li callback", () => {
+		const callbacks = { onCancel: () => {} } as unknown as SettingsCallbacks;
+		const list = new SettingsSelectorComponent(telegramBaseConfig, callbacks).getSettingsList();
+		list.selectItem("li-language");
+		expect(list.render(80).join("\n")).not.toContain("Telegram follow-up");
+	});
+
+	it("shows the parent token and opens the titled submenu", () => {
+		const { callbacks } = makeTelegramCallbacks();
+		const config = { ...telegramBaseConfig, telegramFollowUp: { policy } } as unknown as SettingsConfig;
+		const list = new SettingsSelectorComponent(config, callbacks).getSettingsList();
+		list.selectItem("telegram-follow-up");
+		const rendered = stripAnsi(list.render(80).join("\n"));
+		expect(rendered).toContain("Telegram follow-up");
+		// Disabled by default: one-cell ASCII token, not a localized word.
+		expect(rendered).toContain("- ");
+
+		list.handleInput("\r");
+		const submenuRendered = stripAnsi(list.render(80).join("\n"));
+		expect(submenuRendered).toContain("Master");
+		expect(submenuRendered).toContain("Off");
+		expect(submenuRendered).toContain("Ready");
+		expect(submenuRendered).toContain("Status");
+	});
+
+	it("toggles the master switch inside the submenu", () => {
+		const { callbacks, onPolicyChange } = makeTelegramCallbacks();
+		const config = { ...telegramBaseConfig, telegramFollowUp: { policy } } as unknown as SettingsConfig;
+		const list = openTelegramSubmenu(config, callbacks);
+		list.handleInput("\r"); // tf-master cycle Off -> On
+		expect(onPolicyChange).toHaveBeenCalledTimes(1);
+		const mutated = onPolicyChange.mock.calls[0][0](policy);
+		expect(mutated.enabled).toBe(true);
+		expect(stripAnsi(list.render(80).join("\n"))).toContain("On");
+	});
+
+	it("refreshes the parent + token on every submenu exit path", () => {
+		const { callbacks } = makeTelegramCallbacks();
+		const config = { ...telegramBaseConfig, telegramFollowUp: { policy } } as unknown as SettingsConfig;
+		const list = openTelegramSubmenu(config, callbacks);
+		list.handleInput("\r"); // enable master
+		list.handleInput("\x1b"); // Esc: exit to parent row
+		const rendered = stripAnsi(list.render(80).join("\n"));
+		expect(rendered).toContain("Telegram follow-up");
+		expect(rendered).toContain("+ ");
+	});
+
+	it("re-entry to submenu immediately after toggle sees fresh enabled policy without waiting for timer (regression [P2-T1])", () => {
+		let currentPolicy = { ...policy };
+		const onPolicyChange = vi.fn((mutate: (prev: TelegramFollowUpPolicy) => TelegramFollowUpPolicy) => {
+			currentPolicy = mutate(currentPolicy);
+			return { ok: true, policy: currentPolicy };
+		});
+		const callbacks = {
+			onCancel: () => {},
+			onTelegramFollowUpPolicyChange: onPolicyChange,
+			onTelegramFollowUpPolicyRefresh: () => ({ policy: currentPolicy, source: "file" as const }),
+			onTelegramFollowUpStatus: () => ({ kind: "ready" as const }),
+		} as unknown as SettingsCallbacks;
+
+		// Initial config snapshot has policy with enabled: false
+		const config = {
+			...telegramBaseConfig,
+			telegramFollowUp: { policy: currentPolicy },
+		} as unknown as SettingsConfig;
+		const list = new SettingsSelectorComponent(config, callbacks).getSettingsList();
+		list.selectItem("telegram-follow-up");
+		list.handleInput("\r"); // open submenu
+
+		// Toggle Off -> On
+		list.handleInput("\r");
+		expect(currentPolicy.enabled).toBe(true);
+
+		// Esc back to parent settings row
+		list.handleInput("\x1b");
+		expect(stripAnsi(list.render(80).join("\n"))).toContain("+ ");
+
+		// Re-enter submenu immediately without waiting for timer
+		list.handleInput("\r");
+		const reentered = stripAnsi(list.render(80).join("\n"));
+		expect(reentered).toContain("Master");
+		expect(reentered).toContain("On");
+		expect(reentered).not.toContain("Off");
+	});
+
+	it("selects delays through a titled submenu instead of a one-way cycle", () => {
+		const { callbacks, onPolicyChange } = makeTelegramCallbacks();
+		const config = { ...telegramBaseConfig, telegramFollowUp: { policy } } as unknown as SettingsConfig;
+		const list = openTelegramSubmenu(config, callbacks);
+		list.handleInput("\x1b[B"); // down to tf-final-delay
+		list.handleInput("\r"); // open SelectSubmenu (current 10m)
+		const delayRendered = stripAnsi(list.render(80).join("\n"));
+		expect(delayRendered).toContain("Final delay");
+		list.handleInput("\x1b[A"); // up: 10m -> 5m
+		list.handleInput("\x1b[A"); // up: 5m -> 3m
+		list.handleInput("\r"); // choose 3m
+		expect(onPolicyChange).toHaveBeenCalledTimes(1);
+		const mutated = onPolicyChange.mock.calls[0][0](policy);
+		expect(mutated.finalAnswerDelayMinutes).toBe(3);
+	});
+
+	it("keeps the status row read-only", () => {
+		const { callbacks } = makeTelegramCallbacks();
+		const config = { ...telegramBaseConfig, telegramFollowUp: { policy } } as unknown as SettingsConfig;
+		const list = openTelegramSubmenu(config, callbacks);
+		list.handleInput("\x1b[B");
+		list.handleInput("\x1b[B");
+		list.handleInput("\x1b[B");
+		list.handleInput("\x1b[B"); // tf-status (master, final, ask, terminal, status)
+		list.handleInput("\r");
+		list.handleInput(" ");
+		// Still inside the same submenu list; no values/submenu were activated.
+		const rendered = stripAnsi(list.render(80).join("\n"));
+		expect(rendered).toContain("Ready");
+	});
+
+	it("keeps the security description readable at width 40", () => {
+		const { callbacks } = makeTelegramCallbacks();
+		const config = { ...telegramBaseConfig, telegramFollowUp: { policy } } as unknown as SettingsConfig;
+		const list = openTelegramSubmenu(config, callbacks);
+		// Master row is focused on open; its description is the security note.
+		const rendered = stripAnsi(list.render(40).join("\n"));
+		expect(rendered).toContain("Telegram follow-up");
+		expect(rendered).toContain("sanitized");
+		expect(rendered).toContain("credentials");
+		// Rows and hints stay on single lines (no clipping mid-token).
+		for (const line of list.render(40)) {
+			expect(stripAnsi(line).length).toBeLessThanOrEqual(40);
+		}
 	});
 });

@@ -36,6 +36,15 @@ import {
 	liLocaleFromDisplayLabel,
 } from "../locale.ts";
 import {
+	DELAY_PRESET_MINUTES,
+	type DelayMinutes,
+	formatDelayMinutes,
+	type PolicyMutation,
+	type PolicyReadResult,
+	type PolicyWriteResult,
+	type TelegramFollowUpPolicy,
+} from "../telegram-follow-up-policy.ts";
+import {
 	getSettingsListTheme,
 	parseAutoThemeSetting,
 	SYSTEM_THEME_NAME,
@@ -109,6 +118,18 @@ export interface SettingsConfig {
 	fullscreenCopyOnSelect: boolean;
 	fullscreenWheelScrollLines: WheelScrollLines;
 	warnings: WarningSettings;
+	telegramFollowUp?: { policy: TelegramFollowUpPolicy };
+}
+
+/** One-cell ASCII tokens shown on the parent row; localized description explains them. */
+export const TELEGRAM_PARENT_TOKEN_ON = "+";
+export const TELEGRAM_PARENT_TOKEN_OFF = "-";
+
+/** Compact bridge/delivery status for the submenu's read-only row. */
+export interface TelegramFollowUpStatusSnapshot {
+	kind: "ready" | "failed" | "unknown_delivery" | "no_bridge";
+	/** Allowlisted code (AUTH/403/429/PARSE/NETWORK/OTHER) when the bridge reported a failure. */
+	errorCode?: string;
 }
 
 export interface SettingsCallbacks {
@@ -142,6 +163,10 @@ export interface SettingsCallbacks {
 	onQuietStartupChange: (quiet: QuietStartup) => void;
 	onLiToolOutputStyleChange?: (style: LiToolOutputStyle) => void;
 	onLiLanguageChange?: (locale: LiLocale) => void;
+	onTelegramFollowUpPolicyChange?: (mutate: PolicyMutation) => PolicyWriteResult;
+	onTelegramFollowUpPolicyRefresh?: () => PolicyReadResult;
+	onTelegramFollowUpStatus?: () => TelegramFollowUpStatusSnapshot;
+	onTelegramFollowUpRenderRequest?: () => void;
 	onDefaultProjectTrustChange: (defaultProjectTrust: DefaultProjectTrust) => void;
 	onClearOnShrinkChange: (enabled: boolean) => void;
 	onShowTerminalProgressChange: (enabled: boolean) => void;
@@ -487,6 +512,203 @@ class ThemeSubmenu extends Container {
 }
 
 /**
+ * Li-only submenu for the global Telegram follow-up policy. The policy lives in
+ * a file under the TelePi supervisor root (see telegram-follow-up-policy.ts),
+ * so this component only mutates through the host callback and refreshes its
+ * values while open so external changes surface within a second.
+ */
+class TelegramFollowUpSubmenu extends Container {
+	private settingsList: SettingsList;
+	private policy: TelegramFollowUpPolicy;
+	private statusOverride: "ready" | "no_bridge" | "unknown" | undefined;
+	private refreshTimer: NodeJS.Timeout | undefined;
+	private readonly callbacks: SettingsCallbacks;
+	private readonly copy: LiUiCopy;
+	private readonly close: (parentToken: string) => void;
+
+	constructor(
+		policy: TelegramFollowUpPolicy,
+		callbacks: SettingsCallbacks,
+		copy: LiUiCopy,
+		close: (parentToken: string) => void,
+	) {
+		super();
+		this.policy = { ...policy };
+		this.callbacks = callbacks;
+		this.copy = copy;
+		this.close = close;
+		const tf = copy.settings.telegramFollowUpSubmenu;
+		this.addChild(new Text(theme.bold(theme.fg("accent", tf.title)), 0, 0));
+		this.addChild(new Spacer(1));
+		this.settingsList = new SettingsList(
+			this.buildItems(),
+			Math.min(5, 10),
+			getSettingsListTheme(),
+			(id, newValue) => this.handleChange(id, newValue),
+			() => this.finish(),
+			{ copy: copy.settingsList },
+		);
+		this.addChild(this.settingsList);
+		this.refreshTimer = setInterval(() => this.refreshFromDisk(), 1_000);
+		this.refreshTimer.unref?.();
+	}
+
+	private buildItems(): SettingItem[] {
+		const tf = this.copy.settings.telegramFollowUpSubmenu;
+		return [
+			{
+				id: "tf-master",
+				label: tf.master.label,
+				description: tf.securityDescription,
+				currentValue: this.policy.enabled ? tf.masterOn : tf.masterOff,
+				values: [tf.masterOff, tf.masterOn],
+			},
+			{
+				id: "tf-final-delay",
+				label: tf.finalDelay.label,
+				description: tf.finalDelay.description,
+				currentValue: formatDelayMinutes(this.policy.finalAnswerDelayMinutes),
+				submenu: (_currentValue, done) =>
+					this.delaySubmenu(
+						tf.finalDelay.label,
+						"finalAnswerDelayMinutes",
+						this.policy.finalAnswerDelayMinutes,
+						done,
+					),
+			},
+			{
+				id: "tf-ask-delay",
+				label: tf.askUserDelay.label,
+				description: tf.askUserDelay.description,
+				currentValue: formatDelayMinutes(this.policy.askUserDelayMinutes),
+				submenu: (_currentValue, done) =>
+					this.delaySubmenu(tf.askUserDelay.label, "askUserDelayMinutes", this.policy.askUserDelayMinutes, done),
+			},
+			{
+				id: "tf-terminal-delay",
+				label: tf.terminalDelay.label,
+				description: tf.terminalDelay.description,
+				currentValue: formatDelayMinutes(this.policy.terminalNoticeDelayMinutes),
+				submenu: (_currentValue, done) =>
+					this.delaySubmenu(
+						tf.terminalDelay.label,
+						"terminalNoticeDelayMinutes",
+						this.policy.terminalNoticeDelayMinutes,
+						done,
+					),
+			},
+			{
+				id: "tf-status",
+				label: tf.status.label,
+				description: tf.status.description,
+				currentValue: this.statusText(),
+			},
+		];
+	}
+
+	private statusText(): string {
+		const tf = this.copy.settings.telegramFollowUpSubmenu;
+		if (this.statusOverride === "no_bridge") return tf.statusNoBridge;
+		const snapshot = this.callbacks.onTelegramFollowUpStatus?.();
+		switch (snapshot?.kind) {
+			case "ready":
+				return tf.statusReady;
+			case "failed":
+				return tf.statusErr(snapshot.errorCode ?? "OTHER");
+			case "unknown_delivery":
+				return tf.statusUnknown;
+			default:
+				return tf.statusUnknown;
+		}
+	}
+
+	/** Titled select list per delay; up/down/Enter/Esc, never a one-way cycle. */
+	private delaySubmenu(
+		label: string,
+		key: "finalAnswerDelayMinutes" | "askUserDelayMinutes" | "terminalNoticeDelayMinutes",
+		current: DelayMinutes | null,
+		done: (selectedValue?: string) => void,
+	): SelectSubmenu {
+		const tf = this.copy.settings.telegramFollowUpSubmenu;
+		const options: SelectItem[] = [null, ...DELAY_PRESET_MINUTES].map((minutes) => ({
+			value: minutes === null ? "off" : String(minutes),
+			label: `${minutes === current ? "✓ " : "  "}${formatDelayMinutes(minutes)}`,
+		}));
+		return new SelectSubmenu(
+			tf.delaySelectTitle(label),
+			tf.delaySelectDescription,
+			options,
+			current === null ? "off" : String(current),
+			(value) => {
+				const minutes = value === "off" ? null : (Number(value) as DelayMinutes);
+				this.applyPolicyMutation((policy) => ({ ...policy, [key]: minutes }));
+				done(formatDelayMinutes(minutes));
+			},
+			() => done(),
+			undefined,
+			{ copy: this.copy.selectSubmenu },
+		);
+	}
+
+	private applyPolicyMutation(mutate: PolicyMutation): void {
+		const result = this.callbacks.onTelegramFollowUpPolicyChange?.(mutate);
+		if (result) {
+			this.policy = { ...result.policy };
+			if (!result.ok && result.diagnostic?.startsWith("ENABLE_")) {
+				this.statusOverride = "no_bridge";
+			} else if (result.ok) {
+				this.statusOverride = undefined;
+			}
+		}
+		this.syncValues();
+	}
+
+	private syncValues(): void {
+		const tf = this.copy.settings.telegramFollowUpSubmenu;
+		this.settingsList.updateValue("tf-master", this.policy.enabled ? tf.masterOn : tf.masterOff);
+		this.settingsList.updateValue("tf-final-delay", formatDelayMinutes(this.policy.finalAnswerDelayMinutes));
+		this.settingsList.updateValue("tf-ask-delay", formatDelayMinutes(this.policy.askUserDelayMinutes));
+		this.settingsList.updateValue("tf-terminal-delay", formatDelayMinutes(this.policy.terminalNoticeDelayMinutes));
+		this.settingsList.updateValue("tf-status", this.statusText());
+	}
+
+	private handleChange(id: string, newValue: string): void {
+		const tf = this.copy.settings.telegramFollowUpSubmenu;
+		if (id !== "tf-master") return;
+		const enabled = newValue === tf.masterOn;
+		this.applyPolicyMutation((policy) => ({ ...policy, enabled }));
+		this.callbacks.onTelegramFollowUpRenderRequest?.();
+	}
+
+	/** Re-read the policy + status while the submenu is open; external changes surface here. */
+	private refreshFromDisk(): void {
+		const result = this.callbacks.onTelegramFollowUpPolicyRefresh?.();
+		if (result && result.policy.revision !== this.policy.revision) {
+			this.policy = { ...result.policy };
+			this.syncValues();
+			this.callbacks.onTelegramFollowUpRenderRequest?.();
+		}
+	}
+
+	/** Every exit path reports the fresh master state back to the parent row. */
+	private finish(): void {
+		if (this.refreshTimer) {
+			clearInterval(this.refreshTimer);
+			this.refreshTimer = undefined;
+		}
+		this.close(this.policy.enabled ? TELEGRAM_PARENT_TOKEN_ON : TELEGRAM_PARENT_TOKEN_OFF);
+	}
+
+	handleInput(data: string): void {
+		this.settingsList.handleInput(data);
+	}
+
+	invalidate(): void {
+		this.settingsList.invalidate();
+	}
+}
+
+/**
  * Main settings selector component.
  */
 export class SettingsSelectorComponent extends Container {
@@ -812,6 +1034,23 @@ export class SettingsSelectorComponent extends Container {
 				description: c.settings.items.liLanguage.description,
 				currentValue: liLocaleDisplayLabel(config.liLanguage ?? "en"),
 				values: [...LI_LANGUAGE_DISPLAY_VALUES],
+			});
+		}
+
+		// Telegram follow-up: Li-only global policy row backed by the supervisor
+		// root policy file. Pi never sees it and settings.json stays untouched.
+		if (APP_NAME === "li" && callbacks.onTelegramFollowUpPolicyChange && config.telegramFollowUp) {
+			const anchorIndex = items.findIndex((item) => item.id === "li-language");
+			const insertIndex = anchorIndex === -1 ? items.length : anchorIndex + 1;
+			items.splice(insertIndex, 0, {
+				id: "telegram-follow-up",
+				label: c.settings.telegramFollowUpEntry.label,
+				description: c.settings.telegramFollowUpEntry.description,
+				currentValue: config.telegramFollowUp.policy.enabled ? TELEGRAM_PARENT_TOKEN_ON : TELEGRAM_PARENT_TOKEN_OFF,
+				submenu: (_currentValue, done) => {
+					const policy = callbacks.onTelegramFollowUpPolicyRefresh?.().policy ?? config.telegramFollowUp!.policy;
+					return new TelegramFollowUpSubmenu(policy, callbacks, c, done);
+				},
 			});
 		}
 

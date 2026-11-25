@@ -307,3 +307,11 @@ Hai gate riêng, đừng lộn:
   Pi mới hơn. Không "sửa hộ" file đó bằng tay.
 - `li update` (mọi biến thể) bị chặn trong code; `PI_SKIP_VERSION_CHECK=1` của wrapper chỉ tắt
   nag, không phải cơ chế guard.
+
+## Telegram follow-up setting (SPEC-2026-11-09)
+
+- Li-only hàng "Telegram follow-up" trong `/settings` (Pi không thấy): master On/Off + ba delay (final/ask/terminal, preset Off + 1/3/5/10/15/30/60m, mặc định 10m/5m/5m) + status row (`Ready`/`Err <code>`/`Unknown`/`No bridge`).
+- Policy canonical nằm ở `global-policy.json` dưới supervisor root (`%APPDATA%\telepi\supervisor`, override `TELEPI_SUPERVISOR_DIR`) — KHÔNG nằm trong `.pi/settings.json`; mọi session Li đang mở thấy thay đổi trong ≤1 giây, không restart.
+- Bật master được chỉ khi `global-status.json` báo TelePi protocol v2 + heartbeat ≤45 giây; thiếu → giữ Off, status `No bridge`. Mismatch/read failure fail-closed.
+- Chỉ session Li (`LI_RUNTIME=1`) phát protocol v2 event; Pi thường giữ nguyên v1 `/tele`. Đổi policy không cần restart; đổi code extensions/TelePi theo deploy order trong README TelePi (TelePi v2 trước, extensions sau, global giữ Off tới smoke xong).
+- Build/verify không đổi: `npm run check` + `node scripts/build-li.mjs --offline`; focused tests `test/settings-selector.test.ts`, `test/li-telegram-follow-up-policy.test.ts`.
