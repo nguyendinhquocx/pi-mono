@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `formatProgramResume()`, `formatProgramResumeClear()`, and `takeProgramResumeToken()` for the [Program Resume Protocol (OSC 7577)](https://www.superlogical.com/rex/docs/build/program-resume), which tells the terminal how to resume a program after the terminal restarts
+
+### Fixed
+
+- Fixed `SettingsList` hint hardcoding Enter and Esc instead of naming the configured `tui.select.confirm` and `tui.select.cancel` keys
+
+## [1.6.1] - 2026-11-25
+
 ### Fixed
 
 - Fixed `Editor.addToHistory()` storing a prompt again when it was already in history; it now moves the existing entry to the most recent position ([#12279](https://github.com/earendil-works/pi/issues/12279))
