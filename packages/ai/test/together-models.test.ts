@@ -43,31 +43,28 @@ describe("Together models", () => {
 	});
 
 	it("models Together reasoning controls from the Together API surface", () => {
-		const gptOss = getModel("together", "openai/gpt-oss-120b");
-		expect(gptOss.thinkingLevelMap).toEqual({
-			off: null,
+		// Upstream models.dev no longer lists gpt-oss / DeepSeek-V4-Pro under
+		// together, so every live reasoning model now flows through the toggle
+		// reasoning branch (TOGGLE_REASONING_LEVELS + "together" format).
+		const kimiK3 = getModel("together", "moonshotai/Kimi-K3");
+		expect(kimiK3.thinkingLevelMap).toEqual({
 			minimal: null,
-			low: "low",
-			medium: "medium",
-			high: "high",
-			max: null,
-			xhigh: null,
+			low: null,
+			medium: null,
 		});
-		expect(gptOss.compat).toMatchObject({
-			supportsReasoningEffort: true,
-			thinkingFormat: "openai",
+		expect(kimiK3.compat).toMatchObject({
+			supportsReasoningEffort: false,
+			thinkingFormat: "together",
 		});
 
-		const deepSeekV4 = getModel("together", "deepseek-ai/DeepSeek-V4-Pro-0813");
+		const deepSeekV4 = getModel("together", "deepseek-ai/DeepSeek-V4.1-Flash");
 		expect(deepSeekV4.thinkingLevelMap).toEqual({
 			minimal: null,
 			low: null,
 			medium: null,
-			high: "high",
-			xhigh: null,
 		});
 		expect(deepSeekV4.compat).toMatchObject({
-			supportsReasoningEffort: true,
+			supportsReasoningEffort: false,
 			thinkingFormat: "together",
 		});
 	});

@@ -1434,7 +1434,7 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("sends thinking disabled for OpenCode Kimi K2.6 when thinking is off", async () => {
-		const model = getModel("opencode", "kimi-k2.6")!;
+		const model = getModel("opencode", "kimi-k3")!;
 		let payload: unknown;
 
 		await streamSimple(
@@ -1456,7 +1456,7 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("sends thinking enabled for OpenCode Kimi K2.6 when thinking is enabled", async () => {
-		const model = getModel("opencode", "kimi-k2.6")!;
+		const model = getModel("opencode", "kimi-k3")!;
 		let payload: unknown;
 
 		await streamSimple(
@@ -1527,11 +1527,11 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("sends max_tokens for OpenCode completions models", async () => {
-		const cases = [getModel("opencode-go", "kimi-k3")!, getModel("opencode", "kimi-k2.6")!] as const;
+		const cases = [getModel("opencode-go", "kimi-k3")!, getModel("opencode", "kimi-k3")!] as const;
 
 		for (const model of cases) {
 			let payload: unknown;
-			expect(model.compat?.maxTokensField).toBe("max_tokens");
+			expect((model.compat as { maxTokensField?: string } | undefined)?.maxTokensField).toBe("max_tokens");
 
 			await streamSimple(
 				model,
@@ -1571,7 +1571,7 @@ describe("openai-completions tool_choice", () => {
 		const cases = [...nativeModels, customModel, customUppercaseModel] as const;
 
 		for (const model of nativeModels) {
-			expect(model.compat?.maxTokensField).toBe("max_tokens");
+			expect((model.compat as { maxTokensField?: string } | undefined)?.maxTokensField).toBe("max_tokens");
 		}
 
 		for (const model of cases) {
@@ -1601,7 +1601,7 @@ describe("openai-completions tool_choice", () => {
 		const cases = [getModel("zai", "glm-5-turbo")!, getModel("zai", "glm-5.2")!] as const;
 
 		for (const model of cases) {
-			expect(model.compat?.maxTokensField).toBe("max_tokens");
+			expect((model.compat as { maxTokensField?: string } | undefined)?.maxTokensField).toBe("max_tokens");
 			let payload: unknown;
 
 			await streamSimple(
