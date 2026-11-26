@@ -356,9 +356,106 @@ describe("AgentSession in-place refresh", () => {
 					await session.releaseSessionDataLock(lock.lockId);
 				}
 				expect(header.id).toBe(session.sessionManager.getSessionId());
+				// The pre-acquire probe tmp must not outlive the acquire: every refused or
+				// successful acquire previously leaked a full-size tmp into the sessions dir.
+				expect(readdirSync(dirname(sessionFile)).filter((name) => name.includes(".pre-acquire-"))).toEqual([]);
 			} finally {
 				await session.releaseSessionDataAccess();
 				session.dispose();
+				fixture.restorePackageDir();
+			}
+		},
+		30_000,
+	);
+
+	// Drop a foreign lease record for the fixture session and return its id.
+	// Mirrors the real open-lease record shape so registry parsing accepts it.
+	function writeForeignLeaseFixture(
+		fixture: Awaited<ReturnType<typeof createPersistedSession>>,
+		pid: number,
+		holderStart: string,
+	): string {
+		const { pathHash } = canonicalTranscriptIdentity(fixture.sessionFile);
+		const leasesDir = join(fixture.root, "session-open-leases", "leases");
+		const foreignLeaseId = createHash("sha256").update(`foreign-lock-busy:${pathHash}`).digest("hex").slice(0, 32);
+		const foreignLease = {
+			lease_id: foreignLeaseId,
+			session_id: fixture.session.sessionManager.getSessionId(),
+			path_hash: pathHash,
+			pid,
+			process_start_utc: holderStart,
+			runtime: "li",
+			build_hash: "test",
+			opened_at: new Date().toISOString(),
+			lease_state: "open",
+			owner_kind: "tui",
+			owner_epoch: 1,
+			writer_state: "idle",
+		};
+		writeFileSync(
+			join(leasesDir, `${foreignLeaseId}.json`),
+			`${JSON.stringify(foreignLease)}
+`,
+		);
+		return foreignLeaseId;
+	}
+
+	// A foreign LIVE lease must fail acquire fast with lease_conflict naming the
+	// holder pid, instead of blocking in the exclusive guard wait for 20s.
+	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
+		"refuses acquire fast with lease_conflict naming the holder when a foreign live lease exists",
+		async () => {
+			const fixture = await createPersistedSession();
+			const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 60_000)"], { stdio: "ignore" });
+			if (child.pid === undefined) throw new Error("failed to spawn holder child process");
+			try {
+				const holderStart = createDefaultProcessInventory().getProcessStartUtc(child.pid);
+				if (!holderStart) throw new Error("could not prove child process start identity");
+				writeForeignLeaseFixture(fixture, child.pid, holderStart);
+				const before = Date.now();
+				const result = await fixture.session.acquireSessionDataLock();
+				// Fast-fail: the lease-uniqueness gate must refuse without sitting
+				// through the full 20s exclusive guard wait, naming the holder pid.
+				expect(Date.now() - before).toBeLessThan(10_000);
+				expect(result).toMatchObject({ status: "refused", code: "lease_conflict" });
+				if (result.status === "refused") expect(result.message).toContain(`pid ${child.pid}`);
+				// Admission gate must be fully released after the refused acquire.
+				expect(
+					(fixture.session as unknown as { _sessionDataAdmissionLocked: boolean })._sessionDataAdmissionLocked,
+				).toBe(false);
+			} finally {
+				child.kill();
+				await fixture.session.releaseSessionDataAccess();
+				fixture.session.dispose();
+				fixture.restorePackageDir();
+			}
+		},
+		30_000,
+	);
+
+	// A stale foreign lease (owner process provably dead) must not block acquire.
+	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
+		"treats a foreign lease with a dead owner as stale and proceeds with acquire",
+		async () => {
+			const fixture = await createPersistedSession();
+			const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 60_000)"], { stdio: "ignore" });
+			if (child.pid === undefined) throw new Error("failed to spawn holder child process");
+			const holderStart = createDefaultProcessInventory().getProcessStartUtc(child.pid);
+			if (!holderStart) {
+				child.kill();
+				throw new Error("could not prove child process start identity");
+			}
+			child.kill();
+			await new Promise<void>((resolveExit) => child.once("exit", () => resolveExit()));
+			writeForeignLeaseFixture(fixture, child.pid, holderStart);
+			try {
+				const result = await fixture.session.acquireSessionDataLock();
+				const blockedAsLeaseConflict = result.status === "refused" && result.code === "lease_conflict";
+				expect(blockedAsLeaseConflict).toBe(false);
+				if (result.status === "acquired") await fixture.session.releaseSessionDataLock(result.lockId);
+			} finally {
+				await fixture.session.releaseSessionDataAccess();
+				fixture.session.dispose();
 				fixture.restorePackageDir();
 			}
 		},

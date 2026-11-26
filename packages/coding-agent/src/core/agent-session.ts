@@ -160,6 +160,7 @@ import {
 	canonicalTranscriptIdentity,
 	fileFingerprint,
 	formatClaimRecoveryInspection,
+	formatLeaseHolderSummary,
 	type LeaseClaimRecord,
 	type LeaseRecord,
 	parseJsonStrict,
@@ -4647,10 +4648,19 @@ export class AgentSession {
 			const upgraded = await accessGuard.upgrade();
 			upgradeCompleted = true;
 			if (!upgraded.ok) {
+				// The guard wait timed out or was denied. Lease owners are already
+				// refused earlier by lease-uniqueness, so a timeout here means a
+				// lease-less holder (external program) or a holder that appeared
+				// after the uniqueness check; name whichever the registry now sees.
+				const racedHolders = registry.describeForeignLeaseHolders(identity.pathHash);
+				const holderNote =
+					racedHolders.length > 0
+						? `; live lease holders: ${formatLeaseHolderSummary(racedHolders)}`
+						: "; no other live Li session lease is registered for this file (an external program such as an editor may be holding it)";
 				return {
 					status: "refused",
 					code: guardRefusalCode(upgraded.code),
-					message: upgraded.message,
+					message: `${upgraded.message}${holderNote}`,
 				};
 			}
 			guardUpgraded = true;
@@ -4661,8 +4671,16 @@ export class AgentSession {
 			// Re-hash under the held exclusive guard: between the pre-upgrade hash and this
 			// point an external writer could still have touched the file, so the preview
 			// fingerprint contract must be checked against the locked bytes. Range locks deny
-			// plain Node reads, so fingerprint through the guard's helper snapshot.
-			const lockedProbe = await fingerprintThroughGuard(accessGuard, this._snapshotPath("pre-acquire"));
+			// plain Node reads, so fingerprint through the guard's helper snapshot. The
+			// probe tmp is fingerprint-only here, so clean it up: every refused acquire
+			// otherwise leaks a full-size tmp into the sessions directory.
+			const lockedProbePath = this._snapshotPath("pre-acquire");
+			let lockedProbe: Awaited<ReturnType<typeof fingerprintThroughGuard>>;
+			try {
+				lockedProbe = await fingerprintThroughGuard(accessGuard, lockedProbePath);
+			} finally {
+				rmSync(lockedProbePath, { force: true });
+			}
 			if (!lockedProbe.ok) {
 				return { status: "refused", code: lockedProbe.code, message: lockedProbe.message };
 			}

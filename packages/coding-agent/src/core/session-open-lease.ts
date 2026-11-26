@@ -52,6 +52,21 @@ export const LEASE_REGISTRY_FORMAT_VERSION = 1;
 export const LEASE_REGISTRY_PROTOCOL_VERSION = 1;
 export const LEASE_STATE_OPEN = "open";
 
+/** A live foreign lease holder, proven alive via OS death-proof. */
+export type ForeignLeaseHolder = {
+	pid: number;
+	sessionId: string;
+	openedAt: string;
+	ownerKind?: OwnerKind;
+};
+
+/** Human-readable one-line summary for error messages and refusal copy. */
+export function formatLeaseHolderSummary(holders: ForeignLeaseHolder[]): string {
+	return holders
+		.map((holder) => `pid ${holder.pid}${holder.ownerKind ? ` (${holder.ownerKind})` : ""} opened ${holder.openedAt}`)
+		.join("; ");
+}
+
 /** Sentinel for a process-start identity that could not be proven. */
 export const PROCESS_START_UNKNOWN = "UNKNOWN";
 
@@ -1294,6 +1309,29 @@ export class SessionOpenLeaseRegistry {
 		if (record.pid !== process.pid) return false;
 		const start = this.processInventory.getProcessStartUtc(process.pid) ?? PROCESS_START_UNKNOWN;
 		return record.process_start_utc === start;
+	}
+
+	/**
+	 * Live lease holders of a path hash other than THIS process, each proven
+	 * alive by OS death-proof (pid + start identity). Used to name holders in
+	 * exclusive-guard timeout errors. A stale lease whose owner process is
+	 * dead is excluded, not reported.
+	 */
+	describeForeignLeaseHolders(pathHash: string): ForeignLeaseHolder[] {
+		const { records } = this.listLeasesForPath(pathHash);
+		const holders: ForeignLeaseHolder[] = [];
+		for (const record of records) {
+			if (record.lease_state !== LEASE_STATE_OPEN) continue;
+			if (this.isOwnedByCurrentProcess(record)) continue;
+			if (!this.processInventory.isProcessAlive(record.pid, record.process_start_utc)) continue;
+			holders.push({
+				pid: record.pid,
+				sessionId: record.session_id,
+				openedAt: record.opened_at,
+				ownerKind: record.owner_kind,
+			});
+		}
+		return holders;
 	}
 
 	/**
