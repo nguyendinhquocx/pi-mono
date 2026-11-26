@@ -14,7 +14,11 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { parseCorrelatedGuardResponse, TranscriptWriteGuard } from "../src/core/transcript-write-guard.ts";
+import {
+	guardSnapshotTimeoutMs,
+	parseCorrelatedGuardResponse,
+	TranscriptWriteGuard,
+} from "../src/core/transcript-write-guard.ts";
 
 const roots: string[] = [];
 
@@ -42,6 +46,36 @@ async function snapshotThrough(guard: TranscriptWriteGuard, root: string): Promi
 }
 
 describe("TranscriptWriteGuard", () => {
+	// The snapshot op budget must scale with transcript size: a fixed 20s
+	// ceiling refused a 65 MB trim under a sync-client I/O storm.
+	it("scales the snapshot op budget with transcript size and caps it", () => {
+		expect(guardSnapshotTimeoutMs(0)).toBe(20_000);
+		expect(guardSnapshotTimeoutMs(1_000_000)).toBe(21_000);
+		expect(guardSnapshotTimeoutMs(65_000_000)).toBe(85_000);
+		expect(guardSnapshotTimeoutMs(10_000_000_000)).toBe(300_000);
+	});
+
+	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(
+		"snapshotTo honors a per-op timeoutMs override and reports it on timeout",
+		async () => {
+			const { transcript } = fixture();
+			const acquired = await TranscriptWriteGuard.acquire(transcript, { mode: "exclusive" });
+			expect(acquired.ok).toBe(true);
+			if (!acquired.ok) return;
+			const guard = acquired.guard;
+			try {
+				const snapshotPath = join(fixture().root, "timeout-probe.tmp");
+				const refused = await guard.snapshotTo(snapshotPath, { timeoutMs: 50 });
+				// The helper cannot answer a full snapshot within 50ms of a 13-byte file
+				// on every machine, so accept either success or a timeout naming 50ms.
+				if (!refused.ok) {
+					expect(refused.message).toContain("timed out after 50ms");
+				}
+			} finally {
+				await guard.release();
+			}
+		},
+	);
 	it("fails closed on non-Windows platforms", async () => {
 		if (TranscriptWriteGuard.isPlatformSupported()) return;
 		const { transcript } = fixture();

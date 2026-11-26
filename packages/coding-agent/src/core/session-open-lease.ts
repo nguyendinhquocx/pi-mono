@@ -18,7 +18,7 @@ import {
 } from "fs";
 import { basename, dirname, join } from "path";
 import { canonicalizePath } from "../utils/paths.ts";
-import { fingerprintThroughGuard, TranscriptWriteGuard } from "./transcript-write-guard.ts";
+import { fingerprintThroughGuard, guardSnapshotTimeoutMs, TranscriptWriteGuard } from "./transcript-write-guard.ts";
 
 /**
  * Session-open lease registry (v1) per the session-trim spec.
@@ -2062,7 +2062,9 @@ export class SessionOpenLeaseRegistry {
 			`.${basename(input.transcriptPath)}.restore-${randomUUID()}.tmp`,
 		);
 		try {
-			const preCheck = await fingerprintThroughGuard(guard, snapshotPath);
+			const preCheck = await fingerprintThroughGuard(guard, snapshotPath, {
+				timeoutMs: guardSnapshotTimeoutMs(lstatSync(input.backupPath).size),
+			});
 			if (!preCheck.ok) {
 				return fail(
 					preCheck.code === "io_error"
@@ -2093,7 +2095,9 @@ export class SessionOpenLeaseRegistry {
 					rewritten.message,
 				);
 			}
-			const restored = await fingerprintThroughGuard(guard, snapshotPath);
+			const restored = await fingerprintThroughGuard(guard, snapshotPath, {
+				timeoutMs: guardSnapshotTimeoutMs(lstatSync(input.backupPath).size),
+			});
 			if (!restored.ok) {
 				return fail(
 					restored.code === "io_error"

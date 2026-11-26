@@ -15,7 +15,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import {
 	type AfterToolCallContext,
@@ -193,6 +193,8 @@ import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import {
 	fingerprintThroughGuard,
+	guardSnapshotTimeoutMs,
+	removeTempBestEffort,
 	type TranscriptGuardErrorCode,
 	TranscriptWriteGuard,
 } from "./transcript-write-guard.ts";
@@ -4677,9 +4679,11 @@ export class AgentSession {
 			const lockedProbePath = this._snapshotPath("pre-acquire");
 			let lockedProbe: Awaited<ReturnType<typeof fingerprintThroughGuard>>;
 			try {
-				lockedProbe = await fingerprintThroughGuard(accessGuard, lockedProbePath);
+				lockedProbe = await fingerprintThroughGuard(accessGuard, lockedProbePath, {
+					timeoutMs: guardSnapshotTimeoutMs(statSync(sessionFile).size),
+				});
 			} finally {
-				rmSync(lockedProbePath, { force: true });
+				removeTempBestEffort(lockedProbePath);
 			}
 			if (!lockedProbe.ok) {
 				return { status: "refused", code: lockedProbe.code, message: lockedProbe.message };
@@ -4904,8 +4908,9 @@ export class AgentSession {
 			return refuse("lock_missing", "mutation claim does not match the session lock and id");
 		}
 		const currentSnapshot = this._snapshotPath("pre-replace");
+		const replaceTimeoutMs = guardSnapshotTimeoutMs(statSync(held.guard.path).size);
 		try {
-			const current = await fingerprintThroughGuard(held.guard, currentSnapshot);
+			const current = await fingerprintThroughGuard(held.guard, currentSnapshot, { timeoutMs: replaceTimeoutMs });
 			if (!current.ok) return refuse(current.code, current.message);
 			const currentFingerprint = current.fingerprint;
 			if (
@@ -4974,7 +4979,7 @@ export class AgentSession {
 			if (!replacement.ok) {
 				return refuse(guardRefusalCode(replacement.code), replacement.message);
 			}
-			const published = await fingerprintThroughGuard(held.guard, currentSnapshot);
+			const published = await fingerprintThroughGuard(held.guard, currentSnapshot, { timeoutMs: replaceTimeoutMs });
 			if (!published.ok) {
 				registry.updateOwnedClaim(held.pathHash, held.lockId, held.guard.guardId, { phase: "blocked" });
 				return refuse(published.code, published.message);
@@ -5044,7 +5049,9 @@ export class AgentSession {
 		// the guarded transcript flows through the helper (snapshot + hash).
 		const snapshotPath = this._snapshotPath("reload");
 		try {
-			const observed = await fingerprintThroughGuard(held.guard, snapshotPath);
+			const observed = await fingerprintThroughGuard(held.guard, snapshotPath, {
+				timeoutMs: guardSnapshotTimeoutMs(statSync(sessionFile).size),
+			});
 			if (!observed.ok) return refuse(observed.code, observed.message);
 			const observedFingerprint = observed.fingerprint;
 			if (observedFingerprint !== options.expectedFingerprint) {
@@ -5160,7 +5167,9 @@ export class AgentSession {
 			const finalSnapshotPath = this._snapshotPath("pre-commit");
 			let finalSnapshot: Awaited<ReturnType<typeof fingerprintThroughGuard>>;
 			try {
-				finalSnapshot = await fingerprintThroughGuard(held.guard, finalSnapshotPath);
+				finalSnapshot = await fingerprintThroughGuard(held.guard, finalSnapshotPath, {
+					timeoutMs: guardSnapshotTimeoutMs(statSync(sessionFile).size),
+				});
 			} finally {
 				rmSync(finalSnapshotPath, { force: true });
 			}

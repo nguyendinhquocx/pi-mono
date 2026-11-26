@@ -358,13 +358,22 @@ export class TranscriptWriteGuard {
 	}> = [];
 	#buffer = "";
 	#opTimeoutMs: number;
+	/** True when the caller passed an explicit opTimeoutMs; their budget wins over size scaling. */
+	#explicitOpTimeout: boolean;
 	#lossListener: (() => void) | undefined;
 
-	private constructor(canonicalPath: string, mode: TranscriptGuardMode, guardId: string, opTimeoutMs: number) {
+	private constructor(
+		canonicalPath: string,
+		mode: TranscriptGuardMode,
+		guardId: string,
+		opTimeoutMs: number,
+		explicitOpTimeout: boolean,
+	) {
 		this.#canonicalPath = canonicalPath;
 		this.#mode = mode;
 		this.#guardId = guardId;
 		this.#opTimeoutMs = opTimeoutMs;
+		this.#explicitOpTimeout = explicitOpTimeout;
 	}
 
 	/** Canonical path this guard protects. */
@@ -420,6 +429,7 @@ export class TranscriptWriteGuard {
 	): Promise<TranscriptGuardAcquireResult> {
 		const mode = options?.mode ?? "exclusive";
 		const opTimeoutMs = options?.opTimeoutMs ?? 20_000;
+		const explicitOpTimeout = options?.opTimeoutMs !== undefined;
 		if (!TranscriptWriteGuard.isPlatformSupported()) {
 			return guardFailure(
 				new TranscriptGuardUnavailableError(
@@ -430,7 +440,7 @@ export class TranscriptWriteGuard {
 		}
 		const canonical = canonicalizePath(canonicalPath);
 		const guardId = newGuardId(canonical, mode);
-		const guard = new TranscriptWriteGuard(canonical, mode, guardId, opTimeoutMs);
+		const guard = new TranscriptWriteGuard(canonical, mode, guardId, opTimeoutMs, explicitOpTimeout);
 		let response: WireResponse;
 		try {
 			response = await guard.#spawnAndRequest(
@@ -519,7 +529,7 @@ export class TranscriptWriteGuard {
 			const timer = setTimeout(() => {
 				const index = this.#pending.findIndex((entry) => entry.reject === settleReject);
 				if (index !== -1) this.#pending.splice(index, 1);
-				const error = new Error(`guard op timed out after ${this.#opTimeoutMs}ms`);
+				const error = new Error(`guard op timed out after ${timeoutMs}ms`);
 				if (typeof payload.op === "string" && MUTATION_OPS.has(payload.op)) {
 					// The helper may or may not have applied the mutation before the
 					// timeout: kill it so the stale helper cannot act further and
@@ -555,11 +565,11 @@ export class TranscriptWriteGuard {
 		return this.#request(payload, timeoutMs);
 	}
 
-	async #requestWithSpawnGuard(payload: Record<string, unknown>): Promise<WireResponse> {
+	async #requestWithSpawnGuard(payload: Record<string, unknown>, timeoutMs?: number): Promise<WireResponse> {
 		if (!this.#child) {
 			throw new Error("guard helper is not running");
 		}
-		return this.#request(payload);
+		return this.#request(payload, timeoutMs);
 	}
 
 	/**
@@ -619,7 +629,8 @@ export class TranscriptWriteGuard {
 			};
 		}
 		try {
-			const sourceFingerprint = createHash("sha256").update(readFileSync(sourceAbsolutePath)).digest("hex");
+			const sourceBytes = readFileSync(sourceAbsolutePath);
+			const sourceFingerprint = createHash("sha256").update(sourceBytes).digest("hex");
 			// A caller-pinned fingerprint (e.g. the claim's recorded original
 			// fingerprint for guarded restore) binds the source bytes to what the
 			// caller inspected, not to whatever happens to sit at the path now.
@@ -633,11 +644,16 @@ export class TranscriptWriteGuard {
 					message: `rewrite source fingerprint ${sourceFingerprint} does not match the pinned expectation ${options.expectedSourceFingerprint}`,
 				};
 			}
-			const response = await this.#requestWithSpawnGuard({
-				op: "rewrite",
-				source: sourceAbsolutePath,
-				expectedFingerprint: options?.expectedSourceFingerprint ?? sourceFingerprint,
-			});
+			// Reading the source and rewriting the stream is proportional I/O:
+			// scale the op budget with the source size instead of the fixed default.
+			const response = await this.#requestWithSpawnGuard(
+				{
+					op: "rewrite",
+					source: sourceAbsolutePath,
+					expectedFingerprint: options?.expectedSourceFingerprint ?? sourceFingerprint,
+				},
+				this.#explicitOpTimeout ? undefined : guardSnapshotTimeoutMs(sourceBytes.length),
+			);
 			if (!response.ok) {
 				if (response.held !== true) this.#held = false;
 				return guardFailure(
@@ -750,13 +766,19 @@ export class TranscriptWriteGuard {
 	 * this is the only way the owner can hash/parse the transcript while an
 	 * exclusive guard is held. The snapshot is a plain unlocked file.
 	 */
-	async snapshotTo(destPath: string): Promise<TranscriptGuardResult & { byteLength?: number }> {
+	async snapshotTo(
+		destPath: string,
+		options?: { timeoutMs?: number },
+	): Promise<TranscriptGuardResult & { byteLength?: number }> {
 		if (this.#uncertain) return this.#uncertainRefusal();
 		if (!this.isHeld) {
 			return { ok: false, code: "writer_conflict", message: "guard is no longer held; refusing snapshot" };
 		}
 		try {
-			const response = await this.#requestWithSpawnGuard({ op: "snapshot", dest: resolve(destPath) });
+			const response = await this.#requestWithSpawnGuard(
+				{ op: "snapshot", dest: resolve(destPath) },
+				options?.timeoutMs,
+			);
 			if (!response.ok) {
 				return {
 					ok: false,
@@ -876,11 +898,40 @@ export type GuardedFingerprintResult =
  * while a full-range exclusive lock is held, so guarded verification flows
  * must read via the guard itself (same process/handle as the lock owner).
  */
+/**
+ * Guard-op budget for snapshot/fingerprint work on a transcript of
+ * `sizeBytes`: the helper reads and rewrites the whole file through a pipe,
+ * so a fixed 20s ceiling failed on large transcripts under slow I/O
+ * (65 MB took >20s during a sync-client re-materialization storm).
+ * 1s per MB on top of the 20s base, capped at 5 minutes.
+ */
+export function guardSnapshotTimeoutMs(sizeBytes: number): number {
+	const sizeMb = Math.max(0, sizeBytes) / 1_000_000;
+	return Math.min(300_000, 20_000 + Math.ceil(sizeMb) * 1_000);
+}
+
+/** Delete a transient guard tmp file; retry briefly, never throw. */
+export function removeTempBestEffort(path: string, attempts = 3): void {
+	for (let attempt = 0; attempt < attempts; attempt += 1) {
+		try {
+			rmSync(path, { force: true });
+			return;
+		} catch {
+			// The helper may still hold the handle right after an aborted op;
+			// brief pause then retry. Total retry window stays under 1s.
+			if (attempt < attempts - 1) {
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
+			}
+		}
+	}
+}
+
 export async function fingerprintThroughGuard(
 	guard: TranscriptWriteGuard,
 	snapshotPath: string,
+	options?: { timeoutMs?: number },
 ): Promise<GuardedFingerprintResult> {
-	const snapshot = await guard.snapshotTo(snapshotPath);
+	const snapshot = await guard.snapshotTo(snapshotPath, options);
 	if (!snapshot.ok) {
 		return {
 			ok: false,
