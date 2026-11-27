@@ -63,6 +63,6 @@ LI_EXT_SNAPSHOT=%TEMP%/snap.json li -p "reply ok"
 | import-repro.ts | 81-118ms/boot | đã xoá |
 
 - Sweep concurrency: cap1 2375 / cap2 1810 / cap4 2067 / cap8 1772ms → giữ cap 8.
-- Escape hatch: `LI_EXT_IMPORT_SEQUENTIAL=1` (tuần tự, debug regression side-effect order).
-- Lưu ý side-effect: top-level code giữa các extension chạy song song mất determinism thứ tự — registration chính nằm ở factory (tuần tự) nên an toàn; tránh thêm top-level cross-extension side effect.
+- Escape hatch: `LI_EXT_IMPORT_SEQUENTIAL=1` — old interleaved path thật: mỗi extension import xong chạy factory+commit ngay trước khi ext kế được import (import A → factory A → import B → factory B), không phải 2-phase tuần tự imports.
+- Lưu ý side-effect: top-level code giữa các extension chạy song song mất determinism thứ tự — registration chính nằm ở factory (tuần tự) nên an toàn; tránh thêm top-level cross-extension side effect. Debug nghi side-effect order thì bật escape hatch trên: nó tái lập thứ tự side-effect tuần tự thật.
 - Cold vs warm: cold ~13s vs warm ~6s trước tối ưu — Defender scan từng file lần đầu; exclusion path (owner admin) thu hẹp gap.

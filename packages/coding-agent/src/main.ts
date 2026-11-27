@@ -1036,7 +1036,16 @@ export async function main(args: string[], options?: MainOptions) {
 			errors: extensionsResult.errors,
 			warnings: extensionsResult.warnings ?? [],
 		};
-		writeFileSync(snapshotPath, `${JSON.stringify(snapshot, null, "\t")}\n`);
+		try {
+			writeFileSync(snapshotPath, `${JSON.stringify(snapshot, null, "\t")}\n`);
+		} catch (error) {
+			// Debug-only snapshot: a bad path must warn and continue booting, not kill the CLI.
+			console.error(
+				chalk.yellow(
+					`LI_EXT_SNAPSHOT: failed to write ${snapshotPath}: ${error instanceof Error ? error.message : String(error)}`,
+				),
+			);
+		}
 	}
 	// Mutating session metadata is delayed until AgentSession has acquired the
 	// strict writer lease and installed its composite SessionManager write gate.

@@ -688,22 +688,16 @@ async function importExtensionModule(
 
 /**
  * Import every extension module before any factory runs. Imports are independent of each other
- * (each gets its own jiti instance), so they run in parallel with a small concurrency cap;
- * `LI_EXT_IMPORT_SEQUENTIAL=1` restores fully sequential imports for debugging. Registration
- * order (precedence) is decided later by the sequential factory pass, never here.
+ * (each gets its own jiti instance), so they run in parallel with a small concurrency cap.
+ * Registration order (precedence) is decided later by the sequential factory pass, never here.
+ * The `LI_EXT_IMPORT_SEQUENTIAL=1` escape hatch bypasses this phase entirely (see
+ * loadExtensionsInternal).
  */
 async function importExtensionModules(
 	paths: string[],
 	cwd: string,
 	cacheToken?: ExtensionCacheToken,
 ): Promise<ExtensionModuleImport[]> {
-	if (process.env.LI_EXT_IMPORT_SEQUENTIAL === "1") {
-		const sequential: ExtensionModuleImport[] = [];
-		for (const extPath of paths) {
-			sequential.push(await importExtensionModule(extPath, cwd, cacheToken));
-		}
-		return sequential;
-	}
 	const concurrency = Number.parseInt(process.env.LI_EXT_IMPORT_CONCURRENCY ?? "", 10);
 	const cap = Number.isFinite(concurrency) && concurrency > 0 ? concurrency : DEFAULT_EXT_IMPORT_CONCURRENCY;
 	const results = new Array<ExtensionModuleImport>(paths.length);
@@ -733,8 +727,11 @@ export async function loadExtensionFromFactory(
 }
 
 /**
- * Load extensions from paths: import all modules in parallel first, then run factories and commit
- * sequentially in path order so `LoadExtensionsResult` matches the sequential order.
+ * Load extensions from paths. Default (two-phase): import all modules in parallel first, then run
+ * factories and commit sequentially in path order so `LoadExtensionsResult` matches the sequential
+ * order. `LI_EXT_IMPORT_SEQUENTIAL=1` restores the old interleaved path instead: import a module,
+ * then immediately run its factory+commit, before the next extension is imported — useful for
+ * debugging side-effect order regressions.
  */
 async function loadExtensionsInternal(
 	paths: string[],
@@ -751,16 +748,23 @@ async function loadExtensionsInternal(
 	const resolvedEventBus = eventBus ?? createEventBus();
 	const resolvedRuntime = runtime ?? createExtensionRuntime();
 
-	// Phase 1: import modules in parallel (capped). Each import keeps its own wall-clock timing.
-	const imports = await importExtensionModules(paths, resolvedCwd, cacheToken);
-	// Delta since reload start ≈ wall-clock of the whole import phase; the factory deltas after
-	// this point are then attributable per extension again (factories run sequentially).
-	time("imports phase (from reload start)", "extensions");
+	// Default two-phase path: import modules in parallel (capped) first, each with its own
+	// wall-clock timing. The sequential escape hatch skips this phase and interleaves below.
+	const sequentialInline = process.env.LI_EXT_IMPORT_SEQUENTIAL === "1";
+	const imports: ExtensionModuleImport[] | undefined = sequentialInline
+		? undefined
+		: await importExtensionModules(paths, resolvedCwd, cacheToken);
+	if (!sequentialInline) {
+		// Delta since reload start ≈ wall-clock of the whole import phase; the factory deltas after
+		// this point are then attributable per extension again (factories run sequentially).
+		time("imports phase (from reload start)", "extensions");
+	}
 
-	// Phase 2: run factories + commit strictly in path order — precedence and conflict detection
-	// depend on this order. A failed import is mapped to its own path and skips the factory.
+	// Run factories + commit strictly in path order — precedence and conflict detection depend on
+	// this order. A failed import is mapped to its own path and skips the factory. With the escape
+	// hatch set, the import itself happens here too, so the whole pipeline is interleaved per path.
 	for (const [index, extPath] of paths.entries()) {
-		const imported = imports[index];
+		const imported = imports ? imports[index] : await importExtensionModule(extPath, resolvedCwd, cacheToken);
 		if (imported?.error) {
 			errors.push({ path: extPath, error: imported.error });
 			continue;

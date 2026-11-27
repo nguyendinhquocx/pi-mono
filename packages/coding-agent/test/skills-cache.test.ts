@@ -68,4 +68,31 @@ describe("skills directory cache (revision signature)", () => {
 		expect(asUser.skills[0].sourceInfo.scope).toBe("user");
 		expect(asProject.skills[0].sourceInfo.scope).toBe("project");
 	});
+
+	// Regression: the signature walk used to treat any SKILL.md as a skill root and return early,
+	// even when the scan's ignore rules excluded it — edits to the subtree below the ignored
+	// SKILL.md then failed to invalidate the cache.
+	it("still watches the subtree below an ignored SKILL.md", () => {
+		fs.writeFileSync(path.join(tempDir, ".gitignore"), "child/SKILL.md\n");
+		fs.mkdirSync(path.join(tempDir, "child", "enfant"), { recursive: true });
+		fs.writeFileSync(
+			path.join(tempDir, "child", "SKILL.md"),
+			"---\nname: ignored\ndescription: must never load\n---\n",
+		);
+		fs.writeFileSync(
+			path.join(tempDir, "child", "enfant", "SKILL.md"),
+			"---\nname: enfant\ndescription: before edit\n---\n",
+		);
+
+		const before = loadSkillsFromDir({ dir: tempDir, source: "path" });
+		expect(before.skills.map((skill) => skill.name)).toEqual(["enfant"]);
+
+		fs.writeFileSync(
+			path.join(tempDir, "child", "enfant", "SKILL.md"),
+			"---\nname: enfant\ndescription: after edit\n---\n",
+		);
+		const after = loadSkillsFromDir({ dir: tempDir, source: "path" });
+		expect(after.skills.map((skill) => skill.name)).toEqual(["enfant"]);
+		expect(after.skills[0].description).toBe("after edit");
+	});
 });

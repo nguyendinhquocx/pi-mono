@@ -220,20 +220,23 @@ function loadSkillsFromDirCached(dir: string, source: string): LoadSkillsResult 
 /**
  * Revision signature of a skill directory: per-entry revisions (`getFileRevision`) covering
  * everything the scan actually reads — directories it recurses into, skill/root `.md` files it
- * loads — plus the ignore files whose rules filter the walk. Non-markdown files inside
- * non-skill dirs are never read by the scan, so they are skipped here; a directory's own
- * revision still changes when children are added, removed or renamed. The list is sorted before
- * joining so the signature is stable across runs.
+ * loads — plus the ignore files whose rules filter the walk. The walk applies the same ignore
+ * rules as the scan (single matcher, rules added per directory), so an ignored entry is skipped
+ * here too. Non-markdown files inside non-skill dirs are never read by the scan, so they are
+ * skipped here; a directory's own revision still changes when children are added, removed or
+ * renamed. The list is sorted before joining so the signature is stable across runs.
  */
 function computeSkillsDirSignature(dir: string): string {
 	const parts: string[] = [];
-	collectSkillsDirSignature(dir, dir, parts);
+	collectSkillsDirSignature(dir, dir, parts, ignore());
 	parts.sort();
 	return parts.join("|");
 }
 
-function collectSkillsDirSignature(dir: string, root: string, parts: string[]): void {
+function collectSkillsDirSignature(dir: string, root: string, parts: string[], ig: IgnoreMatcher): void {
 	if (!existsSync(dir)) return;
+	// Mirror the scan: load this directory's ignore rules before filtering its entries.
+	addIgnoreRules(ig, dir, root);
 	for (const filename of IGNORE_FILE_NAMES) {
 		const revision = getFileRevision(join(dir, filename));
 		if (revision !== undefined) {
@@ -248,8 +251,9 @@ function collectSkillsDirSignature(dir: string, root: string, parts: string[]): 
 		return;
 	}
 
-	// A directory holding SKILL.md is a skill root: the scan loads it and returns, so nothing
-	// else inside matters (mirrors loadSkillsFromDirInternal).
+	// A directory holding an unignored SKILL.md is a skill root: the scan loads it and returns, so
+	// nothing else inside matters. An ignored SKILL.md is not a skill root — keep walking so the
+	// subtree below is still collected, exactly like loadSkillsFromDirInternal.
 	for (const entry of entries) {
 		if (entry.name !== "SKILL.md") continue;
 		const fullPath = join(dir, entry.name);
@@ -261,8 +265,8 @@ function collectSkillsDirSignature(dir: string, root: string, parts: string[]): 
 				continue;
 			}
 		}
-		if (isFile) {
-			parts.push(`SKILL.md=${getFileRevision(fullPath) ?? "gone"}`);
+		if (isFile && !ig.ignores(toPosixPath(relative(root, fullPath)))) {
+			parts.push(`${toPosixPath(relative(root, fullPath))}=${getFileRevision(fullPath) ?? "gone"}`);
 			return;
 		}
 	}
@@ -281,11 +285,13 @@ function collectSkillsDirSignature(dir: string, root: string, parts: string[]): 
 				continue;
 			}
 		}
+		const relPath = toPosixPath(relative(root, fullPath));
+		if (ig.ignores(isDirectory ? `${relPath}/` : relPath)) continue;
 		if (isDirectory) {
-			parts.push(`${toPosixPath(relative(root, fullPath))}=${getFileRevision(fullPath) ?? "gone"}`);
-			collectSkillsDirSignature(fullPath, root, parts);
+			parts.push(`${relPath}=${getFileRevision(fullPath) ?? "gone"}`);
+			collectSkillsDirSignature(fullPath, root, parts, ig);
 		} else if (isMarkdown) {
-			parts.push(`${toPosixPath(relative(root, fullPath))}=${getFileRevision(fullPath) ?? "gone"}`);
+			parts.push(`${relPath}=${getFileRevision(fullPath) ?? "gone"}`);
 		}
 	}
 }

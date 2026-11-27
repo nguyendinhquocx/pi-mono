@@ -95,4 +95,62 @@ describe("extensions parallel import (two-phase)", () => {
 			delete process.env.LI_EXT_IMPORT_SEQUENTIAL;
 		}
 	});
+
+	// Module top-level code runs in the same realm as the loader (jiti eval), so a globalThis array
+	// records the real side-effect order: import events and factory events interleave per extension.
+	const extCodeWithEvents = (name: string) => `
+		globalThis.__extSeqEvents.push("import:${name}");
+		export default function(pi) {
+			globalThis.__extSeqEvents.push("factory:${name}");
+			pi.registerCommand("${name}", { handler: async () => {} });
+		}
+	`;
+
+	const withEventLog = (run: () => Promise<void>): Promise<string[]> => {
+		const log = globalThis as { __extSeqEvents?: string[] };
+		const events: string[] = [];
+		log.__extSeqEvents = events;
+		return run()
+			.then(() => events)
+			.finally(() => {
+				delete log.__extSeqEvents;
+			});
+	};
+
+	it("LI_EXT_IMPORT_SEQUENTIAL=1 runs the old interleaved pipeline (factory A before import B)", async () => {
+		const firstPath = path.join(tempDir, "first.ts");
+		const secondPath = path.join(tempDir, "second.ts");
+		fs.writeFileSync(firstPath, extCodeWithEvents("first"));
+		fs.writeFileSync(secondPath, extCodeWithEvents("second"));
+
+		process.env.LI_EXT_IMPORT_SEQUENTIAL = "1";
+		try {
+			const events = await withEventLog(async () => {
+				const result = await loadExtensions([firstPath, secondPath], tempDir);
+				expect(result.errors).toHaveLength(0);
+			});
+			// Strictly interleaved: each import finishes and its factory runs before the next import.
+			expect(events).toEqual(["import:first", "factory:first", "import:second", "factory:second"]);
+		} finally {
+			delete process.env.LI_EXT_IMPORT_SEQUENTIAL;
+		}
+	});
+
+	it("default two-phase runs every import before any factory", async () => {
+		const firstPath = path.join(tempDir, "first.ts");
+		const secondPath = path.join(tempDir, "second.ts");
+		fs.writeFileSync(firstPath, extCodeWithEvents("first"));
+		fs.writeFileSync(secondPath, extCodeWithEvents("second"));
+
+		const events = await withEventLog(async () => {
+			const result = await loadExtensions([firstPath, secondPath], tempDir);
+			expect(result.errors).toHaveLength(0);
+		});
+		// Import completion order may vary under parallel import; every factory must still run
+		// strictly after both imports have finished (phase boundary).
+		expect(events).toContain("import:first");
+		expect(events).toContain("import:second");
+		expect(events.indexOf("factory:first")).toBeGreaterThan(events.indexOf("import:second"));
+		expect(events.indexOf("factory:second")).toBeGreaterThan(events.indexOf("factory:first"));
+	});
 });

@@ -17,6 +17,9 @@ const wallClockTimings = new Map<TimingLabel, Array<{ path: string; ms: number }
 export function resetTimings(namespace: TimingLabel = "main"): void {
 	if (!ENABLED) return;
 	timingNamespaces.set(namespace, { timings: [], lastTime: Date.now() });
+	// Leftover per-import entries belong to the previous (aborted) pass: without dropping them a
+	// reload that threw mid-way would be double-counted in the next flush.
+	wallClockTimings.delete(namespace);
 }
 
 export function time(label: string, namespace: TimingLabel = "main"): void {
