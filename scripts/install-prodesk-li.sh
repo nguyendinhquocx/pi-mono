@@ -69,6 +69,19 @@ read_json_string() {
 	sed -n "s/^[[:space:]]*\"$field\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$json_file" | head -n 1
 }
 
+# Reads a JSON field as a scalar, accepting a quoted string or a bare integer.
+# Count-style producers (docs snapshot snippet) emit numbers; older receipts
+# emit strings. Ids and hashes must keep using read_json_string.
+read_json_scalar() {
+	field=$1
+	json_file=$2
+	value=$(sed -n "s/^[[:space:]]*\"$field\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$json_file" | head -n 1)
+	if [ -z "$value" ]; then
+		value=$(sed -n "s/^[[:space:]]*\"$field\"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9][0-9]*\).*/\1/p" "$json_file" | head -n 1)
+	fi
+	printf '%s\n' "$value"
+}
+
 is_hex_64() {
 	case "$1" in *[!a-f0-9]*|'') return 1 ;; esac
 	[ "${#1}" -eq 64 ]
@@ -118,7 +131,7 @@ verify_profile_snapshot() {
 
 	SNAPSHOT_RECEIPT_ID=$(read_json_string snapshot_id "$SNAPSHOT_RECEIPT")
 	SNAPSHOT_RECEIPT_SOURCE=$(read_json_string source_path "$SNAPSHOT_RECEIPT")
-	SNAPSHOT_FILE_COUNT=$(read_json_string file_count "$SNAPSHOT_RECEIPT")
+	SNAPSHOT_FILE_COUNT=$(read_json_scalar file_count "$SNAPSHOT_RECEIPT")
 	SNAPSHOT_EXPECTED_SHA=$(read_json_string archive_sha256 "$SNAPSHOT_RECEIPT")
 	is_hex_64 "$SNAPSHOT_EXPECTED_SHA" || { echo "$PROG_NAME: profile snapshot receipt SHA-256 is invalid." >&2; return 1; }
 	[ "$SNAPSHOT_RECEIPT_ID" = "$PROFILE_SNAPSHOT_ID" ] || { echo "$PROG_NAME: profile snapshot ID does not match Li build receipt." >&2; return 1; }
@@ -158,7 +171,7 @@ validate_bundle() {
 	RUNTIME_FILENAME=$(read_json_string runtime_filename "$LOCK_FILE")
 	RUNTIME_EXPECTED_SHA=$(read_json_string runtime_sha256 "$LOCK_FILE")
 	RUNTIME_TREE_SHA=$(read_json_string runtime_tree_sha256 "$LOCK_FILE")
-	RUNTIME_FILE_COUNT=$(read_json_string runtime_file_count "$LOCK_FILE")
+	RUNTIME_FILE_COUNT=$(read_json_scalar runtime_file_count "$LOCK_FILE")
 	INSTALLER_FILENAME=$(read_json_string installer_filename "$LOCK_FILE")
 	INSTALLER_EXPECTED_SHA=$(read_json_string installer_sha256 "$LOCK_FILE")
 

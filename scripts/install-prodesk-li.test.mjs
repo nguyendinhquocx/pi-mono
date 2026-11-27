@@ -66,7 +66,7 @@ function createTempRoot() {
 	return root;
 }
 
-function createProfileSnapshot(home) {
+function createProfileSnapshot(home, numericCounts = false) {
 	const piRoot = join(home, ".pi");
 	mkdirSync(join(piRoot, "agent"), { recursive: true });
 	writeFileSync(join(piRoot, "agent", "fixture-entry.jsonl"), '{"type":"fixture"}\n', "utf8");
@@ -82,7 +82,9 @@ function createProfileSnapshot(home) {
 	const receipt = {
 		snapshot_id: snapshotId,
 		source_path: ".pi",
-		file_count: "1",
+		// Producers write counts either as JSON numbers (docs snippet) or as
+		// strings (v1.5.2-era receipts); the installer accepts both forms.
+		file_count: numericCounts ? 1 : "1",
 		archive_sha256: sha256(readFileSync(archivePath)),
 	};
 	const receiptPath = join(snapshotDir, "snapshot.json");
@@ -223,6 +225,26 @@ test("readiness verifies artifact pins and the private profile snapshot without 
 
 	assert.equal(result.status, 0, result.stderr);
 	assert.match(result.stdout, /readiness PASS/);
+	assert.equal(currentTarget(join(home, ".local", "prodesk-li", "current")), "");
+});
+
+test("readiness accepts snapshot receipt counts written as JSON numbers", (t) => {
+	if (process.platform === "win32") {
+		t.skip("owner-only mode verification requires Linux filesystem semantics");
+		return;
+	}
+	const root = createTempRoot();
+	const home = join(root, "home");
+	mkdirSync(home, { recursive: true });
+	// Regression: docs/li-maintenance.md emits count fields as JSON numbers,
+	// which the pre-scalar reader rejected as "file count is invalid".
+	createProfileSnapshot(home, true);
+	const bundle = createBundle(root, { sourceCommit: sourceCommits[0], packageVersion: "1.3.0" });
+	const result = runReadiness(bundle, home);
+
+	assert.equal(result.status, 0, result.stderr);
+	assert.match(result.stdout, /readiness PASS/);
+	assert.doesNotMatch(result.stderr, /file count is invalid/);
 	assert.equal(currentTarget(join(home, ".local", "prodesk-li", "current")), "");
 });
 

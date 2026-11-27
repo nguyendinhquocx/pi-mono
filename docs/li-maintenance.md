@@ -160,6 +160,8 @@ mv "$staging_dir" "$snapshot_dir"
 
 Snapshot directory `0700`; receipt ghi `snapshot_id`, `source_path: .pi`, regular-file/symlink/socket counts, directory-mtime-only drift, archive size và SHA-256. Chỉ báo PASS/count/size/hash-match status; không in file names, archive hash hay nội dung profile ra chat/log. Đặt đúng ID vào `LI_PROFILE_SNAPSHOT_ID` khi build để receipt Li trỏ tới backup thật.
 
+Installer đọc count fields (`file_count`, `runtime_file_count`) qua `read_json_scalar` — chấp nhận cả JSON number lẫn numeric string; `snapshot_id`/`source_path`/hash vẫn phải string qua `read_json_string`.
+
 Laptop, từ repo Li sạch:
 
 ```
