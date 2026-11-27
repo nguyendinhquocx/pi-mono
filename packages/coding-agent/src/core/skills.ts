@@ -1,9 +1,9 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "fs";
+import { type Dirent, existsSync, readdirSync, readFileSync, statSync } from "fs";
 import ignore from "ignore";
 import { basename, dirname, join, relative, resolve, sep } from "path";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { parseFrontmatter } from "../utils/frontmatter.ts";
-import { isPathWithin, resolvePath } from "../utils/paths.ts";
+import { getFileRevision, isPathWithin, resolvePath } from "../utils/paths.ts";
 import type { ResourceDiagnostic } from "./diagnostics.ts";
 import { createSyntheticSourceInfo, getResourcePathKey, type SourceInfo } from "./source-info.ts";
 
@@ -166,8 +166,128 @@ function createSkillSourceInfo(filePath: string, baseDir: string, source: string
  * - recurse into subdirectories to find SKILL.md
  */
 export function loadSkillsFromDir(options: LoadSkillsFromDirOptions): LoadSkillsResult {
-	const { dir, source } = options;
-	return loadSkillsFromDirInternal(dir, source, true);
+	return loadSkillsFromDirCached(options.dir, options.source);
+}
+
+/** LRU cap for the top-level skill-directory cache. */
+const SKILLS_CACHE_MAX_ENTRIES = 32;
+
+interface SkillsCacheEntry {
+	signature: string;
+	result: LoadSkillsResult;
+}
+
+const skillsDirCache = new Map<string, SkillsCacheEntry>();
+
+function readSkillsDirCache(key: string): SkillsCacheEntry | undefined {
+	const entry = skillsDirCache.get(key);
+	if (!entry) return undefined;
+	// Map insertion order is the LRU order: touch on read.
+	skillsDirCache.delete(key);
+	skillsDirCache.set(key, entry);
+	return entry;
+}
+
+function writeSkillsDirCache(key: string, entry: SkillsCacheEntry): void {
+	skillsDirCache.delete(key);
+	skillsDirCache.set(key, entry);
+	if (skillsDirCache.size > SKILLS_CACHE_MAX_ENTRIES) {
+		const oldest = skillsDirCache.keys().next().value;
+		if (oldest !== undefined) skillsDirCache.delete(oldest);
+	}
+}
+
+/**
+ * Top-level directory loads go through a revision-signature cache: rescanning reads and parses
+ * every skill file on every reload, while the signature only stats entries, so warm reloads
+ * (`/new`, `/resume`, `/reload`) drop from tens of ms to a cheap stat walk.
+ * Keyed by (dirPath, source): the same directory loaded with a different source must not reuse
+ * the entry, because `source` changes the skills' sourceInfo.
+ */
+function loadSkillsFromDirCached(dir: string, source: string): LoadSkillsResult {
+	const resolvedDir = resolve(dir);
+	const key = `${getResourcePathKey(resolvedDir)}\u0000${source}`;
+	const signature = computeSkillsDirSignature(resolvedDir);
+	const cached = readSkillsDirCache(key);
+	if (cached && cached.signature === signature) {
+		return { skills: [...cached.result.skills], diagnostics: [...cached.result.diagnostics] };
+	}
+	const result = loadSkillsFromDirInternal(resolvedDir, source, true);
+	writeSkillsDirCache(key, { signature, result });
+	return { skills: [...result.skills], diagnostics: [...result.diagnostics] };
+}
+
+/**
+ * Revision signature of a skill directory: per-entry revisions (`getFileRevision`) covering
+ * everything the scan actually reads — directories it recurses into, skill/root `.md` files it
+ * loads — plus the ignore files whose rules filter the walk. Non-markdown files inside
+ * non-skill dirs are never read by the scan, so they are skipped here; a directory's own
+ * revision still changes when children are added, removed or renamed. The list is sorted before
+ * joining so the signature is stable across runs.
+ */
+function computeSkillsDirSignature(dir: string): string {
+	const parts: string[] = [];
+	collectSkillsDirSignature(dir, dir, parts);
+	parts.sort();
+	return parts.join("|");
+}
+
+function collectSkillsDirSignature(dir: string, root: string, parts: string[]): void {
+	if (!existsSync(dir)) return;
+	for (const filename of IGNORE_FILE_NAMES) {
+		const revision = getFileRevision(join(dir, filename));
+		if (revision !== undefined) {
+			parts.push(`${toPosixPath(relative(root, join(dir, filename)))}=${revision}`);
+		}
+	}
+
+	let entries: Dirent[];
+	try {
+		entries = readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return;
+	}
+
+	// A directory holding SKILL.md is a skill root: the scan loads it and returns, so nothing
+	// else inside matters (mirrors loadSkillsFromDirInternal).
+	for (const entry of entries) {
+		if (entry.name !== "SKILL.md") continue;
+		const fullPath = join(dir, entry.name);
+		let isFile = entry.isFile();
+		if (entry.isSymbolicLink()) {
+			try {
+				isFile = statSync(fullPath).isFile();
+			} catch {
+				continue;
+			}
+		}
+		if (isFile) {
+			parts.push(`SKILL.md=${getFileRevision(fullPath) ?? "gone"}`);
+			return;
+		}
+	}
+
+	for (const entry of entries) {
+		if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+		const fullPath = join(dir, entry.name);
+		let isDirectory = entry.isDirectory();
+		let isMarkdown = entry.isFile() && entry.name.endsWith(".md");
+		if (entry.isSymbolicLink()) {
+			try {
+				const stats = statSync(fullPath);
+				isDirectory = stats.isDirectory();
+				isMarkdown = stats.isFile() && entry.name.endsWith(".md");
+			} catch {
+				continue;
+			}
+		}
+		if (isDirectory) {
+			parts.push(`${toPosixPath(relative(root, fullPath))}=${getFileRevision(fullPath) ?? "gone"}`);
+			collectSkillsDirSignature(fullPath, root, parts);
+		} else if (isMarkdown) {
+			parts.push(`${toPosixPath(relative(root, fullPath))}=${getFileRevision(fullPath) ?? "gone"}`);
+		}
+	}
 }
 
 function loadSkillsFromDirInternal(
@@ -455,8 +575,8 @@ export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
 	}
 
 	if (includeDefaults) {
-		addSkills(loadSkillsFromDirInternal(join(resolvedAgentDir, "skills"), "user", true));
-		addSkills(loadSkillsFromDirInternal(resolve(resolvedCwd, CONFIG_DIR_NAME, "skills"), "project", true));
+		addSkills(loadSkillsFromDirCached(join(resolvedAgentDir, "skills"), "user"));
+		addSkills(loadSkillsFromDirCached(resolve(resolvedCwd, CONFIG_DIR_NAME, "skills"), "project"));
 	}
 
 	const userSkillsDir = join(resolvedAgentDir, "skills");
@@ -481,7 +601,7 @@ export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
 			const stats = statSync(resolvedPath);
 			const source = getSource(resolvedPath);
 			if (stats.isDirectory()) {
-				addSkills(loadSkillsFromDirInternal(resolvedPath, source, true));
+				addSkills(loadSkillsFromDirCached(resolvedPath, source));
 			} else if (stats.isFile() && resolvedPath.endsWith(".md")) {
 				const result = loadSkillFromFile(resolvedPath, source);
 				if (result.skill) {
