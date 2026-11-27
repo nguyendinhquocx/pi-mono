@@ -105,8 +105,9 @@ test/server.test.ts  the plugin tier test of the server facet (`testPlugin` of `
 
 **One audience per contract.** The owner, a session's worker and the server never share a contract; what some callers
 of one audience may do and others not is a `grantable(...)` member or a flag their admission grants (Chord slice 15:
-`state: { history: grantable(...) }`, `methods: { send: grantable(method(...)) }`, `flags: { export: "…" }`). A worker
-reading its own session gets its own contract.
+`state: { history: grantable(...) }`, `methods: { send: grantable(method(...)) }`, `flags: { export:
+messages.message("…") }`, the label a message of the plugin's `messages.ts`, which the contract file may import: Chord's
+`plugin-authoring.md`, "What a plugin may import"). A worker reading its own session gets its own contract.
 
 ```ts
 // contract.ts: what other plugins and facets import
@@ -241,6 +242,14 @@ reference or a native.
 - Node flags go into the worker's `execArgv` (`apps/p3/src/install.ts`), never only into `npm test`.
 - A package that changes what the release ships runs `npm run release:p3:local` (`testing.md`).
 
+**Values handed to Chord**
+- Never change a value after you handed it to Chord (a state value, an admission's value, params, a method's
+  arguments or result, a condition): make a new one. Chord keeps it without a copy and compares by identity first, so
+  the same object changed in place reads as "unchanged": no rebuild, no update, nothing reported (Chord decision
+  "Values handed to Chord are never changed afterwards", 2026-11-26; `plugin-authoring.md`, "Values you hand to
+  Chord"). In-memory indexes that answer admissions (the things plugin's access index) hand out a new answer object
+  for every changed answer and keep the old one untouched.
+
 **Code** (the Chord v2 code style of the root `AGENTS.md`, for plugin code too)
 - One concept per file, named after it; the first line says what the file is for; the public entry first, helpers
   below in the order used.
@@ -292,4 +301,8 @@ reference or a native.
 | A failed store (`storage_failed`) was only logged: the server answered `running` with a closed host | the server closes and exits non-zero; the supervisor starts it again |
 | A second runner contributed to change how workers run (it sorted first, so the route used it): the first runner still ran a held worker, and the status, which named only the second's, hid it from `p3 stop` | one runner; a plugin contributes a wrap (`WorkerRunnerWraps`) over it, and a second runner is reported as a conflict |
 | A built-in app took a new view token through `/v1/web`: on a running server that is the page's base bundle, built at start, so after an apply the token was `undefined` and the app threw | built-in plugins import each other's contract files by path; what comes through `/v1` is the base, which changes only with a restart |
+| The login kind's create hook took its maker from `ctx.principal`: the hook runs inside the things store's `create`, whose caller is the server code holding the store, so every login looked made by the server | the things plugin hands the hook its maker (`by`); never read a caller from a `ctx` that passed through another plugin's store |
 | A test waited for a worker's state by reading Linux's `/proc/<pid>/stat` (stopped by `SIGSTOP`): on a POSIX system without `/proc` it never saw it | the process says it over IPC (a socket the test listens on) or writes a marker file; the test answers to let it go on |
+| A workspace's removal read a table again (`tx.get`) after a `deleteWhere` on it in the same transaction: Chord refuses that | read everything a transaction needs first, then write; the deletes come last |
+| A list's names were a `liveQuery` whose arguments derived from a followed source (the access index's rows): Chord refuses a reader whose arguments read a followed source | read what such a list shows inside the followed computation (the index's probe reads the names before each computation; a rename tells the probes) |
+| A prefix read with no order (`under` a path): Chord orders by the key, so SQLite sorted every page | order by the indexed column the prefix runs on; a plan test |

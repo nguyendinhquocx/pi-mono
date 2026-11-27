@@ -40,7 +40,7 @@ import {
 	type HttpResponse,
 	type ListenAddress,
 } from "@earendil-works/chord/http";
-import { createPlugins, type PluginsError, type PluginsState } from "@earendil-works/chord/plugins";
+import { createPlugins, type PluginsError, type PluginsState, type RolloutStep } from "@earendil-works/chord/plugins";
 import { type PageAssets, pageScripts, webSurface } from "@earendil-works/chord/surfaces";
 import * as v1 from "@earendil-works/p3/v1";
 import { reportError, Server, Session, SessionAccess, until } from "@earendil-works/p3/v1";
@@ -71,6 +71,8 @@ export type ServerOptions = {
 	readonly worker: { readonly entry: string; readonly execArgv: readonly string[] };
 	/** How long a worker idles before it stops itself: 5 minutes by default. */
 	readonly workerIdleMs?: number;
+	/** Where the providers' types request their model catalogs; left out: nowhere. */
+	readonly catalogBaseUrl?: string;
 	/** p3's version, for the command's `status`. */
 	readonly version: string;
 	/** Facets of the server's own besides the base's, loaded with them (the memory test's telemetry ingest). */
@@ -200,6 +202,15 @@ export async function startServer(options: ServerOptions, context: Context): Pro
 			},
 			context,
 		);
+		// The runner is read when its step runs: the server step may have reloaded the runner plugin or a wrap's.
+		const workers: RolloutStep = {
+			name: "workers",
+			kinds: ["worker"],
+			reload: async (built, stepContext) => {
+				const runner = await used.now(stepContext);
+				return runner === undefined ? { hosts: [] } : runner.reload(built, stepContext);
+			},
+		};
 		let listening: ListenAddress | undefined;
 		const runtime: ServerRuntime = {
 			dataDir,
@@ -209,21 +220,11 @@ export async function startServer(options: ServerOptions, context: Context): Pro
 			sessions,
 			worker: options.worker,
 			workerIdleMs: options.workerIdleMs ?? IDLE_MS,
+			catalogBaseUrl: options.catalogBaseUrl,
 			workerScripts: async (ctx) => plugins.current("worker") ?? (await plugins.scripts("worker", ctx)),
 			listening: () => listening,
-			apply: async (ctx) => {
-				const built = await plugins.build(plugins.state.value.dirty, ctx);
-				// The runner is read when its step runs: the server step may have reloaded the runner plugin or a wrap's.
-				const workers = {
-					name: "workers",
-					kinds: ["worker"],
-					reload: async (step: typeof built, stepContext: Context) => {
-						const runner = await used.now(stepContext);
-						return runner === undefined ? { hosts: [] } : runner.reload(step, stepContext);
-					},
-				};
-				return plugins.rollout([plugins.step("server", host), workers, web.step("web")], built, ctx);
-			},
+			// One build and rollout at a time (Chord's `Plugins.apply`): the server, the workers, then the page.
+			apply: (ctx) => plugins.apply([plugins.step("server", host), workers, web.step("web")], ctx),
 			stop: () => options.onStop({ kind: "stopped" }),
 		};
 		const core = [

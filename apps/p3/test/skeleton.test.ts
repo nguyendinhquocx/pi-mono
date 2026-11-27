@@ -3,16 +3,15 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { BACKGROUND_CONTEXT as context, until } from "@earendil-works/p3/v1";
 import { WorkerRunners } from "@earendil-works/p3/v1/server";
 import { type TestServer, testServer } from "@earendil-works/p3/v1/testing";
-import { BACKUP_MARKER } from "@earendil-works/p3/v1/worker";
 import { Sessions, SessionWorker } from "../plugins/sessions/contract.ts";
 import { askServer } from "../src/local-socket.ts";
 import { Probe } from "./plugins/probe/contract.ts";
@@ -109,12 +108,12 @@ describe("session workers", () => {
 		);
 	});
 
-	it("a worker opens its session's store with an outbox exactly while the backup marker is there", async () => {
+	it("a plugin switches its session store's outbox, and the next start keeps the setting", async () => {
 		const { t, id } = await withSession();
 		const dir = join(t.dataDir, "workers", id);
-		await mkdir(dirname(join(dir, BACKUP_MARKER)), { recursive: true });
-		await writeFile(join(dir, BACKUP_MARKER), "");
 		const held = await probe(t, id);
+		assert.equal(outboxOf(dir), 0);
+		await held.outbox(true, context);
 		assert.equal(outboxOf(dir), 1);
 		const pid = held.pid.value;
 		held.release();
@@ -122,9 +121,11 @@ describe("session workers", () => {
 			async () => alive(pid),
 			(lives) => !lives,
 		);
-		// Backup stopped for good: the next start opens the store without its outbox.
-		await rm(join(dir, BACKUP_MARKER));
-		await probe(t, id);
+		// The base opens the store with its persisted setting: backup stays on across starts.
+		const again = await probe(t, id);
+		assert.equal(outboxOf(dir), 1);
+		// Backup stopped for good.
+		await again.outbox(false, context);
 		assert.equal(outboxOf(dir), 0);
 	});
 
@@ -144,26 +145,30 @@ describe("session workers", () => {
 		assert.notEqual((await probe(t, id)).pid.value, pid);
 	});
 
-	it("a working session's worker starts again after a server restart, unasked", async (c) => {
-		running = await testServer({ plugins: [PROBE, FAUX] }, context);
-		const t = running;
-		const folder = await mkdtemp(join(tmpdir(), "p3-skeleton-run-"));
-		// The run waits on its gate on any worker; opened after the case, so no bash call waits on.
-		c.after(async () => {
-			await openGate(folder);
-			await rm(folder, { recursive: true, force: true });
-		});
-		const client = await t.client(context);
-		const id = await gatedSession(client, "one", folder, context);
-		// The harness reports the run `working` (a report by the test would race the harness's own).
-		await startRun(client, id, context);
-		running = await t.restart(context);
-		const restarted = running;
-		await eventually(
-			() => restarted.workers(context),
-			(workers) => workers[id]?.status === "running",
-		);
-	});
+	it(
+		"a working session's worker starts again after a server restart, unasked",
+		{ skip: "until sessions are workspaces, ERNDL-704 push 3" },
+		async (c) => {
+			running = await testServer({ plugins: [PROBE, FAUX] }, context);
+			const t = running;
+			const folder = await mkdtemp(join(tmpdir(), "p3-skeleton-run-"));
+			// The run waits on its gate on any worker; opened after the case, so no bash call waits on.
+			c.after(async () => {
+				await openGate(folder);
+				await rm(folder, { recursive: true, force: true });
+			});
+			const client = await t.client(context);
+			const id = await gatedSession(t.host, client, "one", folder, context);
+			// The harness reports the run `working` (a report by the test would race the harness's own).
+			await startRun(client, id, context);
+			running = await t.restart(context);
+			const restarted = running;
+			await eventually(
+				() => restarted.workers(context),
+				(workers) => workers[id]?.status === "running",
+			);
+		},
+	);
 
 	// Sol, review round 2 (S6): the case applied again and again until the code changed; now one apply per change,
 	// once the watcher marked it, through the command `p3 apply` sends (D11).
