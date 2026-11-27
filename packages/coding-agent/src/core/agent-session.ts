@@ -4341,10 +4341,16 @@ export class AgentSession {
 		}
 	}
 
-	private _markSessionAccessUnguarded(message: string): void {
+	private _markSessionAccessUnguarded(message: string, options?: { silent?: boolean }): void {
 		this._sessionAccessUnguarded = true;
 		if (this._sessionAccessFailure === message) return;
 		this._sessionAccessFailure = message;
+		if (options?.silent) {
+			// Expected platform degradation (non-Windows runtime): the trim path
+			// already surfaces the refusal reason, so a session-level error would
+			// only be noise on every startup.
+			return;
+		}
 		this._extensionRunner?.emitError({
 			extensionPath: "<session-guard>",
 			event: "session_access_guard",
@@ -4450,7 +4456,11 @@ export class AgentSession {
 		const acquired = await TranscriptWriteGuard.acquire(sessionFile, { mode: "shared" });
 		if (!acquired.ok) {
 			if (acquired.code === "writer_conflict") throw new SessionDataLockedError();
-			this._markSessionAccessUnguarded(acquired.message);
+			// A missing OS guard solely because the platform is unsupported is an
+			// expected degradation, not an anomaly: stay silent at session level.
+			const expectedPlatformDegradation =
+				acquired.code === "write_guard_unavailable" && !TranscriptWriteGuard.isPlatformSupported();
+			this._markSessionAccessUnguarded(acquired.message, { silent: expectedPlatformDegradation });
 			this.sessionManager.applyDeferredStartupRepairs();
 			return;
 		}

@@ -81,6 +81,10 @@ describe("TranscriptWriteGuard", () => {
 		const { transcript } = fixture();
 		const result = await TranscriptWriteGuard.acquire(transcript);
 		expect(result).toMatchObject({ ok: false, code: "write_guard_unavailable" });
+		if (!result.ok) {
+			expect(result.message).toBe("OS write guard is only implemented on Windows");
+			expect(result.message).not.toContain("local filesystems");
+		}
 	});
 
 	it.skipIf(!TranscriptWriteGuard.isPlatformSupported())(

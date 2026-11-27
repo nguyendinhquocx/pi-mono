@@ -43,6 +43,7 @@ async function createPersistedSession(options?: {
 	skipExtensionBinding?: boolean;
 	usesDefaultTools?: boolean;
 	extensionFactories?: ExtensionFactory[];
+	bindOnError?: (error: { extensionPath?: string; event?: string; error: unknown }) => void;
 }) {
 	const root = mkdtempSync(join(tmpdir(), "pi-session-refresh-test-"));
 	roots.push(root);
@@ -177,7 +178,8 @@ async function createPersistedSession(options?: {
 		initialActiveToolNames: [],
 		usesDefaultTools: options?.usesDefaultTools === true,
 	});
-	if (!options?.skipExtensionBinding) await session.bindExtensions({ mode: "tui" });
+	if (!options?.skipExtensionBinding)
+		await session.bindExtensions({ mode: "tui", ...(options?.bindOnError ? { onError: options.bindOnError } : {}) });
 	return {
 		root,
 		sessionFile,
@@ -195,7 +197,10 @@ async function createPersistedSession(options?: {
 describe("AgentSession in-place refresh", () => {
 	it("degrades on unsupported OS guards and refuses trim without killing runtime", async () => {
 		if (TranscriptWriteGuard.isPlatformSupported()) return;
-		const fixture = await createPersistedSession();
+		const extensionErrors: unknown[] = [];
+		const fixture = await createPersistedSession({
+			bindOnError: (error) => extensionErrors.push(error),
+		});
 		try {
 			expect(fixture.session.sessionFile).toBe(fixture.sessionFile);
 			expect(await fixture.session.inspectSessionDataLease()).toMatchObject({
@@ -203,7 +208,37 @@ describe("AgentSession in-place refresh", () => {
 				code: "write_guard_unavailable",
 			});
 			expect(fixture.session.sessionManager.getSessionId()).toBe(fixture.header.id);
+			// Expected platform degradation must stay silent at session level;
+			// the trim path is the surface that reports the refusal reason.
+			expect(extensionErrors).toEqual([]);
 		} finally {
+			await fixture.session.releaseSessionDataAccess();
+			fixture.session.dispose();
+			fixture.restorePackageDir();
+		}
+	});
+
+	it("still emits a session error when the OS guard fails for a non-platform reason", async () => {
+		if (!TranscriptWriteGuard.isPlatformSupported()) return;
+		const extensionErrors: unknown[] = [];
+		const acquireSpy = vi.spyOn(TranscriptWriteGuard, "acquire").mockResolvedValue({
+			ok: false,
+			code: "write_guard_unavailable",
+			message: "helper process died before acquiring the lock",
+		});
+		const fixture = await createPersistedSession({
+			bindOnError: (error) => extensionErrors.push(error),
+		});
+		try {
+			expect(await fixture.session.inspectSessionDataLease()).toMatchObject({
+				status: "refused",
+				code: "write_guard_unavailable",
+			});
+			expect(extensionErrors).toHaveLength(1);
+			const reported = extensionErrors[0] as { error?: string };
+			expect(reported.error).toContain("helper process died before acquiring the lock");
+		} finally {
+			acquireSpy.mockRestore();
 			await fixture.session.releaseSessionDataAccess();
 			fixture.session.dispose();
 			fixture.restorePackageDir();

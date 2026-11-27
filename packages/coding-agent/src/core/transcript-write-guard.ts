@@ -434,7 +434,7 @@ export class TranscriptWriteGuard {
 			return guardFailure(
 				new TranscriptGuardUnavailableError(
 					"write_guard_unavailable",
-					"OS write guard is only implemented for Windows local filesystems",
+					"OS write guard is only implemented on Windows",
 				),
 			);
 		}
