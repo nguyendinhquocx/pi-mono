@@ -105,8 +105,11 @@ OUT:
 ## Ordering & Overall Acceptance
 
 - Thứ tự: T1 → T2/T3 (song song được, cùng đo lại bằng T1) → T4 bất kỳ lúc nào → T6 dispatch NGAY sau khi spec chốt (session khác làm song song) → nghiệm thu end-to-end khi T2+T4+T6 đủ.
-- Overall (không tính riêng lẻ từng task): median 3 run warm `PI_TIMING=1 li -p` **≤2500ms** + snapshot tool/command bằng baseline + vitest target PASS; cold ≤8s sau T8; first-call latency lazy tools báo kèm.
-- Baseline/after lưu `.agent-workbench/li-perf/baseline.md` + `after.md`; commit scoped từng task, parent review diff trước commit.
+- Overall — KẾT QUẢ THỰC CHỐT (2026-11-27, sau fix round review 4 model):
+  - Warm median `PI_TIMING=1 li -p`: **~2.8-3.3s** (baseline 6.9s, **−60%**). Mốc spec ban đầu ≤2500ms KHÔNG chạm gắt — nguyên nhân đo được: Babel transform CPU-bound đơn luồng (parallel chỉ overlap I/O), contention 40+ extension + Defender scheduling trên Windows, per-spawn tax ~183ms. In-pair sequential vs parallel: 1668 vs 1702ms — không còn gain đáng kể từ song song hoá ở trạng thái warm sâu; gap còn lại chủ yếu là antigravity in-profile ~400-600ms (isolated 163-191ms).
+  - Snapshot tool/command identical; 192 tests PASS; escape hatch = true old interleaved path (verified in-pair).
+  - Cold ≤8s: chờ owner chạy T8 exclusion rồi đo theo protocol.
+- Baseline/after lưu `.agent-workbench/li-perf/baseline.md` + `after.md`; commits: `4ac339c3cc`, `8165070178`, `9145ecd0b9`, `162ca1f979`, `14cb748f23` (li/stable) + pi-antigravity `45da5ae..9341fa2` (pushed).
 
 ## Review Log
 
