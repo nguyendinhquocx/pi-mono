@@ -19,7 +19,7 @@ import { execCommand } from "../exec.ts";
 import { type McpServerConfig, McpServerRegistry, validateMcpServerConfig } from "../mcp-servers.ts";
 import { readPiManifest } from "../pi-manifest.ts";
 import { createSyntheticSourceInfo, getSyntheticPathSource, isSyntheticPath } from "../source-info.ts";
-import { time } from "../timings.ts";
+import { recordImportWallTime, time } from "../timings.ts";
 import type { ModelRouteRequest, VirtualModelDefinition } from "../virtual-models.ts";
 import type {
 	EntryRenderer,
@@ -606,7 +606,10 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 		...resolutionOptions,
 	});
 
+	const importStart = Date.now();
 	const module = await jiti.import(canonicalizePath(extensionPath), { default: true });
+	// Own wall-clock per import: delta chains are wrong once imports run in parallel.
+	recordImportWallTime("extensions", extensionPath, Date.now() - importStart);
 	const factory = module as ExtensionFactory;
 	if (typeof factory !== "function") {
 		return undefined;
@@ -659,29 +662,60 @@ async function initializeExtension(
 	return extension;
 }
 
-async function loadExtension(
-	extensionPath: string,
-	cwd: string,
-	eventBus: EventBus,
-	runtime: ExtensionRuntime,
-	cacheToken?: ExtensionCacheToken,
-): Promise<{ extension: Extension | null; error: string | null }> {
-	const resolvedPath = resolvePath(extensionPath, cwd, { normalizeUnicodeSpaces: true });
+/** Default parallel import concurrency; `LI_EXT_IMPORT_CONCURRENCY` overrides it (perf sweep). */
+const DEFAULT_EXT_IMPORT_CONCURRENCY = 8;
 
+interface ExtensionModuleImport {
+	resolvedPath: string;
+	factory?: ExtensionFactory;
+	error?: string;
+}
+
+async function importExtensionModule(
+	extPath: string,
+	cwd: string,
+	cacheToken?: ExtensionCacheToken,
+): Promise<ExtensionModuleImport> {
+	const resolvedPath = resolvePath(extPath, cwd, { normalizeUnicodeSpaces: true });
 	try {
 		const factory = await loadExtensionModule(resolvedPath, cacheToken);
-		time(`${extensionPath} module import`, "extensions");
-		if (!factory) {
-			return { extension: null, error: `Extension does not export a valid factory function: ${extensionPath}` };
-		}
-
-		const extension = await initializeExtension(factory, extensionPath, resolvedPath, cwd, eventBus, runtime);
-
-		return { extension, error: null };
+		return { resolvedPath, factory: factory ?? undefined };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
-		return { extension: null, error: `Failed to load extension: ${message}` };
+		return { resolvedPath, error: `Failed to load extension: ${message}` };
 	}
+}
+
+/**
+ * Import every extension module before any factory runs. Imports are independent of each other
+ * (each gets its own jiti instance), so they run in parallel with a small concurrency cap;
+ * `LI_EXT_IMPORT_SEQUENTIAL=1` restores fully sequential imports for debugging. Registration
+ * order (precedence) is decided later by the sequential factory pass, never here.
+ */
+async function importExtensionModules(
+	paths: string[],
+	cwd: string,
+	cacheToken?: ExtensionCacheToken,
+): Promise<ExtensionModuleImport[]> {
+	if (process.env.LI_EXT_IMPORT_SEQUENTIAL === "1") {
+		const sequential: ExtensionModuleImport[] = [];
+		for (const extPath of paths) {
+			sequential.push(await importExtensionModule(extPath, cwd, cacheToken));
+		}
+		return sequential;
+	}
+	const concurrency = Number.parseInt(process.env.LI_EXT_IMPORT_CONCURRENCY ?? "", 10);
+	const cap = Number.isFinite(concurrency) && concurrency > 0 ? concurrency : DEFAULT_EXT_IMPORT_CONCURRENCY;
+	const results = new Array<ExtensionModuleImport>(paths.length);
+	let nextIndex = 0;
+	const worker = async () => {
+		while (nextIndex < paths.length) {
+			const index = nextIndex++;
+			results[index] = await importExtensionModule(paths[index], cwd, cacheToken);
+		}
+	};
+	await Promise.all(Array.from({ length: Math.min(cap, paths.length) }, () => worker()));
+	return results;
 }
 
 /**
@@ -699,7 +733,8 @@ export async function loadExtensionFromFactory(
 }
 
 /**
- * Load extensions from paths.
+ * Load extensions from paths: import all modules in parallel first, then run factories and commit
+ * sequentially in path order so `LoadExtensionsResult` matches the sequential order.
  */
 async function loadExtensionsInternal(
 	paths: string[],
@@ -716,22 +751,37 @@ async function loadExtensionsInternal(
 	const resolvedEventBus = eventBus ?? createEventBus();
 	const resolvedRuntime = runtime ?? createExtensionRuntime();
 
-	for (const extPath of paths) {
-		const { extension, error } = await loadExtension(
-			extPath,
-			resolvedCwd,
-			resolvedEventBus,
-			resolvedRuntime,
-			cacheToken,
-		);
+	// Phase 1: import modules in parallel (capped). Each import keeps its own wall-clock timing.
+	const imports = await importExtensionModules(paths, resolvedCwd, cacheToken);
+	// Delta since reload start ≈ wall-clock of the whole import phase; the factory deltas after
+	// this point are then attributable per extension again (factories run sequentially).
+	time("imports phase (from reload start)", "extensions");
 
-		if (error) {
-			errors.push({ path: extPath, error });
+	// Phase 2: run factories + commit strictly in path order — precedence and conflict detection
+	// depend on this order. A failed import is mapped to its own path and skips the factory.
+	for (const [index, extPath] of paths.entries()) {
+		const imported = imports[index];
+		if (imported?.error) {
+			errors.push({ path: extPath, error: imported.error });
 			continue;
 		}
-
-		if (extension) {
+		if (!imported?.factory) {
+			errors.push({ path: extPath, error: `Extension does not export a valid factory function: ${extPath}` });
+			continue;
+		}
+		try {
+			const extension = await initializeExtension(
+				imported.factory,
+				extPath,
+				imported.resolvedPath,
+				resolvedCwd,
+				resolvedEventBus,
+				resolvedRuntime,
+			);
 			extensions.push(extension);
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			errors.push({ path: extPath, error: `Failed to load extension: ${message}` });
 		}
 	}
 

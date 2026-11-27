@@ -46,7 +46,7 @@ import {
 	isSyntheticPath,
 	type SourceInfo,
 } from "./source-info.ts";
-import { resetTimings } from "./timings.ts";
+import { flushTimings, measureTiming, resetTimings } from "./timings.ts";
 
 export interface ResourceExtensionPaths {
 	skillPaths?: Array<{ path: string; metadata: PathMetadata }>;
@@ -263,6 +263,7 @@ export function loadProjectContextFiles(options: {
 	cwd: string;
 	agentDir: string;
 }): Array<{ path: string; content: string }> {
+	const stopAgentsChainTiming = measureTiming("AGENTS.md chain", "resources");
 	const resolvedCwd = resolvePath(options.cwd);
 	const resolvedAgentDir = resolvePath(options.agentDir);
 
@@ -300,6 +301,7 @@ export function loadProjectContextFiles(options: {
 
 	contextFiles.push(...ancestorContextFiles);
 
+	stopAgentsChainTiming();
 	return contextFiles;
 }
 
@@ -548,6 +550,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 	async reload(options?: ResourceLoaderReloadOptions): Promise<void> {
 		resetTimings("extensions");
+		resetTimings("resources");
 
 		if (this.loaded) {
 			clearExtensionCache();
@@ -561,8 +564,12 @@ export class DefaultResourceLoader implements ResourceLoader {
 		}
 
 		// reload() preserves SettingsManager.projectTrusted and reloads settings for that trust state.
+		const stopSettingsTiming = measureTiming("settings reload", "resources");
 		await this.settingsManager.reload();
+		stopSettingsTiming();
+		const stopResolveTiming = measureTiming("packageManager resolve", "resources");
 		const resolvedPaths = await this.packageManager.resolve();
+		stopResolveTiming();
 		const cliExtensionPaths = await this.packageManager.resolveExtensionSources(this.additionalExtensionPaths, {
 			temporary: true,
 		});
@@ -715,6 +722,9 @@ export class DefaultResourceLoader implements ResourceLoader {
 			.filter((source) => existsSync(source))
 			.map((source) => resolvePath(source));
 		this.loaded = true;
+		// Capture resources + extensions here: `printTimings()` only runs before
+		// `interactiveMode.run()`, so /new, /resume and /reload after start would go unseen.
+		flushTimings(["resources", "extensions"]);
 	}
 
 	private async loadCurrentExtensionSet(options: { includeInlineFactories: boolean }): Promise<LoadExtensionsResult> {
@@ -886,6 +896,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	private updateSkillsFromPaths(skillPaths: string[], metadataByPath?: Map<string, PathMetadata>): void {
+		const stopSkillsTiming = measureTiming("skills scan", "resources");
 		let skillsResult: { skills: Skill[]; diagnostics: ResourceDiagnostic[] };
 		if (this.noSkills && skillPaths.length === 0) {
 			skillsResult = { skills: [], diagnostics: [] };
@@ -906,9 +917,11 @@ export class DefaultResourceLoader implements ResourceLoader {
 				this.getDefaultSourceInfoForPath(skill.filePath),
 		}));
 		this.skillDiagnostics = resolvedSkills.diagnostics;
+		stopSkillsTiming();
 	}
 
 	private updatePromptsFromPaths(promptPaths: string[], metadataByPath?: Map<string, PathMetadata>): void {
+		const stopPromptsTiming = measureTiming("prompts scan", "resources");
 		let promptsResult: { prompts: PromptTemplate[]; diagnostics: ResourceDiagnostic[] };
 		if (this.noPromptTemplates && promptPaths.length === 0) {
 			promptsResult = { prompts: [], diagnostics: [] };
@@ -934,9 +947,11 @@ export class DefaultResourceLoader implements ResourceLoader {
 				this.getDefaultSourceInfoForPath(prompt.filePath),
 		}));
 		this.promptDiagnostics = resolvedPrompts.diagnostics;
+		stopPromptsTiming();
 	}
 
 	private updateThemesFromPaths(themePaths: string[], metadataByPath?: Map<string, PathMetadata>): void {
+		const stopThemesTiming = measureTiming("themes", "resources");
 		let themesResult: { themes: Theme[]; diagnostics: ResourceDiagnostic[] };
 		if (this.noThemes && themePaths.length === 0) {
 			themesResult = { themes: [], diagnostics: [] };
@@ -961,6 +976,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			return theme;
 		});
 		this.themeDiagnostics = resolvedThemes.diagnostics;
+		stopThemesTiming();
 	}
 
 	private applyExtensionSourceInfo(extensions: Extension[], metadataByPath: Map<string, PathMetadata>): void {

@@ -5,6 +5,7 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
+import { writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
 import { setCapabilityOverrides } from "@earendil-works/pi-tui";
@@ -1018,6 +1019,25 @@ export async function main(args: string[], options?: MainOptions) {
 	time("createAgentSessionRuntime");
 	const { services, session, modelFallbackMessage } = runtime;
 	const { settingsManager, modelRuntime, resourceLoader } = services;
+	// Mechanical extension-result snapshot for perf work (LI_EXT_SNAPSHOT=<file>): serialize
+	// paths/errors/tool+command counts so refactor diffs compare content, not timing.
+	const snapshotPath = process.env.LI_EXT_SNAPSHOT;
+	delete process.env.LI_EXT_SNAPSHOT;
+	if (snapshotPath) {
+		const extensionsResult = resourceLoader.getExtensions();
+		const snapshot = {
+			extensions: extensionsResult.extensions.map((extension) => ({
+				path: extension.path,
+				resolvedPath: extension.resolvedPath,
+				tools: [...extension.tools.keys()].sort(),
+				commands: [...extension.commands.keys()].sort(),
+				flags: [...extension.flags.keys()].sort(),
+			})),
+			errors: extensionsResult.errors,
+			warnings: extensionsResult.warnings ?? [],
+		};
+		writeFileSync(snapshotPath, `${JSON.stringify(snapshot, null, "\t")}\n`);
+	}
 	// Mutating session metadata is delayed until AgentSession has acquired the
 	// strict writer lease and installed its composite SessionManager write gate.
 	if (sessionNameToApply !== undefined) sessionManager.appendSessionInfo(sessionNameToApply);
