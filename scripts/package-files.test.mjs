@@ -79,6 +79,16 @@ test("clean allows nested dist and .eval targets across packages", (t) => {
 	assert.equal(run(join(root, "packages", "x"), "clean", "dist").status, 0);
 });
 
+test("clean dist still passes when copy-assets parked a package.json inside dist", (t) => {
+	const root = packageSandbox(t);
+	const x = join(root, "packages", "x");
+	// copy-binary-assets copies package.json into dist; the guard must not
+	// anchor its boundary on that copy.
+	writeFileSync(join(x, "dist", "package.json"), "{}", "utf8");
+	assert.equal(run(x, "clean", "dist").status, 0);
+	assert.equal(existsSync(join(x, "dist")), false);
+});
+
 test("clean is idempotent on missing targets", (t) => {
 	const root = packageSandbox(t);
 	const x = join(root, "packages", "x");

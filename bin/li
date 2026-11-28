@@ -90,9 +90,16 @@ li_journal() {
 	li_journal_file=${LI_BUILD_JOURNAL:-$LI_DEFAULT_JOURNAL}
 	li_journal_dir=$(dirname -- "$li_journal_file")
 	li_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || li_ts=unknown-time
+	# JSON-escape backslash and double quote so paths with either cannot break
+	# the JSON line (sh has no JSON encoder of its own).
+	li_escape() {
+		printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\\\"/g'
+	}
+	li_root_json=$(li_escape "$LI_ROOT")
+	li_detail_json=$(li_escape "$2")
 	if [ -d "$li_journal_dir" ] || mkdir -p -- "$li_journal_dir" 2>/dev/null; then
 		printf '{"schemaVersion":1,"ts":"%s","kind":"%s","pid":%s,"liRoot":"%s","detail":"%s"}\n' \
-			"$li_ts" "$1" "$$" "$LI_ROOT" "$2" >>"$li_journal_file" 2>/dev/null || true
+			"$li_ts" "$1" "$$" "$li_root_json" "$li_detail_json" >>"$li_journal_file" 2>/dev/null || true
 	fi
 }
 
@@ -140,11 +147,20 @@ li_lock_owner_state() {
 		case "${li_owner_pid:-}" in
 			''|*[!0-9]*) ;;
 			*)
+				li_alive=0
 				if kill -0 "$li_owner_pid" 2>/dev/null; then
+					li_alive=1
+				elif ps -p "$li_owner_pid" >/dev/null 2>&1; then
+					# EPERM: the process exists but cannot be signalled — alive.
+					li_alive=1
+				fi
+				if [ "$li_alive" -eq 1 ]; then
 					li_owner_start=$("$NODE_BIN" -p 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).start' "$li_owner_file" 2>/dev/null) || li_owner_start=
 					li_now_start=$(ps -o lstart= -p "$li_owner_pid" 2>/dev/null) || li_now_start=
 					if [ -n "${li_owner_start:-}" ] && [ -n "${li_now_start:-}" ]; then
 						if [ "$li_now_start" = "$li_owner_start" ]; then li_state=alive; else li_state=stale; fi
+					else
+						li_state=alive
 					fi
 				else
 					li_state=stale

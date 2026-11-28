@@ -213,10 +213,10 @@ function appendJournal(fields) {
 	}
 }
 
-function failFaultedBuild(stage, detail) {
+function failFaultedBuild(stage, detail, injected = true) {
 	const exitCode = faultExitCodes[stage];
-	appendJournal({ kind: "fail", stage, exitCode, attemptId, detail });
-	console.error(`[bundle] injected fault ${stage}: exiting ${exitCode} (${detail})`);
+	appendJournal({ kind: "fail", stage, exitCode, attemptId, detail: `${injected ? "injected" : "real"}: ${detail}` });
+	console.error(`[bundle] ${injected ? "injected fault" : "build failed"} ${stage}: exiting ${exitCode} (${detail})`);
 	process.exit(exitCode);
 }
 
@@ -245,14 +245,26 @@ function readLockOwner() {
 // "stale" = owner pid is dead, or a different process reused the pid
 // (start-time mismatch). Unreadable start-time, empty recorded start, or a
 // cross-format start (sh lstart vs Windows FileTime) fails safe to alive.
+// EPERM from kill(pid, 0) means the process EXISTS but cannot be signalled:
+// that is alive, never stale. An ownerless lock older than the grace period
+// is stale (nothing will ever write owner.json for it again).
+const lockUnknownGraceMs = 10 * 60 * 1000;
 function lockState() {
 	const owner = readLockOwner();
-	if (!owner || typeof owner.pid !== "number" || owner.pid <= 0) return "unknown";
+	if (!owner || typeof owner.pid !== "number" || owner.pid <= 0) {
+		try {
+			if (Date.now() - statSync(lockDir).mtimeMs > lockUnknownGraceMs) return "stale";
+		} catch {}
+		return "unknown";
+	}
 	let alive = false;
 	try {
 		process.kill(owner.pid, 0);
 		alive = true;
-	} catch {}
+	} catch (error) {
+		// EPERM: the pid exists but we lack permission to signal it — alive.
+		alive = error.code === "EPERM";
+	}
 	if (!alive) return "stale";
 	const start = processStartTime(owner.pid);
 	if (start === null) return "alive";
@@ -307,7 +319,10 @@ function sweepStaleStaging() {
 			try {
 				process.kill(pid, 0);
 				alive = true;
-			} catch {}
+			} catch (error) {
+				// EPERM: the pid exists but cannot be signalled — do not delete.
+				alive = error.code === "EPERM";
+			}
 			if (alive) continue;
 		}
 		rmSync(join(codingAgentDistDir, name), { recursive: true, force: true });
@@ -548,7 +563,7 @@ try {
 } catch (error) {
 	if (fault === "swap3") {
 		// Injected rollback failure: the old marker keeps the live bundle.
-		failFaultedBuild("swap3", "injected rollback failure");
+		failFaultedBuild("swap3", "injected rollback failure", true);
 	}
 	let rollbackFailed = false;
 	if (hadLiveBundle && existsSync(oldDir) && !existsSync(bundleDir)) {
@@ -559,18 +574,24 @@ try {
 		}
 	}
 	if (rollbackFailed) {
-		failFaultedBuild("swap3", `rollback failed: ${error instanceof Error ? error.message : String(error)}`);
+		failFaultedBuild("swap3", `rollback failed: ${error instanceof Error ? error.message : String(error)}`, false);
 	}
-	failFaultedBuild("swap1", `swap failed, bundle kept: ${error instanceof Error ? error.message : String(error)}`);
+	failFaultedBuild("swap1", `swap failed, bundle kept: ${error instanceof Error ? error.message : String(error)}`, fault !== "");
 }
 
 if (fault === "promote") {
-	failFaultedBuild("promote", "exited after the swap, before receipt promote");
+	failFaultedBuild("promote", "exited after the swap, before receipt promote", true);
 }
 
 // Two-phase receipt: the candidate provenance was parked as .tmp pre-swap;
-// only now that the staging is live does it become the receipt of record.
-renameSync(receiptTmpPath, receiptPath);
+// only now that the staging is live does it become the receipt of record. A
+// real promote failure leaves live=new bytes with the old receipt — the next
+// build-li heals the receipt from live.
+try {
+	renameSync(receiptTmpPath, receiptPath);
+} catch (error) {
+	failFaultedBuild("promote", `receipt promote failed (live=new, receipt=old, next build heals): ${error instanceof Error ? error.message : String(error)}`, false);
+}
 const oscPatchReceipt = {
 	schemaVersion: 1,
 	runtime: "li",

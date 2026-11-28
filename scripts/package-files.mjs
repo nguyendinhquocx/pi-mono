@@ -38,10 +38,15 @@ switch (command) {
 }
 
 // Nearest ancestor (starting at the target itself) that holds a package.json.
+// Directories named dist/.eval are skipped as anchors: copy-assets can place a
+// copy of package.json inside <package>/dist, and anchoring there would make
+// the boundary [<dist>/dist, <dist>/.eval] which refuses the real clean calls.
 function findPackageRoot(fromPath) {
 	let current = fromPath;
 	while (true) {
-		if (existsSync(join(current, "package.json"))) return current;
+		const dirName = basename(current).toLowerCase();
+		const isBuildOutputDir = dirName === "dist" || dirName === ".eval";
+		if (!isBuildOutputDir && existsSync(join(current, "package.json"))) return current;
 		const parent = dirname(current);
 		if (parent === current) return null;
 		current = parent;

@@ -178,14 +178,26 @@ function readLockOwner() {
 // "stale" = owner pid is dead, or a different process reused the pid
 // (start-time mismatch). Unreadable start-time, empty recorded start, or a
 // cross-format start (sh lstart vs Windows FileTime) fails safe to alive.
+// EPERM from kill(pid, 0) means the process EXISTS but cannot be signalled:
+// that is alive, never stale. An ownerless lock older than the grace period
+// is stale (nothing will ever write owner.json for it again).
+const lockUnknownGraceMs = 10 * 60 * 1000;
 function lockState() {
 	const owner = readLockOwner();
-	if (!owner || typeof owner.pid !== "number" || owner.pid <= 0) return "unknown";
+	if (!owner || typeof owner.pid !== "number" || owner.pid <= 0) {
+		try {
+			if (Date.now() - statSync(lockDir).mtimeMs > lockUnknownGraceMs) return "stale";
+		} catch {}
+		return "unknown";
+	}
 	let alive = false;
 	try {
 		process.kill(owner.pid, 0);
 		alive = true;
-	} catch {}
+	} catch (error) {
+		// EPERM: the pid exists but we lack permission to signal it — alive.
+		alive = error.code === "EPERM";
+	}
 	if (!alive) return "stale";
 	const start = processStartTime(owner.pid);
 	if (start === null) return "alive";
@@ -241,7 +253,10 @@ function sweepStaleStaging() {
 			try {
 				process.kill(pid, 0);
 				alive = true;
-			} catch {}
+			} catch (error) {
+				// EPERM: the pid exists but cannot be signalled — do not delete.
+				alive = error.code === "EPERM";
+			}
 			if (alive) continue;
 		}
 		rmSync(join(codingAgentDistDir, name), { recursive: true, force: true });
@@ -290,7 +305,23 @@ function readReceiptTmp() {
 }
 
 function writeReceipt(record) {
-	writeFileSync(receiptPath, `${JSON.stringify(record, null, "\t")}\n`, "utf8");
+	// Atomic by design: write a side temp then rename, so a crash can never
+	// leave a truncated receipt at the path `li --version` reads. The temp uses
+	// a heal/record-specific suffix so it can never be mistaken for the
+	// bundler's protocol temp (li-build-receipt.json.tmp).
+	const writeTmp = `${receiptPath}.heal.tmp`;
+	writeFileSync(writeTmp, `${JSON.stringify(record, null, "\t")}\n`, "utf8");
+	renameSync(writeTmp, receiptPath);
+}
+
+// Corrupt or missing receipts are treated the same way: "no usable receipt",
+// so recovery heals from the live bundle instead of dead-looping.
+function readReceiptSafe() {
+	try {
+		return JSON.parse(readFileSync(receiptPath, "utf8"));
+	} catch {
+		return null;
+	}
 }
 
 // Heal the receipt from the live bundle when no provenance can be proven:
@@ -323,18 +354,18 @@ function writeHealedReceipt(artifact) {
 // bytes stays untouched (byte-identical rebuilds must not "heal" it); a stale
 // or missing receipt is healed from the live bundle with provenance unknown.
 function reconcileReceiptWithLive(liveArtifact, contextDetail, notes) {
-	if (existsSync(receiptPath)) {
-		const kept = JSON.parse(readFileSync(receiptPath, "utf8"));
-		if (kept.artifactHash === liveArtifact.aggregateHash) {
-			appendJournal({
-				kind: "receipt-heal",
-				artifactHash: liveArtifact.aggregateHash,
-				gitShortSha: kept.gitShortSha ?? null,
-				gitDirty: kept.gitDirty ?? null,
-				detail: `${contextDetail}; receipt kept`,
-			});
-			return;
-		}
+	// A corrupt receipt reads as null: it cannot prove the live bytes, so it is
+	// overwritten by the heal write below instead of dead-looping every build.
+	const kept = readReceiptSafe();
+	if (kept && kept.artifactHash === liveArtifact.aggregateHash) {
+		appendJournal({
+			kind: "receipt-heal",
+			artifactHash: liveArtifact.aggregateHash,
+			gitShortSha: kept.gitShortSha ?? null,
+			gitDirty: kept.gitDirty ?? null,
+			detail: `${contextDetail}; receipt kept`,
+		});
+		return;
 	}
 	writeHealedReceipt(liveArtifact);
 	appendJournal({
@@ -342,7 +373,7 @@ function reconcileReceiptWithLive(liveArtifact, contextDetail, notes) {
 		artifactHash: liveArtifact.aggregateHash,
 		gitShortSha: null,
 		gitDirty: null,
-		detail: `${contextDetail}; ${existsSync(receiptPath) ? "stale receipt" : "receipt missing"} healed from live`,
+		detail: `${contextDetail}; ${kept ? "stale receipt" : kept === null && existsSync(receiptPath) ? "corrupt receipt" : "receipt missing"} healed from live`,
 	});
 	notes.push("receipt healed from live");
 }
@@ -431,27 +462,35 @@ function recoverAndHeal() {
 
 const options = parseArgs(process.argv.slice(2));
 
-if (options.recordTests) {
-	if (!existsSync(receiptPath)) fail(`Receipt not found: ${receiptPath}. Build first.`);
-	const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
-	let testResults;
-	try {
-		testResults = JSON.parse(readFileSync(options.recordTests, "utf8"));
-	} catch (error) {
-		fail(`Could not read test results ${options.recordTests}: ${error.message}`);
-	}
-	receipt.testOutputs = testResults;
-	receipt.testOutputsRecordedAt = new Date().toISOString();
-	writeReceipt(receipt);
-	process.exit(0);
-}
-
 if (!existsSync(join(repoRoot, "node_modules"))) {
 	fail("node_modules is missing at the Li worktree root. Run: npm ci --ignore-scripts");
 }
 
 acquireLock();
 try {
+	if (options.recordTests) {
+		// Inside the lock: this writes the receipt, so it must not race a build.
+		// failRecord releases the lock explicitly: fail() exits the process and
+		// skips this scope's finally.
+		const failRecord = (message) => {
+			releaseLock();
+			fail(message);
+		};
+		const receipt = readReceiptSafe();
+		if (!receipt) failRecord(`Receipt not found or unreadable: ${receiptPath}. Build first.`);
+		let testResults;
+		try {
+			testResults = JSON.parse(readFileSync(options.recordTests, "utf8"));
+		} catch (error) {
+			failRecord(`Could not read test results ${options.recordTests}: ${error.message}`);
+		}
+		receipt.testOutputs = testResults;
+		receipt.testOutputsRecordedAt = new Date().toISOString();
+		writeReceipt(receipt);
+		releaseLock();
+		process.exit(0);
+	}
+
 	appendJournal({ kind: "started", detail: options.offline ? "build started (--offline)" : "build started" });
 
 	let notes;
@@ -484,7 +523,10 @@ try {
 		failAfterStart(`Bundle build did not produce ${join(bundleDir, "cli.js")}`);
 	}
 
-	const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
+	const receipt = readReceiptSafe();
+	if (!receipt) {
+		failAfterStart(`Bundler promoted an unreadable receipt at ${receiptPath}`);
+	}
 	appendJournal({
 		kind: "ok",
 		attemptId: receipt.attemptId,

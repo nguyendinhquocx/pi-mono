@@ -74,7 +74,7 @@ goto :no_build
 :restore_ok
 if exist "%LI_TMP_RECEIPT%" del /f /q "%LI_TMP_RECEIPT%" >nul 2>nul
 call :journal recovered "restored %LI_BEST_OLD%"
-for /f "delims=" %%D in ('dir /b /ad "%LI_DIST_DIR%undle.old-*" 2^>nul') do rd /s /q "%LI_DIST_DIR%\%%D" >nul 2>nul
+for /f "delims=" %%D in ('dir /b /ad "%LI_DIST_DIR%bundle.old-*" 2^>nul') do rd /s /q "%LI_DIST_DIR%\%%D" >nul 2>nul
 call :release_lock
 goto :cli_ready
 

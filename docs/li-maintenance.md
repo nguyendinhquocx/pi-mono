@@ -175,6 +175,12 @@ Take-over stale lock (launcher lẫn build-li) là rm-then-mkdir không atomic: 
 stale có thể đua re-acquire trong ms — hậu quả bounded (rename nguyên tử, một bên thắng, bên kia
 báo lỗi sạch); chấp nhận cho quy mô 1 máy 1 user, đừng chủ động đua lock.
 
+Known limitations (defer, không code): (F9) POSIX `ps -o lstart=` chỉ có độ phân giải 1 giây —
+PID reuse trong cùng giây không bị phát hiện (window 1s, chấp nhận); (F11) sh launcher dùng file
+tạm cố định `%TEMP%/li-lock-state.tmp` — hai launcher sh chạy ĐỒNG THỜI đúng khoảnh khắc check
+stale có thể đọc lẫn output (window ms, hậu quả chỉ là state đọc sai 1 lần, vòng wait kế tự chốt
+lại).
+
 ### M2 — source-tree wipe (tracked files), KHÁC hoàn toàn P1
 
 Nếu `git status --porcelain` thấy hàng loạt dòng ` D` (tracked file mất loạt — kiểu vụ 929 file
