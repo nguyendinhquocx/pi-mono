@@ -259,9 +259,11 @@ function lockState() {
 }
 
 function acquireBundleLock() {
+	mkdirSync(codingAgentDistDir, { recursive: true });
 	for (let attempt = 0; attempt < 25; attempt++) {
 		try {
-			mkdirSync(lockDir, { recursive: true });
+			// Non-recursive on purpose: EEXIST is the signal that someone holds it.
+			mkdirSync(lockDir);
 			writeFileSync(
 				join(lockDir, "owner.json"),
 				`${JSON.stringify({ pid: process.pid, start: processStartTime(process.pid) ?? "" })}\n`,
