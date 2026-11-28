@@ -17,7 +17,9 @@ Li đã build.
 | ProDesk user-local install | `~/.local/prodesk-li/{releases,current,bin}`; stable `bin/li` trỏ theo Li `current` |
 | ProDesk user command | `~/.local/prodesk-li/bin/li`; `~/.local/bin/li` là symlink tùy chọn, không tự sửa shell profile |
 | Li CLI entry | `packages/coding-agent/dist/bundle/cli.js` (generated) |
-| Build receipt | `packages/coding-agent/dist/li-build-receipt.json` (generated) |
+| Build receipt | `packages/coding-agent/dist/li-build-receipt.json` (generated; bundler ghi 2 pha qua `.tmp`) |
+| Build journal | `~/.pi/agent/li-build-journal.jsonl` (ngoài repo, override `LI_BUILD_JOURNAL`) |
+| Build lock | `packages/coding-agent/dist/.bundle-lock` (mkdir lock; xoá tay chỉ khi chắc chắn không build) |
 | Profile dùng chung | `~/.pi/agent` (`configDir` giữ `.pi`; Pi và Li chia sẻ, gồm cả `tuiMode`) |
 | Li TUI mặc định | quiet, borderless; mọi trạng thái chạy (working/compaction/retry/bash/modal) pulse `.` `..` `...`; input theo sát transcript, tới đáy khi regular scrollback lấp viewport |
 | Li selection + prompt | `/resume` và `/tree` chọn bằng `→` + chữ đậm, không nền; prompt user nhập hiển thị bold italic trong `blank` style |
@@ -44,9 +46,15 @@ chấp nhận khi residual failures rơi đúng các nhóm trên và `npm run ch
 Sau khi sửa test count, merge summary vào receipt:
 `node scripts/build-li.mjs --record-tests <test-summary.json>`.
 
-`build-li.mjs` ghi receipt với: full HEAD SHA, base Pi version, source tree hash, Node version,
-artifact hash. Trước khi hash, build neutralize `TERMINAL_COLOR_QUERY` ngay trong Li bundle và ghi
-`li-osc-patch-receipt.json` với SHA trước/sau; runtime guard không cần vá bundle Li lúc mở session.
+`build-li.mjs` điều phối, nhưng bundler (`build-coding-agent-bundle.mjs`) mới là nơi ghi receipt 2 pha:
+esbuild chạy vào `dist/bundle.staging.<attemptId>` (attemptId = epoch-ms zero-pad 13 + pid), OSC
+patch + hash chạy trên staging, receipt đầy đủ (full HEAD SHA, base Pi version, source tree hash,
+Node version, artifact hash, attemptId) được park vào `dist/li-build-receipt.json.tmp` TRƯỚC swap,
+chỉ rename thành `li-build-receipt.json` sau khi staging đã lên live. Mọi failure giữ bundle cũ
+nguyên (fail-closed); swap crash để lại `bundle.old-<attemptId>` cho launcher/build-li recovery.
+Mỗi build/missing event append 1 dòng JSON vào build journal (xem section bên dưới).
+OSC patch `TERMINAL_COLOR_QUERY` chạy trên staging trước khi hash, và `li-osc-patch-receipt.json`
+ghi sau promote; runtime guard không cần vá bundle Li lúc mở session.
 `li --version` đọc receipt này (`li <base-version> (source <short-sha>)`).
 Resume tool-loadout + EP routing integration smoke nằm ở Python repo `tests/super-parent/resume-tool-loadout-smoke.ps1`; nó rebuild Li, nạp extension closure vào profile tạm và chỉ dùng provider/WezTerm giả. Chạy từ Python repo: `powershell -NoProfile -File tests/super-parent/resume-tool-loadout-smoke.ps1 -LiRepo ..\pi-mono-li -ExtensionSource app_presets\pi\extensions`; evidence vào `tests/artifacts/resume-tool-loadout-smoke`.
 Trước lần boot đầu trên profile thật, snapshot `.pi` xong phải rebuild kèm snapshot ID để provenance
@@ -69,6 +77,111 @@ trong khi registry (`~/.pi/agent/session-open-leases/registry.json`) chỉ appro
 tree sạch → `build-li.mjs` → backup `registry.json` + `t20-canary-receipt.json` thành `*.bak` →
 ghi receipt mới (decision approved, artifactHash mới, supersedes build cũ) → cập nhật
 `t20_receipt_sha256` + `approved_builds` → verify `li --version` khớp receipt.
+
+## Bundle resilience: journal, recovery, audit SACL (P3), source-wipe (M2)
+
+Từ SPEC-2026-11-28, build Li là fail-closed: build fail/interrupt ở bước nào cũng giữ bundle cũ
+nguyên; không còn cửa sổ "rmSync dist/bundle rồi esbuild chết giữa chừng" làm `li` chết tới khi
+build lại thành công.
+
+### Build journal — vị trí, schema, cách đọc khi xử sự cố
+
+- Vị trí: `~/.pi/agent/li-build-journal.jsonl` (ngoài repo, sống qua mọi lần dist bị xoá);
+  override bằng env `LI_BUILD_JOURNAL`. Append-only, mỗi event 1 dòng JSON.
+- Ai ghi: `build-li.mjs` (`started`/`ok`/`fail` crash), bundler (`fail` fault-inject), `bin/li` +
+  `bin/li.cmd` (`recovered`/`missing-detected` khi user chạy `li` mà bundle thiếu).
+- Schema (cột "khi nào" cho biết field nào xuất hiện ở kind nào):
+
+| Field | Khi nào | Ý nghĩa |
+|---|---|---|
+| `schemaVersion` | luôn | `1` |
+| `ts` | luôn | ISO 8601 UTC, sortable |
+| `kind` | luôn | `started`\|`fail`\|`ok`\|`recovered`\|`receipt-heal`\|`missing-detected` |
+| `pid` | luôn | pid của process ghi entry |
+| `liRoot` | luôn | checkout root — phân biệt nhiều variant pi-mono-li |
+| `attemptId` | khi có | `<epochMs zero-pad 13>-<pid>` của build |
+| `stage` + `exitCode` | fail/crash | `esbuild`\|`swap1`\|`swap2`\|`promote`\|`swap3`\|`pretmp`\|`crash` + mã exit |
+| `artifactHash` + `gitShortSha` + `gitDirty` | ok/heal | provenance của artifact đang live |
+| `detail` | luôn | ASCII ≤200 ký tự: tên old marker, lý do |
+
+- Cách agent đọc khi xử sự cố "Li chết": đọc ngược journal, timeline điển hình là
+  `started → fail/crash → missing-detected → recovered` — đủ biết lúc nào build chết, bundle mất
+  lúc nào được phát hiện, và đã tự hồi phục chưa. Fault-inject test dùng env `LI_BUNDLE_FAULT`
+  (`esbuild`\|`swap1`\|`swap2`\|`swap3`\|`pretmp`\|`promote` → exit 64/65/66/68/69/67; unset = no-op,
+  NHỚ clear giữa các case).
+- Journal là best-effort (kill đúng lúc ghi / path không ghi được → entry mất); không dùng làm audit
+  bắt thủ phạm xoá file — phần đó là SACL (P3) bên dưới.
+
+### Hai đường recovery + receipt 2 pha
+
+- **Launcher (`li` thường)**: check `cli.js` TRƯỚC nhánh `--version`. Bundle còn → chạy bình thường,
+  kể cả lúc build đang giữ lock. Bundle thiếu → thử lấy lock: lấy được → restore
+  `bundle.old-<attemptId>` mới nhất (có `cli.js`), xoá `li-build-receipt.json.tmp`, journal
+  `recovered`, nhả lock. Lock bị giữ → chờ bounded 3×1s; builder sống → journal
+  `missing-detected` + lỗi "build đang chạy" (false-negative có chủ đích ở đúng cửa sổ swap
+  ms-level, hiếm — chạy lại `li` là xong); lock stale (pid chết hoặc pid bị reuse, start-time
+  khác) → take over rồi restore như trên.
+- **build-li (đầu mỗi lượt, trong lock)**: bundle thiếu + marker có `cli.js` → restore + journal
+  `recovered`; `li-build-receipt.json.tmp` chỉ được promote khi đủ 3 điều kiện: (1) KHÔNG vừa
+  restore old, (2) tồn tại marker `bundle.old-<tmp.attemptId>` ĐÚNG tên, (3) hash tmp khớp
+  `hashTree(bundle live)`. Thiếu bất kỳ → DISCARD tmp; receipt cũ mô tả đúng byte live thì GIỮ
+  NGUYÊN, sai/missing thì heal theo live với `healed:true, provenanceSource:'heal', git fields null`.
+- **Receipt 2 pha**: receipt.tmp chứa provenance đầy đủ của candidate, chỉ thành receipt chính thức
+  sau promote. `li` thường chỉ chạy bundle, KHÔNG heal receipt. Launcher restore old → tmp bị xoá →
+  receipt có thể stale mô tả artifact cũ tới khi build-li kế heal THEO LIVE — đừng mặc định receipt
+  cũ đúng. `li --version` đọc receipt-only: trong cửa sổ receipt-stale có thể in version cũ; receipt
+  healed thì in `source ?` — chấp nhận để giữ startup lean.
+- Stale marker/marker consumed dư (`bundle.old-consumed-*`) được build-li kế dọn + ghi journal; đừng
+  xoá tay trong lúc build đang chạy.
+
+### P3 — audit SACL bắt thủ phạm xoá file (chỉ bật khi cần điều tra)
+
+USN journal KHÔNG chứa PID/process — đừng kỳ vọng vào nó. Muốn biết AI/process nào xoá file trong
+`packages/coding-agent` (kể cả `dist`), bật File System auditing tường minh theo ĐỦ vòng đời
+ON → thu evidence → OFF:
+
+1. Tăng Security log size TRƯỚC khi bật (Event 4663 rất ồn với `dist`):
+   `wevtutil sl Security /ms:268435456`
+2. Bật audit policy (admin):
+   `auditpol /set /subcategory:"File System" /success:enable`
+3. Set SACL Audit rule Delete cho source + dist (admin PowerShell, inheritance cho cả cây):
+   ```
+   $paths = 'packages/coding-agent/src','packages/coding-agent/test','packages/coding-agent/examples','packages/coding-agent/docs','packages/coding-agent/dist'
+   $paths | ForEach-Object {
+     $p = Resolve-Path $_
+     $acl = Get-Acl $p
+     $rule = New-Object System.Security.AccessControl.FileSystemAuditRule('Everyone','Delete','ContainerInherit,ObjectInherit','None','Success')
+     $acl.AddAuditRule($rule)
+     Set-Acl $p $acl
+   }
+   ```
+4. Thu evidence: correlate Event 4663 (Delete, có `ProcessName` + `ObjectName`) với Event 4660
+   qua `HandleId` — 4660 KHÔNG có ObjectName. Ví dụ lọc 1 dòng:
+   `Get-WinEvent -FilterHashtable @{LogName='Security';Id=4663} | Where-Object { $_.Message -match 'coding-agent' } | Select-Object TimeCreated, Message | Format-List`
+5. OFF khi xong (bắt buộc — log volume lớn): remove SACL rule tương tự với
+   `$acl.RemoveAuditRule($rule)` cho từng path, rồi
+   `auditpol /set /subcategory:"File System" /success:disable`.
+
+### Publish flow — downtime chấp nhận có chủ đích
+
+`prepublishOnly` và root `clean --workspaces` xoá cả `dist` (gồm live bundle + lock). Đây là
+downtime CHẤP NHẬN — KHÔNG nằm trong cam kết fail-safe của cơ chế trên. Quy ước: đừng interrupt
+giữa clean và build; đừng chạy clean concurrent với build. `clean` giờ chỉ xoá trong
+`<package>/dist`/`.eval` (guard + `--force` để thoát có log); mutation ngoài boundary bị refuse.
+
+### M2 — source-tree wipe (tracked files), KHÁC hoàn toàn P1
+
+Nếu `git status --porcelain` thấy hàng loạt dòng ` D` (tracked file mất loạt — kiểu vụ 929 file
+sáng 28/11):
+
+```
+git status --porcelain | head -30
+git restore .
+```
+
+`git restore .` khôi phục tracked files; `dist/` gitignored nên không bị đụng — bundle live và
+journal không ảnh hưởng. Đây là playbook cho source wipe; recovery bundle (`bundle.old-*`) chỉ lo
+build artifacts, không lo source.
 
 ## Cài Li side-by-side trên ProDesk Linux
 
