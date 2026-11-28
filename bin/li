@@ -74,6 +74,137 @@ if [ -z "$NODE_BIN" ]; then
 	exit 1
 fi
 
+# --- fail-closed bundle lifecycle (SPEC-2026-11-28) -------------------------
+# The bundle check runs BEFORE the --version branch: when the live bundle is
+# missing, the launcher journals missing-detected, takes the build lock and
+# restores the newest bundle.old-<attemptId> marker; while a live build holds
+# the lock it waits ~3s and fails with a journal entry instead of racing the
+# swap. Journal schema is shared verbatim with scripts/build-li.mjs.
+
+LI_DIST_DIR=$PI_PACKAGE_DIR/dist
+LI_LOCK_DIR=$LI_DIST_DIR/.bundle-lock
+LI_TMP_RECEIPT=$LI_DIST_DIR/li-build-receipt.json.tmp
+LI_DEFAULT_JOURNAL=$HOME/.pi/agent/li-build-journal.jsonl
+
+li_journal() {
+	li_journal_file=${LI_BUILD_JOURNAL:-$LI_DEFAULT_JOURNAL}
+	li_journal_dir=$(dirname -- "$li_journal_file")
+	li_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || li_ts=unknown-time
+	if [ -d "$li_journal_dir" ] || mkdir -p -- "$li_journal_dir" 2>/dev/null; then
+		printf '{"schemaVersion":1,"ts":"%s","kind":"%s","pid":%s,"liRoot":"%s","detail":"%s"}\n' \
+			"$li_ts" "$1" "$$" "$LI_ROOT" "$2" >>"$li_journal_file" 2>/dev/null || true
+	fi
+}
+
+li_release_lock() {
+	rm -rf -- "$LI_LOCK_DIR" 2>/dev/null || true
+}
+
+li_no_build_error() {
+	printf '[li] Li CLI build not found: %s\n' "$PI_CORE_CLI_PATH" >&2
+	printf '[li] Build Li first: node scripts/build-li.mjs --offline\n' >&2
+	exit 1
+}
+
+li_no_build_busy_error() {
+	printf '[li] Li CLI build not found and a build appears to be running (lock: %s).\n' "$LI_LOCK_DIR" >&2
+	printf '[li] Wait for the build to finish and run li again. Journal: %s\n' "${LI_BUILD_JOURNAL:-$LI_DEFAULT_JOURNAL}" >&2
+	exit 1
+}
+
+# Newest restorable marker: bundle.old-<13digits>-<pid> (never consumed) with
+# a cli.js inside; max attemptId wins because zero-padded string sort == time.
+li_newest_old_marker() {
+	for li_candidate in "$LI_DIST_DIR"/bundle.old-*; do
+		[ -d "$li_candidate" ] || continue
+		case "${li_candidate##*/}" in
+			bundle.old-consumed-*) continue ;;
+		esac
+		case "${li_candidate##*/bundle.old-}" in
+			[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9]*) ;;
+			*) continue ;;
+		esac
+		if [ -f "$li_candidate/cli.js" ]; then
+			printf '%s\n' "$li_candidate"
+		fi
+	done | sort -r | head -n 1
+}
+
+# Print stale|alive|unknown for the lock owner. PID reuse (same pid, different
+# start-time) counts as stale; an unreadable start-time fails safe to alive.
+li_lock_owner_state() {
+	li_owner_file=$1
+	li_state=unknown
+	if [ -f "$li_owner_file" ]; then
+		li_owner_pid=$("$NODE_BIN" -p 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).pid' "$li_owner_file" 2>/dev/null) || li_owner_pid=
+		case "${li_owner_pid:-}" in
+			''|*[!0-9]*) ;;
+			*)
+				if kill -0 "$li_owner_pid" 2>/dev/null; then
+					li_owner_start=$("$NODE_BIN" -p 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).start' "$li_owner_file" 2>/dev/null) || li_owner_start=
+					li_now_start=$(ps -o lstart= -p "$li_owner_pid" 2>/dev/null) || li_now_start=
+					if [ -n "${li_owner_start:-}" ] && [ -n "${li_now_start:-}" ]; then
+						if [ "$li_now_start" = "$li_owner_start" ]; then li_state=alive; else li_state=stale; fi
+					fi
+				else
+					li_state=stale
+				fi
+			;;
+		esac
+	fi
+	printf '%s\n' "$li_state"
+}
+
+if [ ! -f "$PI_CORE_CLI_PATH" ]; then
+	li_wait_rounds=0
+	while :; do
+		if mkdir -- "$LI_LOCK_DIR" 2>/dev/null; then
+			li_owner_start=$(ps -o lstart= -p $$ 2>/dev/null) || li_owner_start=
+			printf '{"pid":%s,"start":"%s"}\n' "$$" "${li_owner_start:-}" >"$LI_LOCK_DIR/owner.json" 2>/dev/null || true
+			li_newest_old=$(li_newest_old_marker)
+			if [ -n "${li_newest_old:-}" ] && [ ! -e "$LI_DIST_DIR/bundle" ]; then
+				if mv -- "$li_newest_old" "$LI_DIST_DIR/bundle" 2>/dev/null && [ -f "$PI_CORE_CLI_PATH" ]; then
+					rm -f -- "$LI_TMP_RECEIPT" 2>/dev/null || true
+					li_journal recovered "restored ${li_newest_old##*/}"
+				else
+					li_journal missing-detected "restore failed from ${li_newest_old##*/}"
+					li_release_lock
+					li_no_build_error
+				fi
+			elif [ -n "${li_newest_old:-}" ]; then
+				li_journal missing-detected "bundle dir exists without cli.js; refusing to restore over it"
+				li_release_lock
+				li_no_build_error
+			else
+				li_journal missing-detected "no bundle.old-* marker with cli.js"
+				li_release_lock
+				li_no_build_error
+			fi
+			li_release_lock
+			break
+		fi
+		# Lock held by someone else: bounded wait, then stale take-over or give up.
+		li_wait_rounds=$((li_wait_rounds + 1))
+		sleep 1
+		if [ -f "$PI_CORE_CLI_PATH" ]; then
+			break
+		fi
+		if [ "$li_wait_rounds" -ge 5 ]; then
+			li_journal missing-detected "bundle missing; lock unresolved after bounded wait"
+			li_no_build_busy_error
+		fi
+		if [ "$li_wait_rounds" -ge 3 ]; then
+			li_owner_state=$(li_lock_owner_state "$LI_LOCK_DIR/owner.json")
+			if [ "$li_owner_state" = "stale" ]; then
+				li_release_lock
+				continue
+			fi
+			li_journal missing-detected "bundle missing; build in progress (lock state $li_owner_state)"
+			li_no_build_busy_error
+		fi
+	done
+fi
+
 if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-v" ]; then
 	if [ ! -r "$BUILD_RECEIPT" ]; then
 		printf '[li] Li build receipt is missing or unreadable: %s\n' "$BUILD_RECEIPT" >&2
