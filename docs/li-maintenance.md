@@ -120,7 +120,9 @@ build lại thành công.
   `recovered`, nhả lock. Lock bị giữ → chờ bounded 3×1s; builder sống → journal
   `missing-detected` + lỗi "build đang chạy" (false-negative có chủ đích ở đúng cửa sổ swap
   ms-level, hiếm — chạy lại `li` là xong); lock stale (pid chết hoặc pid bị reuse, start-time
-  khác) → take over rồi restore như trên.
+  khác) → atomic rename-takeover rồi restore; owner.json thiếu/hỏng chỉ stale khi lock dir mtime
+  quá 10 phút, lock mới vẫn fail-safe là bận. Nếu lock vừa được nhả sau lần mkdir fail cuối,
+  launcher thử mkdir/recovery thêm một lần thay vì báo bận oan.
 - **build-li (đầu mỗi lượt, trong lock)**: bundle thiếu + marker có `cli.js` → restore + journal
   `recovered`; `li-build-receipt.json.tmp` chỉ được promote khi đủ 3 điều kiện: (1) KHÔNG vừa
   restore old, (2) tồn tại marker `bundle.old-<tmp.attemptId>` ĐÚNG tên, (3) hash tmp khớp
@@ -171,9 +173,11 @@ giữa clean và build; đừng chạy clean concurrent với build. `clean` gi�
 Tương tự: CẤM chạy `build-li --record-tests` khi một build đang giữ lock — nó ghi receipt ngoài
 protocol lock (race thấp nhưng thật; chờ build xong rồi chạy).
 
-Take-over stale lock (launcher lẫn build-li) là rm-then-mkdir không atomic: hai process cùng thấy
-stale có thể đua re-acquire trong ms — hậu quả bounded (rename nguyên tử, một bên thắng, bên kia
-báo lỗi sạch); chấp nhận cho quy mô 1 máy 1 user, đừng chủ động đua lock.
+Take-over stale lock dùng rename nguyên tử sang tên quarantine `.bundle-lock.stale-*` rồi mới tạo
+lock mới. Hai process cùng thấy stale thì chỉ một rename được source lock cũ; bên thua thử lại,
+lấy lock nếu path đã trống hoặc thấy owner mới rồi báo build đang chạy. Không còn rm-then-mkdir hai
+owner cùng thắng. Quarantine dọn best-effort; nếu process chết sau rename, lock path vẫn trống và
+process kế tiếp tự tạo lock mới.
 
 Known limitations (defer, không code): (F9) POSIX `ps -o lstart=` chỉ có độ phân giải 1 giây —
 PID reuse trong cùng giây không bị phát hiện (window 1s, chấp nhận); (F11) sh launcher dùng file

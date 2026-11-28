@@ -202,9 +202,13 @@ function lockState() {
 	const start = processStartTime(owner.pid);
 	if (start === null) return "alive";
 	const stored = String(owner.start ?? "");
-	if (!stored) return "alive";
-	const isFileTime = (value) => /^\d{15,}$/.test(value);
-	if (isFileTime(stored) !== isFileTime(start)) return "alive";
+	const startFormat = (value) => {
+		if (/^\d{15,}$/.test(value)) return "filetime";
+		if (/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ 0-9]\d \d{2}:\d{2}:\d{2} \d{4}$/.test(value)) return "lstart";
+		return null;
+	};
+	const storedFormat = startFormat(stored);
+	if (!storedFormat || storedFormat !== startFormat(start)) return "alive";
 	return start === stored ? "alive" : "stale";
 }
 
@@ -222,7 +226,18 @@ function acquireLock() {
 		} catch (error) {
 			if (error.code !== "EEXIST") throw error;
 			if (lockState() === "stale") {
-				rmSync(lockDir, { recursive: true, force: true });
+				// Rename is the ownership election: among stale contenders, only
+				// one can move this exact lock directory out of the shared path.
+				const staleDir = `${lockDir}.stale-${String(Date.now()).padStart(13, "0")}-${process.pid}-${attempt}`;
+				try {
+					renameSync(lockDir, staleDir);
+				} catch (takeoverError) {
+					if (takeoverError.code === "ENOENT" || takeoverError.code === "EEXIST") continue;
+					throw takeoverError;
+				}
+				try {
+					rmSync(staleDir, { recursive: true, force: true });
+				} catch {}
 				continue;
 			}
 			fail(
@@ -430,7 +445,8 @@ function recoverAndHeal() {
 
 	if (!existsSync(join(bundleDir, "cli.js"))) {
 		notes.push("no live bundle before build");
-	} else if (!existsSync(receiptPath)) {
+	} else if (!readReceiptSafe()) {
+		const receiptWasPresent = existsSync(receiptPath);
 		const artifact = hashTree(bundleDir);
 		writeHealedReceipt(artifact);
 		appendJournal({
@@ -438,7 +454,7 @@ function recoverAndHeal() {
 			artifactHash: artifact.aggregateHash,
 			gitShortSha: null,
 			gitDirty: null,
-			detail: "receipt missing; healed from live bundle",
+			detail: `${receiptWasPresent ? "corrupt" : "missing"} receipt; healed from live bundle`,
 		});
 		notes.push("receipt healed from live");
 	}

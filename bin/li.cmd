@@ -43,7 +43,17 @@ set /a LI_WAIT_ROUNDS=0
 if %LI_WAIT_ROUNDS% GEQ 5 goto :recover_giveup
 md "%LI_LOCK_DIR%" >nul 2>nul
 if errorlevel 1 goto :recover_held
+goto :recover_owned
 
+:recover_giveup
+rem The builder may have released the lock just after our final failed md.
+rem Retry once only when the owner disappeared; md remains the atomic winner.
+if exist "%LI_LOCK_DIR%\owner.json" goto :recover_busy
+md "%LI_LOCK_DIR%" >nul 2>nul
+if errorlevel 1 goto :recover_busy
+goto :recover_owned
+
+:recover_owned
 rem We own the lock: record the owner, then restore the newest old marker.
 rem PS commands are chunked into short vars: cmd's label scanner misses labels
 rem that follow very long lines in LF-ended .cmd files.
@@ -74,7 +84,7 @@ goto :no_build
 :restore_ok
 if exist "%LI_TMP_RECEIPT%" del /f /q "%LI_TMP_RECEIPT%" >nul 2>nul
 call :journal recovered "restored %LI_BEST_OLD%"
-for /f "delims=" %%D in ('dir /b /ad "%LI_DIST_DIR%bundle.old-*" 2^>nul') do rd /s /q "%LI_DIST_DIR%\%%D" >nul 2>nul
+for /f "delims=" %%D in ('dir /b /ad "%LI_DIST_DIR%\bundle.old-*" 2^>nul') do rd /s /q "%LI_DIST_DIR%\%%D" >nul 2>nul
 call :release_lock
 goto :cli_ready
 
@@ -83,15 +93,26 @@ set /a LI_WAIT_ROUNDS+=1
 ping -n 2 127.0.0.1 >nul
 if exist "%PI_CORE_CLI_PATH%" goto :cli_ready
 if %LI_WAIT_ROUNDS% LSS 3 goto :recover_loop
+rem Last mkdir may have raced a release; retry only if the shared lock path is gone.
+if exist "%LI_LOCK_DIR%\owner.json" goto :recover_check_owner
+if exist "%LI_LOCK_DIR%\" goto :recover_check_owner
+md "%LI_LOCK_DIR%" >nul 2>nul
+if not errorlevel 1 goto :recover_owned
+:recover_check_owner
 call :lock_state
-if /i "%LOCK_STATE%"=="stale" (
-    rd /s /q "%LI_LOCK_DIR%" >nul 2>nul
-    goto :recover_loop
-)
+if /i "%LOCK_STATE%"=="stale" goto :recover_stale
 call :journal missing-detected "bundle missing; build in progress (lock state %LOCK_STATE%)"
 goto :no_build_busy
 
-:recover_giveup
+:recover_stale
+rem Rename elects one stale-lock taker; never delete the shared lock path.
+set "LI_STALE_LOCK_DIR=%LI_LOCK_DIR%.stale-%RANDOM%-%RANDOM%"
+move "%LI_LOCK_DIR%" "%LI_STALE_LOCK_DIR%" >nul 2>nul
+if errorlevel 1 goto :recover_loop
+rd /s /q "%LI_STALE_LOCK_DIR%" >nul 2>nul
+goto :recover_loop
+
+:recover_busy
 call :journal missing-detected "bundle missing; lock unresolved after bounded wait"
 goto :no_build_busy
 
@@ -152,7 +173,7 @@ exit /b 0
 
 :lock_state
 set "LOCK_STATE=unknown"
-set "LI_PS_L1=$state='unknown';$o=$null;try{$o=Get-Content -Raw -LiteralPath ($env:LI_LOCK_DIR+'\owner.json') | ConvertFrom-Json}catch{};"
+set "LI_PS_L1=$state='unknown';$o=$null;try{$o=Get-Content -Raw -LiteralPath ($env:LI_LOCK_DIR+'\owner.json') | ConvertFrom-Json}catch{};if(-not($o -and $o.pid)){try{$age=((Get-Date).ToUniversalTime()-(Get-Item -LiteralPath $env:LI_LOCK_DIR).LastWriteTimeUtc).TotalMinutes;if($age -gt 10){$state='stale'}}catch{}};"
 set "LI_PS_L2=if($o -and $o.pid){$alive=$false;try{Get-Process -Id $o.pid -ErrorAction Stop | Out-Null;$alive=$true}catch{};"
 set "LI_PS_L3=if(-not $alive){$state='stale'}elseif(-not $o.start){$state='alive'}else{$cur='';try{$cur=(Get-Process -Id $o.pid).StartTime.ToFileTime()}catch{};"
 set "LI_PS_L4=if((''+$cur) -notmatch '\A\d{15,}\z' -or (''+$o.start) -notmatch '\A\d{15,}\z'){$state='alive'}elseif((''+$cur) -ne (''+$o.start)){$state='stale'}else{$state='alive'}}};$state"

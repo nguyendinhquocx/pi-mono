@@ -93,7 +93,7 @@ li_journal() {
 	# JSON-escape backslash and double quote so paths with either cannot break
 	# the JSON line (sh has no JSON encoder of its own).
 	li_escape() {
-		printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\\\"/g'
+		printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 	}
 	li_root_json=$(li_escape "$LI_ROOT")
 	li_detail_json=$(li_escape "$2")
@@ -137,8 +137,25 @@ li_newest_old_marker() {
 	done | sort -r | head -n 1
 }
 
-# Print stale|alive|unknown for the lock owner. PID reuse (same pid, different
-# start-time) counts as stale; an unreadable start-time fails safe to alive.
+# POSIX `ps lstart` and Windows FileTime are different formats. Unknown or
+# cross-format timestamps fail safe to alive; only comparable values can prove
+# PID reuse. `ps lstart` itself has one-second resolution (documented in runbook).
+li_start_time_format() {
+	case "$1" in
+		''|*[!0-9]*)
+			if printf '%s\n' "$1" | grep -Eq '^(Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) ([ 0-9][0-9]) [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}$'; then
+				printf lstart
+			else
+				printf unknown
+			fi
+			;;
+		*)
+			if [ "${#1}" -ge 15 ]; then printf filetime; else printf unknown; fi
+			;;
+	esac
+}
+
+# Ownerless or unreadable locks are stale only after the same 10-minute grace as build-li.
 li_lock_owner_state() {
 	li_owner_file=$1
 	li_state=unknown
@@ -154,21 +171,65 @@ li_lock_owner_state() {
 					# EPERM: the process exists but cannot be signalled — alive.
 					li_alive=1
 				fi
-				if [ "$li_alive" -eq 1 ]; then
+				if [ "$li_alive" -eq 0 ]; then
+					li_state=stale
+				else
 					li_owner_start=$("$NODE_BIN" -p 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).start' "$li_owner_file" 2>/dev/null) || li_owner_start=
 					li_now_start=$(ps -o lstart= -p "$li_owner_pid" 2>/dev/null) || li_now_start=
-					if [ -n "${li_owner_start:-}" ] && [ -n "${li_now_start:-}" ]; then
-						if [ "$li_now_start" = "$li_owner_start" ]; then li_state=alive; else li_state=stale; fi
-					else
+					li_owner_format=$(li_start_time_format "$li_owner_start")
+					li_now_format=$(li_start_time_format "$li_now_start")
+					if [ "$li_owner_format" = unknown ] || [ "$li_owner_format" != "$li_now_format" ]; then
 						li_state=alive
+					elif [ "$li_owner_start" = "$li_now_start" ]; then
+						li_state=alive
+					else
+						li_state=stale
 					fi
-				else
-					li_state=stale
 				fi
 			;;
 		esac
 	fi
+	if [ "$li_state" = unknown ]; then
+		li_lock_dir=${li_owner_file%/*}
+		li_lock_mtime=$(stat -c %Y "$li_lock_dir" 2>/dev/null) || li_lock_mtime=$(stat -f %m "$li_lock_dir" 2>/dev/null) || li_lock_mtime=
+		li_now=$(date +%s 2>/dev/null) || li_now=
+		case "$li_lock_mtime" in ''|*[!0-9]*) li_lock_mtime= ;; esac
+		case "$li_now" in ''|*[!0-9]*) li_now= ;; esac
+		if [ -n "$li_lock_mtime" ] && [ -n "$li_now" ] && [ "$((li_now - li_lock_mtime))" -gt 600 ]; then
+			li_state=stale
+		fi
+	fi
 	printf '%s\n' "$li_state"
+}
+
+# Caller owns LI_LOCK_DIR. Write owner metadata, restore a usable marker, then release.
+li_recover_owned_lock() {
+	li_owner_start=$(ps -o lstart= -p $$ 2>/dev/null) || li_owner_start=
+	printf '{"pid":%s,"start":"%s"}\n' "$$" "${li_owner_start:-}" >"$LI_LOCK_DIR/owner.json" 2>/dev/null || true
+	li_newest_old=$(li_newest_old_marker)
+	if [ -n "${li_newest_old:-}" ] && [ ! -e "$LI_DIST_DIR/bundle" ]; then
+		if mv -- "$li_newest_old" "$LI_DIST_DIR/bundle" 2>/dev/null && [ -f "$PI_CORE_CLI_PATH" ]; then
+			rm -f -- "$LI_TMP_RECEIPT" 2>/dev/null || true
+			li_journal recovered "restored ${li_newest_old##*/}"
+			for li_stale_marker in "$LI_DIST_DIR"/bundle.old-*; do
+				[ -d "$li_stale_marker" ] || continue
+				rm -rf -- "$li_stale_marker" 2>/dev/null || true
+			done
+		else
+			li_journal missing-detected "restore failed from ${li_newest_old##*/}"
+			li_release_lock
+			li_no_build_error
+		fi
+	elif [ -n "${li_newest_old:-}" ]; then
+		li_journal missing-detected "bundle dir exists without cli.js; refusing to restore over it"
+		li_release_lock
+		li_no_build_error
+	else
+		li_journal missing-detected "no bundle.old-* marker with cli.js"
+		li_release_lock
+		li_no_build_error
+	fi
+	li_release_lock
 }
 
 if [ ! -f "$PI_CORE_CLI_PATH" ]; then
@@ -178,32 +239,7 @@ if [ ! -f "$PI_CORE_CLI_PATH" ]; then
 	li_wait_rounds=0
 	while :; do
 		if mkdir -- "$LI_LOCK_DIR" 2>/dev/null; then
-			li_owner_start=$(ps -o lstart= -p $$ 2>/dev/null) || li_owner_start=
-			printf '{"pid":%s,"start":"%s"}\n' "$$" "${li_owner_start:-}" >"$LI_LOCK_DIR/owner.json" 2>/dev/null || true
-			li_newest_old=$(li_newest_old_marker)
-			if [ -n "${li_newest_old:-}" ] && [ ! -e "$LI_DIST_DIR/bundle" ]; then
-				if mv -- "$li_newest_old" "$LI_DIST_DIR/bundle" 2>/dev/null && [ -f "$PI_CORE_CLI_PATH" ]; then
-					rm -f -- "$LI_TMP_RECEIPT" 2>/dev/null || true
-					li_journal recovered "restored ${li_newest_old##*/}"
-					for li_stale_marker in "$LI_DIST_DIR"/bundle.old-*; do
-						[ -d "$li_stale_marker" ] || continue
-						rm -rf -- "$li_stale_marker" 2>/dev/null || true
-					done
-				else
-					li_journal missing-detected "restore failed from ${li_newest_old##*/}"
-					li_release_lock
-					li_no_build_error
-				fi
-			elif [ -n "${li_newest_old:-}" ]; then
-				li_journal missing-detected "bundle dir exists without cli.js; refusing to restore over it"
-				li_release_lock
-				li_no_build_error
-			else
-				li_journal missing-detected "no bundle.old-* marker with cli.js"
-				li_release_lock
-				li_no_build_error
-			fi
-			li_release_lock
+			li_recover_owned_lock
 			break
 		fi
 		# Lock held by someone else: bounded wait, then stale take-over or give up.
@@ -212,14 +248,22 @@ if [ ! -f "$PI_CORE_CLI_PATH" ]; then
 		if [ -f "$PI_CORE_CLI_PATH" ]; then
 			break
 		fi
-		if [ "$li_wait_rounds" -ge 5 ]; then
-			li_journal missing-detected "bundle missing; lock unresolved after bounded wait"
-			li_no_build_busy_error
-		fi
 		if [ "$li_wait_rounds" -ge 3 ]; then
+			# A builder may have released the lock just after our final failed
+			# mkdir. If the shared path is now gone, retry the atomic mkdir once.
+			if [ ! -e "$LI_LOCK_DIR/owner.json" ] && [ ! -d "$LI_LOCK_DIR" ] && mkdir -- "$LI_LOCK_DIR" 2>/dev/null; then
+				li_recover_owned_lock
+				break
+			fi
 			li_owner_state=$(li_lock_owner_state "$LI_LOCK_DIR/owner.json")
 			if [ "$li_owner_state" = "stale" ]; then
-				li_release_lock
+				# Rename elects one stale-lock taker; never recursively delete the
+				# shared lock path that a new builder may already own.
+				li_stale_lock="${LI_LOCK_DIR}.stale-$$-${li_wait_rounds}"
+				if mv -- "$LI_LOCK_DIR" "$li_stale_lock" 2>/dev/null; then
+					rm -rf -- "$li_stale_lock" 2>/dev/null || true
+					continue
+				fi
 				continue
 			fi
 			li_journal missing-detected "bundle missing; build in progress (lock state $li_owner_state)"
