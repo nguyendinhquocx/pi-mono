@@ -1,10 +1,25 @@
 #!/usr/bin/env node
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { execFileSync, spawnSync } from "node:child_process";
+import {
+	appendFileSync,
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	readdirSync,
+	renameSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { isBuiltin } from "node:module";
 import { dirname, join, relative, resolve } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
+import { neutralizeLiTerminalColorQuery } from "./li-osc-patch.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
@@ -12,6 +27,15 @@ const codingAgentDir = join(repoRoot, "packages", "coding-agent");
 const aiDistDir = join(repoRoot, "packages", "ai", "dist");
 const codingAgentDistDir = join(codingAgentDir, "dist");
 const bundleDir = join(codingAgentDistDir, "bundle");
+const receiptPath = join(codingAgentDistDir, "li-build-receipt.json");
+const receiptTmpPath = `${receiptPath}.tmp`;
+const lockDir = join(codingAgentDistDir, ".bundle-lock");
+const journalPath = process.env.LI_BUILD_JOURNAL || join(homedir(), ".pi", "agent", "li-build-journal.jsonl");
+// Injected failure points (LI_BUNDLE_FAULT), used only for verify runs; unset
+// means a normal build. Exit codes are part of the build-li contract.
+const faultExitCodes = { esbuild: 64, swap1: 65, swap2: 66, promote: 67, swap3: 68, pretmp: 69 };
+const fault = process.env.LI_BUNDLE_FAULT ?? "";
+const stagingPrefix = "bundle.staging.";
 const banner = {
 	js: 'import { createRequire as __piCreateRequire } from "node:module"; const require = __piCreateRequire(import.meta.url);',
 };
@@ -137,6 +161,217 @@ function outputBytes(metafiles) {
 	);
 }
 
+function sha256(data) {
+	return createHash("sha256").update(data).digest("hex");
+}
+
+function hashTree(rootDir) {
+	const entries = [];
+	const walk = (dir) => {
+		for (const name of readdirSync(dir).sort()) {
+			const full = join(dir, name);
+			if (statSync(full).isDirectory()) {
+				walk(full);
+			} else {
+				entries.push({ path: relative(rootDir, full).replaceAll("\\", "/"), hash: sha256(readFileSync(full)) });
+			}
+		}
+	};
+	walk(rootDir);
+	const manifest = entries.map((entry) => `${entry.path}:${entry.hash}`).join("\n");
+	return {
+		algorithm: "sha256",
+		aggregateHash: sha256(manifest),
+		fileCount: entries.length,
+	};
+}
+
+// Journal schema is shared verbatim with scripts/build-li.mjs and the bin/li
+// launchers; see SPEC-2026-11-28-li-build-resilience Task 2.
+function appendJournal(fields) {
+	const entry = {
+		schemaVersion: 1,
+		ts: new Date().toISOString(),
+		kind: fields.kind,
+		pid: process.pid,
+		liRoot: repoRoot,
+	};
+	if (fields.attemptId) entry.attemptId = fields.attemptId;
+	if (fields.stage) entry.stage = fields.stage;
+	if (Number.isFinite(fields.exitCode)) entry.exitCode = fields.exitCode;
+	if (fields.artifactHash) entry.artifactHash = fields.artifactHash;
+	if (fields.gitShortSha !== undefined) entry.gitShortSha = fields.gitShortSha;
+	if (fields.gitDirty !== undefined) entry.gitDirty = fields.gitDirty;
+	entry.detail = String(fields.detail ?? "")
+		.slice(0, 200)
+		.replace(/[^\x20-\x7E]/g, "?");
+	try {
+		mkdirSync(dirname(journalPath), { recursive: true });
+		appendFileSync(journalPath, `${JSON.stringify(entry)}\n`, "utf8");
+	} catch {
+		// Journal is best-effort forensics; never fail the build for it.
+	}
+}
+
+function failFaultedBuild(stage, detail) {
+	const exitCode = faultExitCodes[stage];
+	appendJournal({ kind: "fail", stage, exitCode, attemptId, detail });
+	console.error(`[bundle] injected fault ${stage}: exiting ${exitCode} (${detail})`);
+	process.exit(exitCode);
+}
+
+function processStartTime(pid) {
+	try {
+		if (process.platform === "win32") {
+			return execFileSync("powershell", ["-NoProfile", "-Command", `(Get-Process -Id ${pid}).StartTime.ToFileTime()`], {
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "ignore"],
+			}).trim();
+		}
+		return execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" }).trim();
+	} catch {
+		return null;
+	}
+}
+
+function readLockOwner() {
+	try {
+		return JSON.parse(readFileSync(join(lockDir, "owner.json"), "utf8"));
+	} catch {
+		return null;
+	}
+}
+
+// "stale" = owner pid is dead, or a different process reused the pid
+// (start-time mismatch). Unreadable start-time fails safe towards "alive".
+function lockState() {
+	const owner = readLockOwner();
+	if (!owner || typeof owner.pid !== "number" || owner.pid <= 0) return "unknown";
+	let alive = false;
+	try {
+		process.kill(owner.pid, 0);
+		alive = true;
+	} catch {}
+	if (!alive) return "stale";
+	const start = processStartTime(owner.pid);
+	if (start === null) return "alive";
+	return start === String(owner.start) ? "alive" : "stale";
+}
+
+function acquireBundleLock() {
+	for (let attempt = 0; attempt < 25; attempt++) {
+		try {
+			mkdirSync(lockDir, { recursive: true });
+			writeFileSync(
+				join(lockDir, "owner.json"),
+				`${JSON.stringify({ pid: process.pid, start: processStartTime(process.pid) ?? "" })}\n`,
+			);
+			return;
+		} catch (error) {
+			if (error.code !== "EEXIST") throw error;
+			if (lockState() === "stale") {
+				rmSync(lockDir, { recursive: true, force: true });
+				continue;
+			}
+			throw new Error(
+				`Another Li build appears to be running (bundle lock held by pid ${readLockOwner()?.pid ?? "?"}). ` +
+					`If no build is active, remove ${lockDir} manually.`,
+			);
+		}
+	}
+	throw new Error(`Could not acquire the bundle lock after stale take-over attempts: ${lockDir}`);
+}
+
+function releaseBundleLock() {
+	try {
+		rmSync(lockDir, { recursive: true, force: true });
+	} catch {}
+}
+
+// Remove staging dirs left behind by dead processes. Staging of a live pid is
+// left alone: it belongs to the bundler currently holding the lock.
+function sweepStaleStaging() {
+	if (!existsSync(codingAgentDistDir)) return;
+	for (const name of readdirSync(codingAgentDistDir)) {
+		if (!name.startsWith("bundle.staging.")) continue;
+		const pid = Number(name.slice(stagingPrefix.length).split("-")[1]);
+		if (Number.isSafeInteger(pid) && pid > 0 && pid !== process.pid) {
+			let alive = false;
+			try {
+				process.kill(pid, 0);
+				alive = true;
+			} catch {}
+			if (alive) continue;
+		}
+		rmSync(join(codingAgentDistDir, name), { recursive: true, force: true });
+	}
+}
+
+function git(args) {
+	const result = spawnSync("git", args, { cwd: repoRoot, encoding: "utf8" });
+	if (result.status !== 0) {
+		throw new Error(`git ${args.join(" ")} failed: ${result.stderr.trim() || result.stdout.trim() || "unknown error"}`);
+	}
+	return result.stdout.trim();
+}
+
+// Duplicated from build-li by design (T1): the bundler writes the full
+// receipt.tmp itself, before the swap, so a crash can never lose provenance.
+function collectProvenance() {
+	const packageJson = JSON.parse(readFileSync(join(codingAgentDir, "package.json"), "utf8"));
+	const fullSha = git(["rev-parse", "HEAD"]);
+	const gitStatus = spawnSync("git", ["status", "--porcelain"], { cwd: repoRoot, encoding: "utf8" });
+	if (gitStatus.status !== 0) {
+		throw new Error(`git status failed: ${gitStatus.stderr.trim()}`);
+	}
+	const dirtyPaths = gitStatus.stdout
+		.split("\n")
+		.map((line) => line.trim())
+		.filter(Boolean);
+	return {
+		baseVersion: packageJson.version,
+		packageName: packageJson.name,
+		gitHead: fullSha,
+		gitShortSha: fullSha.slice(0, 10),
+		gitBranch: git(["rev-parse", "--abbrev-ref", "HEAD"]),
+		gitDirty: dirtyPaths.length > 0,
+		gitDirtyPathCount: dirtyPaths.length,
+		sourceTreeHash: sha256(git(["ls-files", "-s"])),
+		nodeVersion: process.version,
+		liCliPath: join(bundleDir, "cli.js"),
+		profileSnapshotId: process.env.LI_PROFILE_SNAPSHOT_ID || null,
+	};
+}
+
+// --- fail-closed bundle lifecycle -----------------------------------------
+// The live bundle is only ever replaced by an atomic rename from a fully
+// validated staging dir; every failure keeps the previous bundle intact.
+
+const parentLockPid = Number(process.env.LI_LOCK_PID ?? "");
+const reentrant = Number.isSafeInteger(parentLockPid) && parentLockPid > 0;
+let ownsBundleLock = false;
+if (reentrant) {
+	const owner = readLockOwner();
+	if (!owner || owner.pid !== parentLockPid) {
+		throw new Error(
+			`Bundle lock owner mismatch: LI_LOCK_PID=${parentLockPid} but the lock is ${owner ? `held by pid ${owner.pid}` : "unreadable"}`,
+		);
+	}
+} else {
+	acquireBundleLock();
+	ownsBundleLock = true;
+}
+
+// attemptId: epoch-ms zero-padded to 13 digits so string sort == time sort.
+const attemptId = `${String(Date.now()).padStart(13, "0")}-${process.pid}`;
+const stagingDir = join(codingAgentDistDir, `bundle.staging.${attemptId}`);
+
+sweepStaleStaging();
+mkdirSync(stagingDir, { recursive: true });
+if (fault === "esbuild") {
+	failFaultedBuild("esbuild", "injected esbuild failure");
+}
+
 for (const entry of [
 	join(codingAgentDistDir, "cli.js"),
 	join(codingAgentDistDir, "index.js"),
@@ -151,9 +386,6 @@ for (const entry of [
 	}
 }
 
-rmSync(bundleDir, { force: true, recursive: true });
-mkdirSync(bundleDir, { recursive: true });
-
 const mainResult = await build({
 	...commonBuildOptions(),
 	entryNames: "[name]",
@@ -162,7 +394,7 @@ const mainResult = await build({
 		index: join(codingAgentDistDir, "index.js"),
 		"rpc-entry": join(codingAgentDistDir, "rpc-entry.js"),
 	},
-	outdir: bundleDir,
+	outdir: stagingDir,
 	chunkNames: "chunks/[name]-[hash]",
 	splitting: true,
 });
@@ -250,9 +482,117 @@ import { createRequire, enableCompileCache } from "node:module";
 enableCompileCache();
 createRequire(import.meta.url)("./cli-runtime.js");
 `;
-writeFileSync(join(bundleDir, "cli.js"), cliLauncher);
-chmodSync(join(bundleDir, "cli.js"), 0o755);
-chmodSync(join(bundleDir, "rpc-entry.js"), 0o755);
+writeFileSync(join(stagingDir, "cli.js"), cliLauncher);
+chmodSync(join(stagingDir, "cli.js"), 0o755);
+chmodSync(join(stagingDir, "rpc-entry.js"), 0o755);
+
+// Patch the OSC color query on the candidate, then hash what will actually go
+// live, and park the full receipt as .tmp before touching the live bundle.
+let terminalColorQueryPatch;
+try {
+	terminalColorQueryPatch = neutralizeLiTerminalColorQuery(stagingDir);
+} catch (error) {
+	throw new Error(`Li OSC build-time patch failed closed: ${error instanceof Error ? error.message : String(error)}`);
+}
+
+const provenance = collectProvenance();
+if (provenance.gitDirty) {
+	console.warn(
+		`[bundle] warning: worktree has ${provenance.gitDirtyPathCount} uncommitted path(s); ` +
+			"the build is a candidate only and must not be promoted until the source is clean.",
+	);
+}
+const artifact = hashTree(stagingDir);
+writeFileSync(
+	receiptTmpPath,
+	`${JSON.stringify(
+		{
+			...provenance,
+			builtAt: new Date().toISOString(),
+			artifactHash: artifact.aggregateHash,
+			artifactAlgorithm: artifact.algorithm,
+			artifactFileCount: artifact.fileCount,
+			terminalColorQueryPatch,
+			attemptId,
+		},
+		null,
+		"\t",
+	)}\n`,
+	"utf8",
+);
+if (fault === "pretmp") {
+	failFaultedBuild("pretmp", "exited after receipt.tmp, before the swap");
+}
+
+// Swap: bundle -> bundle.old-<attemptId>, then staging -> bundle. Rename 2 fail
+// rolls back; a rollback failure leaves the old marker holding the live bundle
+// (recovered by the launcher / next build-li run).
+const oldDir = join(codingAgentDistDir, `bundle.old-${attemptId}`);
+const hadLiveBundle = existsSync(bundleDir);
+try {
+	if (fault === "swap1") throw new Error("injected swap1 failure (first rename)");
+	if (hadLiveBundle) renameSync(bundleDir, oldDir);
+	if (fault === "swap2") {
+		// Hard exit mid-swap: no catch runs, the old marker keeps the live bundle.
+		failFaultedBuild("swap2", "hard-exit after the first rename");
+	}
+	if (fault === "swap3") throw new Error("injected swap3 failure (second rename)");
+	renameSync(stagingDir, bundleDir);
+} catch (error) {
+	if (fault === "swap3") {
+		// Injected rollback failure: the old marker keeps the live bundle.
+		failFaultedBuild("swap3", "injected rollback failure");
+	}
+	let rollbackFailed = false;
+	if (hadLiveBundle && existsSync(oldDir) && !existsSync(bundleDir)) {
+		try {
+			renameSync(oldDir, bundleDir);
+		} catch {
+			rollbackFailed = true;
+		}
+	}
+	if (rollbackFailed) {
+		failFaultedBuild("swap3", `rollback failed: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	failFaultedBuild("swap1", `swap failed, bundle kept: ${error instanceof Error ? error.message : String(error)}`);
+}
+
+if (fault === "promote") {
+	failFaultedBuild("promote", "exited after the swap, before receipt promote");
+}
+
+// Two-phase receipt: the candidate provenance was parked as .tmp pre-swap;
+// only now that the staging is live does it become the receipt of record.
+renameSync(receiptTmpPath, receiptPath);
+const oscPatchReceipt = {
+	schemaVersion: 1,
+	runtime: "li",
+	patchStrategy: "build-time",
+	sourceSha: provenance.gitHead,
+	profileSnapshotId: provenance.profileSnapshotId,
+	packageVersion: provenance.baseVersion,
+	bundleDir,
+	patchedAt: new Date().toISOString(),
+	...terminalColorQueryPatch,
+};
+writeFileSync(join(codingAgentDistDir, "li-osc-patch-receipt.json"), `${JSON.stringify(oscPatchReceipt, null, "\t")}\n`, "utf8");
+console.log(`[bundle] Li OSC query ${terminalColorQueryPatch.status} (${terminalColorQueryPatch.markerCount} marker(s))`);
+
+if (hadLiveBundle) {
+	try {
+		rmSync(oldDir, { recursive: true, force: true });
+	} catch {
+		// EPERM on the old marker never fails the build: the new bundle is live.
+		try {
+			renameSync(oldDir, join(codingAgentDistDir, `bundle.old-consumed-${attemptId}`));
+			console.warn(`[bundle] warning: could not delete ${oldDir}; renamed to bundle.old-consumed-${attemptId}`);
+		} catch {
+			console.warn(`[bundle] warning: could not delete or rename ${oldDir}; it will be cleaned by the next build`);
+		}
+	}
+}
+
+if (ownsBundleLock) releaseBundleLock();
 
 const files = new Set(metafiles.flatMap((metafile) => Object.keys(metafile.outputs))).size + 1;
 const mib = (outputBytes(metafiles) + cliLauncher.length) / (1024 * 1024);
