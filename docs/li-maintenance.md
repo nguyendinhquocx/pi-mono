@@ -168,6 +168,12 @@ ON → thu evidence → OFF:
 downtime CHẤP NHẬN — KHÔNG nằm trong cam kết fail-safe của cơ chế trên. Quy ước: đừng interrupt
 giữa clean và build; đừng chạy clean concurrent với build. `clean` giờ chỉ xoá trong
 `<package>/dist`/`.eval` (guard + `--force` để thoát có log); mutation ngoài boundary bị refuse.
+Tương tự: CẤM chạy `build-li --record-tests` khi một build đang giữ lock — nó ghi receipt ngoài
+protocol lock (race thấp nhưng thật; chờ build xong rồi chạy).
+
+Take-over stale lock (launcher lẫn build-li) là rm-then-mkdir không atomic: hai process cùng thấy
+stale có thể đua re-acquire trong ms — hậu quả bounded (rename nguyên tử, một bên thắng, bên kia
+báo lỗi sạch); chấp nhận cho quy mô 1 máy 1 user, đừng chủ động đua lock.
 
 ### M2 — source-tree wipe (tracked files), KHÁC hoàn toàn P1
 

@@ -60,6 +60,7 @@ function fail(message, exitCode = 1) {
 
 function failAfterStart(message, exitCode = 1) {
 	appendJournal({ kind: "fail", stage: "crash", exitCode, detail: message });
+	releaseLock();
 	fail(message, exitCode);
 }
 
@@ -175,7 +176,8 @@ function readLockOwner() {
 }
 
 // "stale" = owner pid is dead, or a different process reused the pid
-// (start-time mismatch). Unreadable start-time fails safe towards "alive".
+// (start-time mismatch). Unreadable start-time, empty recorded start, or a
+// cross-format start (sh lstart vs Windows FileTime) fails safe to alive.
 function lockState() {
 	const owner = readLockOwner();
 	if (!owner || typeof owner.pid !== "number" || owner.pid <= 0) return "unknown";
@@ -187,7 +189,11 @@ function lockState() {
 	if (!alive) return "stale";
 	const start = processStartTime(owner.pid);
 	if (start === null) return "alive";
-	return start === String(owner.start) ? "alive" : "stale";
+	const stored = String(owner.start ?? "");
+	if (!stored) return "alive";
+	const isFileTime = (value) => /^\d{15,}$/.test(value);
+	if (isFileTime(stored) !== isFileTime(start)) return "alive";
+	return start === stored ? "alive" : "stale";
 }
 
 function acquireLock() {
@@ -414,6 +420,7 @@ function recoverAndHeal() {
 			if (!statSync(markerDir).isDirectory()) continue;
 			try {
 				rmSync(markerDir, { recursive: true, force: true });
+				notes.push(`cleaned ${name}`);
 			} catch {
 				notes.push(`could not clean ${name}`);
 			}
@@ -447,7 +454,12 @@ acquireLock();
 try {
 	appendJournal({ kind: "started", detail: options.offline ? "build started (--offline)" : "build started" });
 
-	const notes = recoverAndHeal();
+	let notes;
+	try {
+		notes = recoverAndHeal();
+	} catch (error) {
+		failAfterStart(`recovery failed: ${error instanceof Error ? error.message : String(error)}`);
+	}
 	notes.push(...sweepStaleStaging().map((name) => `swept staging ${name}`));
 
 	console.log(`[build-li] building Li runtime (${options.offline ? "offline" : "online"})`);
@@ -464,6 +476,7 @@ try {
 		if (!last || last.kind !== "fail") {
 			appendJournal({ kind: "fail", stage, exitCode, detail: `build child exited with code ${exitCode}` });
 		}
+		releaseLock();
 		fail(`build exited with code ${exitCode}`, exitCode);
 	}
 

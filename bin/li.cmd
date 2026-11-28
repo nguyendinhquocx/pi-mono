@@ -74,6 +74,7 @@ goto :no_build
 :restore_ok
 if exist "%LI_TMP_RECEIPT%" del /f /q "%LI_TMP_RECEIPT%" >nul 2>nul
 call :journal recovered "restored %LI_BEST_OLD%"
+for /f "delims=" %%D in ('dir /b /ad "%LI_DIST_DIR%undle.old-*" 2^>nul') do rd /s /q "%LI_DIST_DIR%\%%D" >nul 2>nul
 call :release_lock
 goto :cli_ready
 
@@ -154,7 +155,7 @@ set "LOCK_STATE=unknown"
 set "LI_PS_L1=$state='unknown';$o=$null;try{$o=Get-Content -Raw -LiteralPath ($env:LI_LOCK_DIR+'\owner.json') | ConvertFrom-Json}catch{};"
 set "LI_PS_L2=if($o -and $o.pid){$alive=$false;try{Get-Process -Id $o.pid -ErrorAction Stop | Out-Null;$alive=$true}catch{};"
 set "LI_PS_L3=if(-not $alive){$state='stale'}elseif(-not $o.start){$state='alive'}else{$cur='';try{$cur=(Get-Process -Id $o.pid).StartTime.ToFileTime()}catch{};"
-set "LI_PS_L4=if((''+$cur) -ne (''+$o.start)){$state='stale'}else{$state='alive'}}};$state"
+set "LI_PS_L4=if((''+$cur) -notmatch '\A\d{15,}\z' -or (''+$o.start) -notmatch '\A\d{15,}\z'){$state='alive'}elseif((''+$cur) -ne (''+$o.start)){$state='stale'}else{$state='alive'}}};$state"
 powershell -NoProfile -Command "%LI_PS_L1%%LI_PS_L2%%LI_PS_L3%%LI_PS_L4%" > "%TEMP%\li-lock-state.tmp" 2>nul
 set /p LOCK_STATE=<"%TEMP%\li-lock-state.tmp"
 if not defined LOCK_STATE set "LOCK_STATE=unknown"

@@ -60,7 +60,10 @@ function cleanBuildOutput(rawPath, force) {
 	const target = resolve(rawPath);
 	if (!existsSync(target)) return;
 	const real = realpathSync(target);
-	if (real !== target) {
+	// Windows is case-insensitive: compare folded so a canonical-cased realpath
+	// (different drive/dir casing only) is not mistaken for a junction escape.
+	const samePath = process.platform === "win32" ? real.toLowerCase() === target.toLowerCase() : real === target;
+	if (!samePath) {
 		throw new Error(
 			`Refusing to clean "${rawPath}": junction/symlink escape (resolves to ${real}). Not overridable with --force.`,
 		);

@@ -156,6 +156,9 @@ li_lock_owner_state() {
 }
 
 if [ ! -f "$PI_CORE_CLI_PATH" ]; then
+	# The lock mkdir below must fail only on an existing lock, so make sure the
+	# dist parent exists first (plain mkdir does not create parents).
+	mkdir -p -- "$LI_DIST_DIR" 2>/dev/null || true
 	li_wait_rounds=0
 	while :; do
 		if mkdir -- "$LI_LOCK_DIR" 2>/dev/null; then
@@ -166,6 +169,10 @@ if [ ! -f "$PI_CORE_CLI_PATH" ]; then
 				if mv -- "$li_newest_old" "$LI_DIST_DIR/bundle" 2>/dev/null && [ -f "$PI_CORE_CLI_PATH" ]; then
 					rm -f -- "$LI_TMP_RECEIPT" 2>/dev/null || true
 					li_journal recovered "restored ${li_newest_old##*/}"
+					for li_stale_marker in "$LI_DIST_DIR"/bundle.old-*; do
+						[ -d "$li_stale_marker" ] || continue
+						rm -rf -- "$li_stale_marker" 2>/dev/null || true
+					done
 				else
 					li_journal missing-detected "restore failed from ${li_newest_old##*/}"
 					li_release_lock

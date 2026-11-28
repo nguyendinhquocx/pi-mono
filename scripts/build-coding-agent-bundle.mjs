@@ -243,7 +243,8 @@ function readLockOwner() {
 }
 
 // "stale" = owner pid is dead, or a different process reused the pid
-// (start-time mismatch). Unreadable start-time fails safe towards "alive".
+// (start-time mismatch). Unreadable start-time, empty recorded start, or a
+// cross-format start (sh lstart vs Windows FileTime) fails safe to alive.
 function lockState() {
 	const owner = readLockOwner();
 	if (!owner || typeof owner.pid !== "number" || owner.pid <= 0) return "unknown";
@@ -255,7 +256,11 @@ function lockState() {
 	if (!alive) return "stale";
 	const start = processStartTime(owner.pid);
 	if (start === null) return "alive";
-	return start === String(owner.start) ? "alive" : "stale";
+	const stored = String(owner.start ?? "");
+	if (!stored) return "alive";
+	const isFileTime = (value) => /^\d{15,}$/.test(value);
+	if (isFileTime(stored) !== isFileTime(start)) return "alive";
+	return start === stored ? "alive" : "stale";
 }
 
 function acquireBundleLock() {
